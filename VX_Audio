@@ -1,0 +1,515 @@
+--[[
+    VX_Audio v3.0.0
+    Engine sound, turbo sounds, shift sounds, backfire crackles, launch sound.
+    Multi-stage pitch smoothing + dynamic range compression + adaptive attack.
+
+    Depends on: Core, Profiles, Remote, Powertrain, DriveSystem
+    Exposes:
+      playBackfire(count)
+      playLaunch()
+      getEnginePitch()
+      getMasterGain()
+
+    Emits: (none — consumes events)
+      Listens:
+        vehicle.stateChanged
+        vehicle.shift
+        vehicle.backfire
+        turbo.spool
+        turbo.blowoff
+        vehicle.launchRelease
+        profiles.changed
+        settings.changed
+
+    Registers sounds in registry (auto-appears in Panel).
+]]
+
+local VX = _G.VX
+if not VX or not VX.Framework then error("VX_Audio requires VX_Kernel") end
+
+local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
+local Player = Players.LocalPlayer
+
+local Module = VX.Framework.Module.new({
+    Name = "Audio",
+    Dependencies = { "Core", "Profiles", "Remote", "Powertrain", "DriveSystem" },
+    Version = "3.0.0",
+})
+
+-- ==================== CONSTANTS ====================
+local TURBO_SPOOL_ID   = "89818258229795"
+local TURBO_FLUTTER_ID = "18609462234"
+local TURBO_BLOWOFF_ID = "75197887670820"
+local BACKFIRE_DEFAULT = "140562715692021"
+
+local MAX_ENGINE_PITCH = 3.0
+local MIN_ENGINE_PITCH = 0.5
+
+-- ==================== STATE ====================
+function Module:Construct()
+    -- Engine sound instance
+    self.engineSound = nil
+    self.engineSoundId = nil
+
+    -- Turbo spool loop
+    self.spoolSound = nil
+
+    -- Pitch smoothing (two-stage)
+    self.fastRpm   = 900
+    self.slowRpm   = 900
+    self.fastRate  = 40
+    self.slowRate  = 15
+
+    -- Downshift boost (temporary pitch speedup)
+    self.downshiftBoostUntil = 0
+    self.downshiftBoostAmt   = 15
+
+    -- Rate limiting
+    self.lastShiftTime    = 0
+    self.lastBackfireTime = 0
+    self.lastBlowoffTime  = 0
+    self.lastFlutterTime  = 0
+    self.lastLaunchTime   = 0
+
+    -- Sound pools
+    self._activeSounds = {}  -- [key] = lastPlayedTime
+    self._cooldowns = {
+        shift    = 0.15,
+        backfire = 0.03,
+        blowoff  = 0.25,
+        flutter  = 0.35,
+        launch   = 1.0,
+    }
+
+    -- Compressor
+    self._peakVolume = 0
+    self._compressorGain = 1.0
+
+    -- Loop
+    self._loopThread = nil
+    self._running = false
+
+    -- Counters
+    self._totalBackfires = 0
+    self._totalShifts    = 0
+    self._totalBlowoffs  = 0
+end
+
+function Module:Init(deps)
+    self.core     = deps.Core
+    self.profiles = deps.Profiles
+    self.remote   = deps.Remote
+    self.powertrain = deps.Powertrain
+    self.drive    = deps.DriveSystem
+end
+
+function Module:Start()
+    _G.VX.Audio = self
+
+    self:_registerSoundsInRegistry()
+    self:_registerDiagnostics()
+
+    _G.VX.bus:on("vehicle.stateChanged", function(evt) self:_onStateChange(evt) end)
+    _G.VX.bus:on("vehicle.shift",        function(evt) self:_onShift(evt) end)
+    _G.VX.bus:on("vehicle.backfire",     function(evt) self:_onBackfire(evt) end)
+    _G.VX.bus:on("turbo.spool",          function(evt) self:_onSpool(evt) end)
+    _G.VX.bus:on("turbo.blowoff",        function(evt) self:_onBlowoff(evt) end)
+    _G.VX.bus:on("vehicle.launchRelease", function(evt) self:_onLaunch(evt) end)
+    _G.VX.bus:on("profiles.changed",     function(evt) self:_onProfileChange(evt) end)
+    _G.VX.bus:on("settings.changed",     function(evt) self:_onSettingChange(evt) end)
+end
+
+function Module:Stop()
+    self:_detach()
+    if _G.VX.Audio == self then _G.VX.Audio = nil end
+end
+
+function Module:heartbeat()
+    if not self._running then return true end
+    return self.engineSound ~= nil
+end
+
+-- ==================== REGISTRY ====================
+function Module:_registerSoundsInRegistry()
+    local R = _G.VX.registry
+    local toRegister = {
+        { key = "audio.turbo_spool",   id = TURBO_SPOOL_ID,   category = "Turbo",    type = "loop" },
+        { key = "audio.turbo_flutter", id = TURBO_FLUTTER_ID, category = "Turbo",    type = "one_shot" },
+        { key = "audio.turbo_blowoff", id = TURBO_BLOWOFF_ID, category = "Turbo",    type = "one_shot" },
+        { key = "audio.backfire",      id = BACKFIRE_DEFAULT, category = "Backfire", type = "one_shot" },
+    }
+    for _, item in ipairs(toRegister) do
+        pcall(function()
+            R:set("sounds", item.key, item, "Audio")
+        end)
+    end
+end
+
+function Module:_registerDiagnostics()
+    local D = _G.VX.diagnostics
+    pcall(function()
+        D.register("audio.enginePitch", {
+            fn = function() return { value = string.format("%.2f", self.slowRpm / 3500), unit = "", status = "normal" } end,
+            category = "Audio",
+        }, "Audio")
+        D.register("audio.backfires", {
+            fn = function() return { value = self._totalBackfires, unit = "", status = "normal" } end,
+            category = "Audio",
+        }, "Audio")
+        D.register("audio.shifts", {
+            fn = function() return { value = self._totalShifts, unit = "", status = "normal" } end,
+            category = "Audio",
+        }, "Audio")
+        D.register("audio.blowoffs", {
+            fn = function() return { value = self._totalBlowoffs, unit = "", status = "normal" } end,
+            category = "Audio",
+        }, "Audio")
+        D.register("audio.compressor", {
+            fn = function() return { value = string.format("%.2f", self._compressorGain), unit = "", status = "normal" } end,
+            category = "Audio",
+        }, "Audio")
+    end)
+end
+
+-- ==================== STATE CHANGE ====================
+function Module:_onStateChange(evt)
+    if evt.to == "Ready" or evt.to == "Idle" then
+        self:_attach()
+    elseif evt.to == "Exiting" or evt.to == "Disabled" then
+        self:_detach()
+    end
+end
+
+-- ==================== ATTACH ====================
+function Module:_attach()
+    if self._running then return end
+    self._running = true
+
+    local prof = self.profiles:current()
+    self.fastRpm = prof.idleRPM
+    self.slowRpm = prof.idleRPM
+
+    self:_createEngineSound(prof)
+    self:_createSpoolSound()
+
+    -- Start pitch update loop
+    self._loopThread = task.spawn(function()
+        while self._running do
+            local dt = task.wait(1/60)
+            if dt > 0.1 then dt = 1/60 end
+            pcall(self:_update, self, dt)
+        end
+    end)
+
+    print("[VX] Audio attached — engine: " .. prof.name)
+end
+
+function Module:_detach()
+    if not self._running then return end
+    self._running = false
+
+    if self._loopThread then
+        pcall(function() task.cancel(self._loopThread) end)
+        self._loopThread = nil
+    end
+
+    self:_destroyEngineSound()
+    self:_destroySpoolSound()
+    print("[VX] Audio detached")
+end
+
+-- ==================== ENGINE SOUND ====================
+function Module:_createEngineSound(prof)
+    self:_destroyEngineSound()
+    if not prof or not prof.soundId then return end
+
+    local authority = _G.VX.Authority
+    local handle = authority and authority:getHandle()
+    local parent = handle and (handle.emitter or handle.root and handle.root.PrimaryPart)
+    if not parent then return end
+
+    local s = Instance.new("Sound")
+    s.Name = "VX_Engine"
+    s.SoundId = "rbxassetid://" .. prof.soundId
+    s.Volume = self:_computeBaseVolume(prof)
+    s.Looped = true
+    s.PlaybackSpeed = 1.0
+    s.RollOffMode = Enum.RollOffMode.Linear
+    s.RollOffMaxDistance = 400
+    s.RollOffMinDistance = 10
+    s.Parent = parent
+    s:Play()
+
+    self.engineSound = s
+    self.engineSoundId = prof.soundId
+end
+
+function Module:_destroyEngineSound()
+    if self.engineSound then
+        pcall(function() self.engineSound:Destroy() end)
+        self.engineSound = nil
+    end
+end
+
+-- ==================== TURBO SPOOL ====================
+function Module:_createSpoolSound()
+    self:_destroySpoolSound()
+    if not self.core.settings.turboSpoolEnabled then return end
+    local prof = self.profiles:current()
+    if not prof.hasTurboSounds then return end
+
+    local authority = _G.VX.Authority
+    local handle = authority and authority:getHandle()
+    local parent = handle and (handle.emitter or handle.root and handle.root.PrimaryPart)
+    if not parent then return end
+
+    local s = Instance.new("Sound")
+    s.Name = "VX_TurboSpool"
+    s.SoundId = "rbxassetid://" .. TURBO_SPOOL_ID
+    s.Volume = 0
+    s.Looped = true
+    s.PlaybackSpeed = 0.5
+    s.RollOffMode = Enum.RollOffMode.Linear
+    s.RollOffMaxDistance = 400
+    s.Parent = parent
+    s:Play()
+
+    self.spoolSound = s
+end
+
+function Module:_destroySpoolSound()
+    if self.spoolSound then
+        pcall(function() self.spoolSound:Destroy() end)
+        self.spoolSound = nil
+    end
+end
+
+-- ==================== MAIN UPDATE ====================
+function Module:_update(dt)
+    if not self._running then return end
+    local prof = self.profiles:current()
+    if not prof then return end
+
+    local rpm = self.powertrain:getRPM()
+
+    -- Adaptive attack: fast on downshift
+    local fastRate = self.fastRate
+    if os.clock() < self.downshiftBoostUntil then
+        fastRate = fastRate + self.downshiftBoostAmt
+    end
+
+    -- Stage 1: fast tracking
+    self.fastRpm = self.fastRpm + (rpm - self.fastRpm) * math.min(fastRate * dt, 1)
+
+    -- Stage 2: organic filter
+    self.slowRpm = self.slowRpm + (self.fastRpm - self.slowRpm) * math.min(self.slowRate * dt, 1)
+
+    -- Rev limiter freeze
+    local smoothRpm = self.slowRpm
+    if self.powertrain:isRevLimiting() then
+        smoothRpm = prof.redlineRPM
+    end
+
+    -- Update engine sound pitch
+    if self.engineSound and self.engineSound.Parent then
+        local ref = prof.refRpm or 3500
+        local offset = 1 + (prof.pitchOffset or 0) + (self.core.settings.pitchOffset or 0)
+        local targetPitch = math.clamp((smoothRpm / ref) * offset, MIN_ENGINE_PITCH, MAX_ENGINE_PITCH)
+        if math.abs(self.engineSound.PlaybackSpeed - targetPitch) > 0.01 then
+            self.engineSound.PlaybackSpeed = targetPitch
+        end
+
+        -- Volume
+        local baseVol = self:_computeBaseVolume(prof)
+        local modulated = baseVol * self._compressorGain
+        if math.abs(self.engineSound.Volume - modulated) > 0.01 then
+            self.engineSound.Volume = modulated
+        end
+    end
+
+    -- Update spool sound
+    if self.spoolSound and self.spoolSound.Parent then
+        local boost = self.drive:getBoost()
+        local stage = self.drive:getTurboStage()
+        local targetVol = 0
+        local targetPitch = 0.5
+        if stage > 0 and boost > 0.02 then
+            targetVol = math.min(0.55, boost / 1.5 * 0.55)
+            targetPitch = 0.5 + (boost / 1.5) * 1.5
+        end
+        self.spoolSound.Volume = self.spoolSound.Volume + (targetVol - self.spoolSound.Volume) * math.min(dt * 8, 1)
+        self.spoolSound.PlaybackSpeed = self.spoolSound.PlaybackSpeed + (targetPitch - self.spoolSound.PlaybackSpeed) * math.min(dt * 8, 1)
+    end
+
+    -- Compressor: simulate dynamic range compression
+    self:_updateCompressor(dt)
+end
+
+function Module:_computeBaseVolume(prof)
+    local masterVol = self.core.settings.masterVolume or 1.0
+    local boost = self.core.settings.engineBoost or 1.0
+    return math.clamp(masterVol * boost * (prof.volumeMultiplier or 1.0), 0, 1)
+end
+
+function Module:_updateCompressor(dt)
+    -- Track peak volume from last frames
+    local currentPeak = 0
+    if self.engineSound and self.engineSound.Parent then
+        currentPeak = currentPeak + self.engineSound.Volume
+    end
+    if self.spoolSound and self.spoolSound.Parent then
+        currentPeak = currentPeak + self.spoolSound.Volume
+    end
+
+    self._peakVolume = self._peakVolume + (currentPeak - self._peakVolume) * math.min(dt * 4, 1)
+
+    -- Compress if peak > 1.0
+    local targetGain = 1.0
+    if self._peakVolume > 1.0 then
+        targetGain = math.clamp(1.0 / self._peakVolume, 0.5, 1.0)
+    end
+    self._compressorGain = self._compressorGain + (targetGain - self._compressorGain) * math.min(dt * 6, 1)
+end
+
+-- ==================== EVENT HANDLERS ====================
+function Module:_onShift(evt)
+    local now = os.clock()
+    if now - self.lastShiftTime < self._cooldowns.shift then return end
+    self.lastShiftTime = now
+    self._totalShifts = self._totalShifts + 1
+
+    local prof = self.profiles:current()
+    local isUp = evt.up
+
+    -- Boost pitch rate on downshift
+    if not isUp then
+        self.downshiftBoostUntil = now + 0.30
+    end
+
+    -- Play shift sound if profile has it
+    local soundId
+    if isUp and prof.hasShiftUpSound then
+        soundId = prof.shiftUpSoundId
+    elseif not isUp and prof.hasShiftDownSound then
+        soundId = prof.shiftDownSoundId
+    end
+
+    if soundId then
+        local vol = 1.0 * self.core.settings.masterVolume * self._compressorGain
+        local pitch = 1.0 + (math.random() * 0.1 - 0.05)
+        local handle = _G.VX.Authority:getHandle()
+        local parent = handle and (handle.emitter or handle.root and handle.root.PrimaryPart)
+        pcall(function()
+            self.remote:playSound(soundId, vol, pitch, parent)
+        end)
+    end
+end
+
+function Module:_onBackfire(evt)
+    local now = os.clock()
+    local count = evt.count or 1
+    if now - self.lastBackfireTime < self._cooldowns.backfire then return end
+    self.lastBackfireTime = now
+
+    local prof = self.profiles:current()
+    local soundIds = prof.backfireSoundIds or { BACKFIRE_DEFAULT }
+
+    local handle = _G.VX.Authority:getHandle()
+    local parent = handle and (handle.emitter or handle.root and handle.root.PrimaryPart)
+
+    for i = 1, math.min(count, 5) do
+        local id = soundIds[math.random(1, #soundIds)]
+        local vol = (0.6 + math.random() * 0.4) * self.core.settings.masterVolume * self._compressorGain
+        local pitch = 0.85 + math.random() * 0.3
+        self._totalBackfires = self._totalBackfires + 1
+        pcall(function()
+            self.remote:playSound(id, vol, pitch, parent)
+        end)
+        if i < count then
+            task.wait(math.random(20, 50) / 1000)
+        end
+    end
+end
+
+function Module:_onSpool(evt)
+    -- Handled by continuous _update loop for spool sound.
+    -- Here we just emit occasional "hissss" if needed. For now, no-op.
+end
+
+function Module:_onBlowoff(evt)
+    if not self.core.settings.turboBlowoffEnabled then return end
+    local prof = self.profiles:current()
+    if not prof.hasTurboSounds then return end
+
+    local now = os.clock()
+    if now - self.lastBlowoffTime < self._cooldowns.blowoff then return end
+    self.lastBlowoffTime = now
+    self._totalBlowoffs = self._totalBlowoffs + 1
+
+    local intensity = evt.intensity or 0.5
+    local vol = (0.5 + intensity * 0.5) * self.core.settings.masterVolume * self._compressorGain
+    local pitch = 1.1 - intensity * 0.2 + math.random() * 0.1
+
+    local handle = _G.VX.Authority:getHandle()
+    local parent = handle and (handle.emitter or handle.root and handle.root.PrimaryPart)
+    pcall(function()
+        self.remote:playSound(TURBO_BLOWOFF_ID, vol, pitch, parent)
+    end)
+end
+
+function Module:_onLaunch(evt)
+    local now = os.clock()
+    if now - self.lastLaunchTime < self._cooldowns.launch then return end
+    self.lastLaunchTime = now
+
+    local prof = self.profiles:current()
+    local id = prof.launchSoundId
+    if not id then return end
+
+    local handle = _G.VX.Authority:getHandle()
+    local parent = handle and (handle.emitter or handle.root and handle.root.PrimaryPart)
+    local vol = 1.0 * self.core.settings.masterVolume
+    pcall(function()
+        self.remote:playSound(id, vol, 1.0, parent)
+    end)
+end
+
+function Module:_onProfileChange(evt)
+    local prof = evt.profile
+    if not prof then return end
+    self:_createEngineSound(prof)
+    self:_destroySpoolSound()
+    self:_createSpoolSound()
+    print("[VX] Audio: profile swapped to " .. prof.name)
+end
+
+function Module:_onSettingChange(evt)
+    if not evt then return end
+    local p = evt.path
+    if p == "turboSpoolEnabled" then
+        if evt.new then self:_createSpoolSound() else self:_destroySpoolSound() end
+    elseif p == "masterVolume" or p == "engineBoost" or p == "pitchOffset" then
+        -- Next update tick picks up new values
+    end
+end
+
+-- ==================== PUBLIC API ====================
+function Module:playBackfire(count)
+    self:_onBackfire({ count = count or 1 })
+end
+
+function Module:playLaunch()
+    self:_onLaunch({})
+end
+
+function Module:getEnginePitch()
+    if not self.engineSound then return 0 end
+    return self.engineSound.PlaybackSpeed
+end
+
+function Module:getMasterGain()
+    return self._compressorGain
+end
+
+return Module
