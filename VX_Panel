@@ -1,0 +1,811 @@
+--[[
+    VX_Panel v3.0.0
+    Six-tab settings panel, auto-generated from the registry.
+
+    Depends on: Core, Profiles, Powertrain, DriveSystem, Chassis
+    Exposes:
+      open()
+      close()
+      isOpen()
+
+    Design:
+      - Slide-in from left, slide-out on close
+      - Six tabs: Dynamics, Physics, Audio, Engine, Controls, Lights
+      - Auto-generates rows from registry:getAll("settings") by category
+      - Special rows: engine profile, turbo stage, weight transfer mode, brake bias
+      - Reset Grip button in Dynamics tab
+      - Live updates: listens for settings.changed to refresh row values
+]]
+
+local VX = _G.VX
+if not VX or not VX.Framework then error("VX_Panel requires VX_Kernel") end
+
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local Player = Players.LocalPlayer
+
+local Module = VX.Framework.Module.new({
+    Name = "Panel",
+    Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis" },
+    Version = "3.0.0",
+})
+
+-- ==================== STATE ====================
+function Module:Construct()
+    self.panel = nil
+    self.tabBar = nil
+    self.contentFrame = nil
+    self.tabContents = {}  -- [tabName] = scrolling frame
+    self.tabButtons = {}   -- [tabName] = button
+    self.activeTab = "Dynamics"
+    self.isPanelOpen = false
+    self.tweenIn = nil
+    self.tweenOut = nil
+    self.slideInSound = nil
+    self.slideOutSound = nil
+
+    -- Cached rows for live refresh: [key] = { valueLabel, updater }
+    self.rowRefs = {}
+end
+
+function Module:Init(deps)
+    self.core     = deps.Core
+    self.profiles = deps.Profiles
+    self.powertrain = deps.Powertrain
+    self.drive    = deps.DriveSystem
+    self.chassis  = deps.Chassis
+end
+
+function Module:Start()
+    _G.VX.Panel = self
+
+    self:_createSounds()
+    self:_createPanel()
+
+    _G.VX.bus:on("settings.changed", function(evt) self:_onSettingChange(evt) end)
+
+    print("[VX] Panel ready")
+end
+
+function Module:Stop()
+    if self.panel then
+        pcall(function() self.panel:Destroy() end)
+        self.panel = nil
+    end
+    if _G.VX.Panel == self then _G.VX.Panel = nil end
+end
+
+function Module:heartbeat()
+    return true
+end
+
+-- ==================== HELPERS ====================
+local function corner(obj, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 8)
+    c.Parent = obj
+    return c
+end
+
+local function stroke(obj, col, thick)
+    local s = Instance.new("UIStroke")
+    s.Color = col or Color3.fromRGB(100, 200, 255)
+    s.Thickness = thick or 2
+    s.Transparency = 0.3
+    s.Parent = obj
+    return s
+end
+
+function Module:_createSounds()
+    local function make(id)
+        local s = Instance.new("Sound")
+        s.SoundId = "rbxassetid://" .. id
+        s.Volume = 0.8
+        s.Parent = Player:WaitForChild("PlayerGui")
+        return s
+    end
+    pcall(function()
+        self.slideInSound = make("139821129588664")
+        self.slideOutSound = make("77985512666301")
+    end)
+end
+
+-- ==================== PANEL CREATION ====================
+function Module:_createPanel()
+    local p = Instance.new("Frame")
+    p.Name = "VXSettingsPanel"
+    p.Size = UDim2.new(0.35, 0, 0.65, 0)
+    p.Position = UDim2.new(-0.35, 0, 0.17, 0)
+    p.BackgroundColor3 = Color3.fromRGB(8, 8, 12)
+    p.BackgroundTransparency = 0.1
+    p.BorderSizePixel = 0
+    p.ZIndex = 30
+    p.Visible = false
+    corner(p, 12)
+    stroke(p, Color3.fromRGB(100, 200, 255), 2)
+    p.Parent = _G.VX.UI.gui
+
+    -- Tab bar
+    local tabBar = Instance.new("Frame")
+    tabBar.Name = "TabBar"
+    tabBar.Size = UDim2.new(1, 0, 0.10, 0)
+    tabBar.BackgroundTransparency = 1
+    tabBar.ZIndex = 31
+    tabBar.Parent = p
+
+    local tabs = { "Dynamics", "Physics", "Audio", "Engine", "Controls", "Lights" }
+    local tabWidth = 1 / #tabs
+    for i, name in ipairs(tabs) do
+        local btn = Instance.new("TextButton")
+        btn.Name = name .. "Tab"
+        btn.Size = UDim2.new(tabWidth, 0, 1, 0)
+        btn.Position = UDim2.new(tabWidth * (i-1), 0, 0, 0)
+        btn.Text = name
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+        btn.BackgroundTransparency = 0.3
+        btn.TextScaled = true
+        btn.Font = Enum.Font.GothamBold
+        btn.AutoButtonColor = false
+        btn.ZIndex = 32
+        corner(btn, 6)
+        btn.Parent = tabBar
+        self.tabButtons[name] = btn
+
+        btn.MouseButton1Click:Connect(function()
+            self:_switchTab(name)
+        end)
+    end
+
+    -- Content frame
+    local content = Instance.new("Frame")
+    content.Name = "Content"
+    content.Size = UDim2.new(1, -12, 0.90, -8)
+    content.Position = UDim2.new(0, 6, 0.10, 4)
+    content.BackgroundTransparency = 1
+    content.ZIndex = 31
+    content.Parent = p
+
+    -- Scrolling frame per tab
+    for _, name in ipairs(tabs) do
+        local scroll = Instance.new("ScrollingFrame")
+        scroll.Name = name .. "Scroll"
+        scroll.Size = UDim2.new(1, 0, 1, 0)
+        scroll.BackgroundTransparency = 1
+        scroll.BorderSizePixel = 0
+        scroll.ScrollBarThickness = 6
+        scroll.ScrollBarImageColor3 = Color3.fromRGB(100, 200, 255)
+        scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+        scroll.Visible = false
+        scroll.ZIndex = 32
+        scroll.Parent = content
+        self.tabContents[name] = scroll
+    end
+
+    -- Close button (top-right corner)
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.new(0, 28, 0, 28)
+    close.Position = UDim2.new(1, -32, 0, 6)
+    close.Text = "✕"
+    close.TextColor3 = Color3.fromRGB(255, 100, 100)
+    close.BackgroundColor3 = Color3.fromRGB(40, 20, 20)
+    close.TextScaled = true
+    close.Font = Enum.Font.GothamBold
+    close.AutoButtonColor = false
+    close.ZIndex = 33
+    corner(close, 14)
+    close.Parent = p
+    close.MouseButton1Click:Connect(function() self:close() end)
+
+    self.panel = p
+    self.tabBar = tabBar
+    self.contentFrame = content
+
+    self:_switchTab("Dynamics")
+end
+
+-- ==================== TAB SWITCH ====================
+function Module:_switchTab(name)
+    self.activeTab = name
+    for tabName, btn in pairs(self.tabButtons) do
+        btn.BackgroundColor3 = (tabName == name)
+            and Color3.fromRGB(60, 160, 255) or Color3.fromRGB(20, 20, 25)
+    end
+    for tabName, scroll in pairs(self.tabContents) do
+        scroll.Visible = (tabName == name)
+    end
+    self:_buildTab(name)
+end
+
+-- ==================== TAB BUILDING ====================
+function Module:_buildTab(name)
+    local scroll = self.tabContents[name]
+    if not scroll then return end
+
+    -- Clear existing
+    for _, child in ipairs(scroll:GetChildren()) do
+        if child:IsA("Frame") or child:IsA("TextLabel") or child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+    self.rowRefs = self.rowRefs or {}
+
+    local y = 6
+
+    if name == "Dynamics" then
+        y = self:_buildDynamics(scroll, y)
+    elseif name == "Physics" then
+        y = self:_buildPhysics(scroll, y)
+    elseif name == "Audio" then
+        y = self:_buildAudio(scroll, y)
+    elseif name == "Engine" then
+        y = self:_buildEngine(scroll, y)
+    elseif name == "Controls" then
+        y = self:_buildControls(scroll, y)
+    elseif name == "Lights" then
+        y = self:_buildLights(scroll, y)
+    end
+
+    scroll.CanvasSize = UDim2.new(0, 0, 0, y + 10)
+end
+
+-- ==================== DYNAMICS TAB ====================
+function Module:_buildDynamics(parent, y)
+    -- Header
+    local hdr = Instance.new("TextLabel")
+    hdr.Size = UDim2.new(1, -16, 0, 22)
+    hdr.Position = UDim2.new(0, 8, 0, y)
+    hdr.Text = "Driving Dynamics"
+    hdr.TextColor3 = Color3.fromRGB(100, 200, 255)
+    hdr.BackgroundTransparency = 1
+    hdr.TextXAlignment = Enum.TextXAlignment.Left
+    hdr.TextSize = 13
+    hdr.Font = Enum.Font.GothamBold
+    hdr.ZIndex = 32
+    hdr.Parent = parent
+    y = y + 26
+
+    -- Reset Grip button
+    local resetBtn = Instance.new("TextButton")
+    resetBtn.Size = UDim2.new(1, -16, 0, 28)
+    resetBtn.Position = UDim2.new(0, 8, 0, y)
+    resetBtn.Text = "⟲ RESET GRIP TO STOCK"
+    resetBtn.TextColor3 = Color3.fromRGB(255, 200, 100)
+    resetBtn.BackgroundColor3 = Color3.fromRGB(60, 40, 20)
+    resetBtn.TextSize = 12
+    resetBtn.Font = Enum.Font.GothamBold
+    resetBtn.AutoButtonColor = false
+    resetBtn.ZIndex = 32
+    corner(resetBtn, 6)
+    resetBtn.Parent = parent
+    resetBtn.MouseButton1Click:Connect(function()
+        self:_resetGrip()
+    end)
+    y = y + 34
+
+    y = self:_addSettingRow(parent, y, "brakingPower",     "Braking Power")
+    y = self:_addSettingRow(parent, y, "brakeBiasEnabled", "Brake Bias")
+    y = self:_addSettingRow(parent, y, "brakeBias",        "Bias Front/Rear")
+    y = self:_addSettingRow(parent, y, "brakeBiasIntensity", "Bias Intensity")
+    y = self:_addSettingRow(parent, y, "turboStage",       "Turbo Stage")
+    y = self:_addSettingRow(parent, y, "throttleUltra",    "Throttle Ultra")
+    y = self:_addSettingRow(parent, y, "weightTransferMode", "Weight Transfer Mode")
+    y = self:_addSettingRow(parent, y, "weightTransferIntensity", "WT Intensity")
+    y = self:_addSettingRow(parent, y, "steeringSensitivity", "Steering Sensitivity")
+    y = self:_addSettingRow(parent, y, "driftStrength",    "Drift Strength")
+
+    return y
+end
+
+-- ==================== PHYSICS TAB ====================
+function Module:_buildPhysics(parent, y)
+    local hdr = Instance.new("TextLabel")
+    hdr.Size = UDim2.new(1, -16, 0, 22)
+    hdr.Position = UDim2.new(0, 8, 0, y)
+    hdr.Text = "Physics Simulation"
+    hdr.TextColor3 = Color3.fromRGB(100, 200, 255)
+    hdr.BackgroundTransparency = 1
+    hdr.TextXAlignment = Enum.TextXAlignment.Left
+    hdr.TextSize = 13
+    hdr.Font = Enum.Font.GothamBold
+    hdr.ZIndex = 32
+    hdr.Parent = parent
+    y = y + 26
+
+    y = self:_addSettingRow(parent, y, "physicsTiltLevel", "Body Tilt Level")
+
+    local physicsKeys = {
+        "torqueCurve", "engineBraking", "engineBrakingStrength",
+        "engineLoad", "engineLoadSensitivity",
+        "aeroDrag", "aeroDownforce", "downforceCoefficient",
+        "weightTransfer", "clutchSimulation", "clutchDuration",
+        "coldStart", "coldStartDuration", "idleHunting", "engineBog",
+        "fuelCutLimiter", "tractionControl", "tractionControlSensitivity",
+        "launchWindow", "telemetryHud", "virtualClutch",
+        "antiLagEnabled", "absEnabled", "brakeFadeEnabled", "tireTempEnabled",
+    }
+    for _, key in ipairs(physicsKeys) do
+        y = self:_addSettingRow(parent, y, "physics." .. key, self:_prettyName(key))
+    end
+
+    return y
+end
+
+-- ==================== AUDIO TAB ====================
+function Module:_buildAudio(parent, y)
+    local hdr = Instance.new("TextLabel")
+    hdr.Size = UDim2.new(1, -16, 0, 22)
+    hdr.Position = UDim2.new(0, 8, 0, y)
+    hdr.Text = "Audio"
+    hdr.TextColor3 = Color3.fromRGB(100, 200, 255)
+    hdr.BackgroundTransparency = 1
+    hdr.TextXAlignment = Enum.TextXAlignment.Left
+    hdr.TextSize = 13
+    hdr.Font = Enum.Font.GothamBold
+    hdr.ZIndex = 32
+    hdr.Parent = parent
+    y = y + 26
+
+    y = self:_addSettingRow(parent, y, "masterVolume", "Master Volume")
+    y = self:_addSettingRow(parent, y, "engineBoost",  "Engine Boost")
+    y = self:_addSettingRow(parent, y, "pitchOffset",  "Pitch Offset")
+
+    return y
+end
+
+-- ==================== ENGINE TAB ====================
+function Module:_buildEngine(parent, y)
+    local hdr = Instance.new("TextLabel")
+    hdr.Size = UDim2.new(1, -16, 0, 22)
+    hdr.Position = UDim2.new(0, 8, 0, y)
+    hdr.Text = "Engine Profile"
+    hdr.TextColor3 = Color3.fromRGB(100, 200, 255)
+    hdr.BackgroundTransparency = 1
+    hdr.TextXAlignment = Enum.TextXAlignment.Left
+    hdr.TextSize = 13
+    hdr.Font = Enum.Font.GothamBold
+    hdr.ZIndex = 32
+    hdr.Parent = parent
+    y = y + 26
+
+    -- Profile selector list
+    local profiles = self.profiles:getAll()
+    local currentIdx = self.profiles:getCurrentIndex()
+
+    local warnLabel = Instance.new("TextLabel")
+    warnLabel.Size = UDim2.new(1, -16, 0, 18)
+    warnLabel.Position = UDim2.new(0, 8, 0, y)
+    warnLabel.Text = "⚠ Cannot change while moving"
+    warnLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+    warnLabel.BackgroundTransparency = 1
+    warnLabel.TextXAlignment = Enum.TextXAlignment.Left
+    warnLabel.TextSize = 11
+    warnLabel.Font = Enum.Font.GothamBold
+    warnLabel.Visible = false
+    warnLabel.ZIndex = 32
+    warnLabel.Parent = parent
+    y = y + 22
+
+    for i, prof in ipairs(profiles) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, -16, 0, 30)
+        btn.Position = UDim2.new(0, 8, 0, y)
+        btn.Text = prof.name
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.BackgroundColor3 = (i == currentIdx)
+            and Color3.fromRGB(60, 160, 255) or Color3.fromRGB(30, 30, 40)
+        btn.TextSize = 12
+        btn.Font = Enum.Font.GothamBold
+        btn.AutoButtonColor = false
+        btn.ZIndex = 32
+        corner(btn, 6)
+        btn.Parent = parent
+
+        btn.MouseButton1Click:Connect(function()
+            local speed = self:_getSpeed()
+            if speed > 5 then
+                warnLabel.Visible = true
+                task.delay(2, function() warnLabel.Visible = false end)
+                return
+            end
+            self.profiles:setCurrent(i)
+            for _, child in ipairs(parent:GetChildren()) do
+                if child:IsA("TextButton") and child.Text ~= "⟲ RESET GRIP TO STOCK" then
+                    local pIdx
+                    for k, p in ipairs(profiles) do
+                        if p.name == child.Text then pIdx = k; break end
+                    end
+                    if pIdx then
+                        child.BackgroundColor3 = (pIdx == i)
+                            and Color3.fromRGB(60, 160, 255) or Color3.fromRGB(30, 30, 40)
+                    end
+                end
+            end
+        end)
+        y = y + 34
+    end
+
+    y = y + 10
+
+    -- Toggle rows
+    y = self:_addSettingRow(parent, y, "turboSpoolEnabled",   "Turbo Spool Sound")
+    y = self:_addSettingRow(parent, y, "turboFlutterEnabled", "Turbo Flutter Sound")
+    y = self:_addSettingRow(parent, y, "turboBlowoffEnabled", "Turbo Blow-Off Sound")
+    y = self:_addSettingRow(parent, y, "backfireEnabled",     "Backfire")
+
+    return y
+end
+
+-- ==================== CONTROLS TAB ====================
+function Module:_buildControls(parent, y)
+    local hdr = Instance.new("TextLabel")
+    hdr.Size = UDim2.new(1, -16, 0, 22)
+    hdr.Position = UDim2.new(0, 8, 0, y)
+    hdr.Text = "Controls"
+    hdr.TextColor3 = Color3.fromRGB(100, 200, 255)
+    hdr.BackgroundTransparency = 1
+    hdr.TextXAlignment = Enum.TextXAlignment.Left
+    hdr.TextSize = 13
+    hdr.Font = Enum.Font.GothamBold
+    hdr.ZIndex = 32
+    hdr.Parent = parent
+    y = y + 26
+
+    y = self:_addSettingRow(parent, y, "topSpeed", "Top Speed (dash)")
+    y = self:_addSettingRow(parent, y, "ghostModeEnabled", "Ghost Mode")
+    y = self:_addSettingRow(parent, y, "fovDynamicsEnabled", "FOV Dynamics")
+    y = self:_addSettingRow(parent, y, "highSpeedSteerReduction", "High Speed Steer Reduction")
+    y = self:_addSettingRow(parent, y, "reductionFactor", "Reduction Factor")
+    y = self:_addSettingRow(parent, y, "realisticTurboEnabled", "Realistic Turbo")
+    y = self:_addSettingRow(parent, y, "videoMode", "Video Mode (V)")
+
+    return y
+end
+
+-- ==================== LIGHTS TAB ====================
+function Module:_buildLights(parent, y)
+    local hdr = Instance.new("TextLabel")
+    hdr.Size = UDim2.new(1, -16, 0, 22)
+    hdr.Position = UDim2.new(0, 8, 0, y)
+    hdr.Text = "Lights"
+    hdr.TextColor3 = Color3.fromRGB(100, 200, 255)
+    hdr.BackgroundTransparency = 1
+    hdr.TextXAlignment = Enum.TextXAlignment.Left
+    hdr.TextSize = 13
+    hdr.Font = Enum.Font.GothamBold
+    hdr.ZIndex = 32
+    hdr.Parent = parent
+    y = y + 26
+
+    y = self:_addSettingRow(parent, y, "lightPattern", "Light Pattern")
+    y = self:_addSettingRow(parent, y, "lightSpeed", "Pattern Speed")
+    y = self:_addSettingRow(parent, y, "hazardEnabled", "Hazards in Show")
+    y = self:_addSettingRow(parent, y, "headlightsEnabled", "Headlights in Show")
+
+    return y
+end
+
+-- ==================== SETTING ROW FACTORY ====================
+function Module:_addSettingRow(parent, y, path, label)
+    local schema = _G.VX.registry:get("settings", path)
+    if not schema then
+        -- Row without schema — show label as disabled
+        local row = Instance.new("TextLabel")
+        row.Size = UDim2.new(1, -16, 0, 26)
+        row.Position = UDim2.new(0, 8, 0, y)
+        row.Text = label .. "  [not registered]"
+        row.TextColor3 = Color3.fromRGB(120, 120, 120)
+        row.BackgroundTransparency = 1
+        row.TextXAlignment = Enum.TextXAlignment.Left
+        row.TextSize = 12
+        row.Font = Enum.Font.Gotham
+        row.ZIndex = 32
+        row.Parent = parent
+        return y + 30
+    end
+
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -16, 0, 28)
+    row.Position = UDim2.new(0, 8, 0, y)
+    row.BackgroundTransparency = 1
+    row.ZIndex = 32
+    row.Parent = parent
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(0.55, 0, 1, 0)
+    lbl.Position = UDim2.new(0, 4, 0, 0)
+    lbl.Text = label
+    lbl.TextColor3 = Color3.fromRGB(220, 220, 220)
+    lbl.BackgroundTransparency = 1
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextSize = 12
+    lbl.Font = Enum.Font.Gotham
+    lbl.ZIndex = 33
+    lbl.Parent = row
+
+    local schemaType = schema.type
+    local currentValue = _G.VX.getSetting(path)
+
+    if schemaType == "boolean" then
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0.25, 0, 0.9, 0)
+        btn.Position = UDim2.new(0.72, 0, 0.05, 0)
+        btn.Text = currentValue and "ON" or "OFF"
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.BackgroundColor3 = currentValue
+            and Color3.fromRGB(60, 160, 255) or Color3.fromRGB(80, 80, 80)
+        btn.TextSize = 12
+        btn.Font = Enum.Font.GothamBold
+        btn.AutoButtonColor = false
+        btn.ZIndex = 33
+        corner(btn, 6)
+        btn.Parent = row
+        btn.MouseButton1Click:Connect(function()
+            local newVal = not _G.VX.getSetting(path)
+            _G.VX.setSetting(path, newVal)
+            btn.Text = newVal and "ON" or "OFF"
+            btn.BackgroundColor3 = newVal
+                and Color3.fromRGB(60, 160, 255) or Color3.fromRGB(80, 80, 80)
+        end)
+    elseif schemaType == "number_stepped" or schemaType == "number_range" then
+        local valLabel = Instance.new("TextLabel")
+        valLabel.Size = UDim2.new(0.18, 0, 1, 0)
+        valLabel.Position = UDim2.new(0.56, 0, 0, 0)
+        valLabel.Text = self:_formatNumber(path, currentValue, schema)
+        valLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+        valLabel.BackgroundTransparency = 1
+        valLabel.TextSize = 12
+        valLabel.Font = Enum.Font.GothamBold
+        valLabel.ZIndex = 33
+        valLabel.Parent = row
+
+        local function makeBtn(text, posX, onClick)
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(0.10, 0, 0.9, 0)
+            btn.Position = UDim2.new(posX, 0, 0.05, 0)
+            btn.Text = text
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            btn.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+            btn.TextSize = 14
+            btn.Font = Enum.Font.GothamBold
+            btn.AutoButtonColor = false
+            btn.ZIndex = 33
+            corner(btn, 6)
+            btn.Parent = row
+            btn.MouseButton1Click:Connect(onClick)
+            return btn
+        end
+
+        makeBtn("–", 0.76, function()
+            local v = _G.VX.getSetting(path)
+            v = v - (schema.step or 1)
+            v = math.max(schema.min or -9999, v)
+            _G.VX.setSetting(path, v)
+            valLabel.Text = self:_formatNumber(path, v, schema)
+        end)
+        makeBtn("+", 0.88, function()
+            local v = _G.VX.getSetting(path)
+            v = v + (schema.step or 1)
+            v = math.min(schema.max or 9999, v)
+            _G.VX.setSetting(path, v)
+            valLabel.Text = self:_formatNumber(path, v, schema)
+        end)
+    elseif schemaType == "enum" then
+        -- Special-case weight transfer mode (3 buttons)
+        if path == "weightTransferMode" then
+            local options = { "Off", "Normal", "Drift" }
+            local btnWidth = 0.14
+            for i, opt in ipairs(options) do
+                local btn = Instance.new("TextButton")
+                btn.Size = UDim2.new(btnWidth, 0, 0.9, 0)
+                btn.Position = UDim2.new(0.58 + (i-1) * (btnWidth + 0.01), 0, 0.05, 0)
+                btn.Text = opt
+                btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                btn.BackgroundColor3 = (currentValue == opt)
+                    and Color3.fromRGB(60, 160, 255) or Color3.fromRGB(40, 40, 48)
+                btn.TextSize = 11
+                btn.Font = Enum.Font.GothamBold
+                btn.AutoButtonColor = false
+                btn.ZIndex = 33
+                corner(btn, 6)
+                btn.Parent = row
+                btn.MouseButton1Click:Connect(function()
+                    _G.VX.setSetting(path, opt)
+                    for _, c in ipairs(row:GetChildren()) do
+                        if c:IsA("TextButton") then
+                            c.BackgroundColor3 = (c.Text == opt)
+                                and Color3.fromRGB(60, 160, 255) or Color3.fromRGB(40, 40, 48)
+                        end
+                    end
+                end)
+            end
+        elseif path == "turboStage" then
+            -- 4-button turbo stage
+            local options = { "Off", "Low", "Mid", "High" }
+            local btnWidth = 0.10
+            for i, opt in ipairs(options) do
+                local btn = Instance.new("TextButton")
+                btn.Size = UDim2.new(btnWidth, 0, 0.9, 0)
+                btn.Position = UDim2.new(0.58 + (i-1) * (btnWidth + 0.005), 0, 0.05, 0)
+                btn.Text = opt
+                btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                btn.BackgroundColor3 = (currentValue == (i-1))
+                    and Color3.fromRGB(60, 160, 255) or Color3.fromRGB(40, 40, 48)
+                btn.TextSize = 10
+                btn.Font = Enum.Font.GothamBold
+                btn.AutoButtonColor = false
+                btn.ZIndex = 33
+                corner(btn, 6)
+                btn.Parent = row
+                btn.MouseButton1Click:Connect(function()
+                    _G.VX.setSetting(path, i - 1)
+                    for k, c in ipairs(row:GetChildren()) do
+                        if c:IsA("TextButton") then
+                            local optIdx = nil
+                            for idx, o in ipairs(options) do
+                                if c.Text == o then optIdx = idx; break end
+                            end
+                            if optIdx then
+                                c.BackgroundColor3 = (optIdx == i)
+                                    and Color3.fromRGB(60, 160, 255) or Color3.fromRGB(40, 40, 48)
+                            end
+                        end
+                    end
+                end)
+            end
+        else
+            -- Generic enum: cycle through options
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(0.40, 0, 0.9, 0)
+            btn.Position = UDim2.new(0.57, 0, 0.05, 0)
+            btn.Text = tostring(currentValue)
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            btn.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+            btn.TextSize = 11
+            btn.Font = Enum.Font.GothamBold
+            btn.AutoButtonColor = false
+            btn.ZIndex = 33
+            corner(btn, 6)
+            btn.Parent = row
+            btn.MouseButton1Click:Connect(function()
+                local options = schema.options or {}
+                if #options == 0 then return end
+                local cur = _G.VX.getSetting(path)
+                local curIdx = 1
+                for i, o in ipairs(options) do
+                    if o == cur then curIdx = i; break end
+                end
+                local nextIdx = (curIdx % #options) + 1
+                _G.VX.setSetting(path, options[nextIdx])
+                btn.Text = tostring(options[nextIdx])
+            end)
+        end
+    end
+
+    -- Cache for live updates
+    self.rowRefs[path] = {
+        row = row,
+        valueLabel = row:FindFirstChildWhichIsA("TextLabel"),
+        schema = schema,
+    }
+
+    return y + 30
+end
+
+function Module:_formatNumber(path, value, schema)
+    if path == "masterVolume" or path == "engineBoost" then
+        return string.format("%d%%", math.floor(value * 100))
+    elseif path == "pitchOffset" then
+        return string.format("%+d%%", math.floor(value * 100))
+    elseif path == "topSpeed" then
+        return tostring(value)
+    elseif path == "physicsTiltLevel" or path == "lightPattern" or path == "weightTransferMode" then
+        return tostring(value)
+    elseif schema.unit then
+        return string.format("%.2f%s", value, schema.unit)
+    else
+        return string.format("%.2f", value)
+    end
+end
+
+function Module:_prettyName(key)
+    -- camelCase → Title Case With Spaces
+    local s = key:gsub("(%u)", " %1")
+    s = s:gsub("^%s+", "")
+    return s
+end
+
+-- ==================== RESET GRIP ====================
+function Module:_resetGrip()
+    local authority = _G.VX.Authority
+    local handle = authority and authority:getHandle()
+    if not handle then
+        _G.VX.UI:notify("No vehicle to reset", 1.5)
+        return
+    end
+    for _, w in ipairs(handle.wheels) do
+        if w.physical and w.physical.Parent then
+            pcall(function()
+                local props = w.physical.CustomPhysicalProperties
+                local d = props and props.Density or 0.7
+                local e = props and props.Elasticity or 0.5
+                local fw = props and props.FrictionWeight or 2
+                local ew = props and props.ElasticityWeight or 1
+                w.physical.CustomPhysicalProperties = PhysicalProperties.new(d, 1.0, e, fw, ew)
+            end)
+        end
+    end
+    _G.VX.UI:notify("Grip reset to stock (1.0)", 1.5)
+    self.chassis:_cacheBaseGrip()
+end
+
+-- ==================== OPEN / CLOSE ====================
+function Module:open()
+    if self.isPanelOpen or not self.panel then return end
+    self.isPanelOpen = true
+    self.panel.Visible = true
+
+    self:_buildTab(self.activeTab)
+
+    if self.slideInSound then pcall(function() self.slideInSound:Play() end) end
+
+    if self.tweenOut then
+        pcall(function() self.tweenOut:Cancel() end)
+    end
+    self.tweenIn = TweenService:Create(
+        self.panel,
+        TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        { Position = UDim2.new(0, 0, 0.17, 0) }
+    )
+    self.tweenIn:Play()
+end
+
+function Module:close()
+    if not self.isPanelOpen or not self.panel then return end
+    self.isPanelOpen = false
+
+    if self.slideOutSound then pcall(function() self.slideOutSound:Play() end) end
+
+    if self.tweenIn then
+        pcall(function() self.tweenIn:Cancel() end)
+    end
+    self.tweenOut = TweenService:Create(
+        self.panel,
+        TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+        { Position = UDim2.new(-0.35, 0, 0.17, 0) }
+    )
+    self.tweenOut.Completed:Connect(function()
+        if not self.isPanelOpen then
+            self.panel.Visible = false
+        end
+    end)
+    self.tweenOut:Play()
+end
+
+function Module:isOpen()
+    return self.isPanelOpen
+end
+
+-- ==================== SETTINGS CHANGE ====================
+function Module:_onSettingChange(evt)
+    if not evt or not self.isPanelOpen then return end
+    -- Refresh row value labels if present
+    local cached = self.rowRefs[evt.path]
+    if cached and cached.valueLabel then
+        local schema = cached.schema
+        if schema.type == "number_stepped" or schema.type == "number_range" then
+            cached.valueLabel.Text = self:_formatNumber(evt.path, evt.new, schema)
+        end
+    end
+end
+
+-- ==================== HELPERS ====================
+function Module:_getSpeed()
+    local handle = _G.VX.Authority and _G.VX.Authority:getHandle()
+    if not handle or not handle.root or not handle.root.PrimaryPart then return 0 end
+    local v = handle.root.PrimaryPart.AssemblyLinearVelocity
+    return Vector3.new(v.X, 0, v.Z).Magnitude * 0.626
+end
+
+return Module
