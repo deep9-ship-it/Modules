@@ -27,7 +27,7 @@ local Player = Players.LocalPlayer
 
 local Module = VX.Framework.Module.new({
     Name = "Panel",
-    Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis" },
+    Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "UI" },
     Version = "3.0.0",
 })
 
