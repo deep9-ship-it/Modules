@@ -293,7 +293,8 @@ function Module:_buildDynamics(parent, y)
     y = self:_addSettingRow(parent, y, "weightTransferMode", "Weight Transfer Mode")
     y = self:_addSettingRow(parent, y, "weightTransferIntensity", "WT Intensity")
     y = self:_addSettingRow(parent, y, "steeringSensitivity", "Steering Sensitivity")
-    y = self:_addSettingRow(parent, y, "driftStrength",    "Drift Strength")
+    y = self:_addSettingRow(parent, y, "driftStrength",    "Drift Strength")  
+    y = self:_addSettingRow(parent, y, "drivetrain", "Drivetrain")
 
     return y
 end
@@ -314,6 +315,9 @@ function Module:_buildPhysics(parent, y)
     y = y + 26
 
     y = self:_addSettingRow(parent, y, "physicsTiltLevel", "Body Tilt Level")
+    y = self:_addSettingRow(parent, y, "physics.turnSpeed", "Turn Speed")
+    y = self:_addSettingRow(parent, y, "physics.maxSteerAngle", "Max Steer Angle")
+    y = self:_addSettingRow(parent, y, "physics.steeringDecay", "Steering Decay")
 
     local physicsKeys = {
         "torqueCurve", "engineBraking", "engineBrakingStrength",
