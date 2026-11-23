@@ -1,21 +1,8 @@
 --[[
-    VX_UI v3.0.0
-    Dashboard, telemetry HUD, notifications, video mode, diagnostics panel.
-
-    Depends on: Core, Profiles, Powertrain, DriveSystem, Chassis, VehicleState
-    Exposes:
-      notify(text, duration)
-      toggleVideoMode()
-      isVideoMode()
-      toggleDiagnostics()
-      openPanel() / closePanel()  (delegates to Panel module)
-      getDashboardRefs()
-
-    Listens:
-      vehicle.stateChanged
-      settings.changed
-      vehicle.shift
-      vehicle.launchRelease
+    VX_UI v3.1.0
+    - Video mode: hides ALL MainGUIHandler descendants except Pedals/Steering
+    - Dashboard stays visible
+    - PSI display = boostPressure directly
 ]]
 
 local VX = _G.VX
@@ -29,10 +16,9 @@ local PlayerGui = Player:WaitForChild("PlayerGui")
 local Module = VX.Framework.Module.new({
     Name = "UI",
     Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "VehicleState" },
-    Version = "3.0.0",
+    Version = "3.1.0",
 })
 
--- ==================== STATE ====================
 function Module:Construct()
     self.gui = nil
     self.dashboard = nil
@@ -40,62 +26,46 @@ function Module:Construct()
     self.diagnosticsPanel = nil
     self.settingsBtn = nil
     self.notifQueue = {}
-    self.notifActive = false
 
     self.dashboardRefs = {
-        root       = nil,
-        speedText  = nil,
-        unitText   = nil,
-        gearText   = nil,
-        psiText    = nil,
-        rpmFill    = nil,
-        rpmFlash   = nil,
-        launchInd  = nil,
-        lastFill   = 0,
-        fillTween  = nil,
-        flashPhase = 0,
+        root = nil, speedText = nil, unitText = nil, gearText = nil, psiText = nil,
+        rpmFill = nil, rpmFlash = nil, launchInd = nil,
+        lastFill = 0, fillTween = nil, flashPhase = 0,
     }
-
-    self.dashboardVisible = false
 
     self._loopThread = nil
     self._running = false
     self._updateInterval = 1/20
 
-    -- Video mode
     self.videoMode = false
-    self.hiddenElements = {}  -- [instance] = originalVisible
+    self.hiddenElements = {}
     self.videoModeWatcher = nil
 
-    -- Diagnostics
     self.diagOpen = false
     self.diagRefs = {}
 
-    -- Notifications
-    self.notifParent = nil
     self.notifScreen = nil
 end
 
 function Module:Init(deps)
-    self.core        = deps.Core
-    self.profiles    = deps.Profiles
-    self.powertrain  = deps.Powertrain
-    self.drive       = deps.DriveSystem
-    self.chassis     = deps.Chassis
-    self.state       = deps.VehicleState
+    self.core = deps.Core
+    self.profiles = deps.Profiles
+    self.powertrain = deps.Powertrain
+    self.drive = deps.DriveSystem
+    self.chassis = deps.Chassis
+    self.state = deps.VehicleState
 end
 
 function Module:Start()
     _G.VX.UI = self
-
     self:_createScreenGui()
     self:_createDashboard()
     self:_createSettingsButton()
     self:_createDiagnosticsPanel()
 
     _G.VX.bus:on("vehicle.stateChanged", function(evt) self:_onStateChange(evt) end)
-    _G.VX.bus:on("settings.changed",     function(evt) self:_onSettingChange(evt) end)
-    _G.VX.bus:on("vehicle.shift",        function(evt) self:_onShift(evt) end)
+    _G.VX.bus:on("settings.changed", function(evt) self:_onSettingChange(evt) end)
+    _G.VX.bus:on("vehicle.shift", function(evt) self:_onShift(evt) end)
     _G.VX.bus:on("vehicle.launchRelease", function(evt) self:_onLaunchRelease(evt) end)
 
     print("[VX] UI ready")
@@ -103,35 +73,19 @@ end
 
 function Module:Stop()
     self:_stopLoop()
-    if self.gui then
-        pcall(function() self.gui:Destroy() end)
-        self.gui = nil
-    end
+    if self.gui then pcall(function() self.gui:Destroy() end); self.gui = nil end
     if _G.VX.UI == self then _G.VX.UI = nil end
 end
 
-function Module:heartbeat()
-    return true
-end
+function Module:heartbeat() return true end
 
--- ==================== HELPERS ====================
 local function corner(obj, r)
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, r or 12)
-    c.Parent = obj
-    return c
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 12); c.Parent = obj; return c
 end
-
 local function stroke(obj, col, thick)
-    local s = Instance.new("UIStroke")
-    s.Color = col or Color3.fromRGB(100, 200, 255)
-    s.Thickness = thick or 2
-    s.Transparency = 0.3
-    s.Parent = obj
-    return s
+    local s = Instance.new("UIStroke"); s.Color = col or Color3.fromRGB(100,200,255); s.Thickness = thick or 2; s.Transparency = 0.3; s.Parent = obj; return s
 end
 
--- ==================== SCREEN GUI ====================
 function Module:_createScreenGui()
     local gui = Instance.new("ScreenGui")
     gui.Name = "VX_Overlay"
@@ -141,52 +95,44 @@ function Module:_createScreenGui()
     pcall(function() gui.Parent = game:GetService("CoreGui") end)
     if not gui.Parent then gui.Parent = PlayerGui end
     gui.Enabled = true
-
     self.gui = gui
 
-    -- Dedicated notification container so notifications can be hidden in video mode
     local notifScreen = Instance.new("Frame")
     notifScreen.Name = "Notifications"
-    notifScreen.Size = UDim2.new(1, 0, 1, 0)
+    notifScreen.Size = UDim2.new(1,0,1,0)
     notifScreen.BackgroundTransparency = 1
     notifScreen.ZIndex = 50
     notifScreen.Parent = gui
     self.notifScreen = notifScreen
 end
 
--- ==================== DASHBOARD ====================
 function Module:_createDashboard()
     local dash = Instance.new("Frame")
     dash.Name = "VXDashboard"
     dash.Size = UDim2.new(0, 220, 0, 90)
     dash.Position = UDim2.new(0.5, 0, 0.82, 0)
     dash.AnchorPoint = Vector2.new(0.5, 0.5)
-    dash.BackgroundColor3 = Color3.fromRGB(12, 12, 18)
+    dash.BackgroundColor3 = Color3.fromRGB(12,12,18)
     dash.BackgroundTransparency = 0.15
-    dash.BorderSizePixel = 0
     dash.Active = true
     dash.Visible = false
     dash.ZIndex = 10
     corner(dash, 12)
-    stroke(dash, Color3.fromRGB(100, 200, 255), 2)
+    stroke(dash, Color3.fromRGB(100,200,255), 2)
     dash.Parent = self.gui
 
-    -- RPM bar background
     local barBg = Instance.new("Frame")
-    barBg.Name = "RPMBarBG"
-    barBg.Size = UDim2.new(1, -16, 0, 12)
-    barBg.Position = UDim2.new(0, 8, 0, 8)
-    barBg.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+    barBg.Size = UDim2.new(1,-16,0,12)
+    barBg.Position = UDim2.new(0,8,0,8)
+    barBg.BackgroundColor3 = Color3.fromRGB(30,30,40)
     barBg.BorderSizePixel = 0
     barBg.ZIndex = 11
     corner(barBg, 5)
     barBg.Parent = dash
 
-    -- RPM fill
     local fill = Instance.new("Frame")
-    fill.Name = "RPMFill"
-    fill.Size = UDim2.new(0, 0, 1, 0)
-    fill.BackgroundColor3 = Color3.fromRGB(40, 200, 80)
+    fill.Size = UDim2.new(0,0,1,0)
+    fill.BackgroundColor3 = Color3.fromRGB(40,200,80)
     fill.BorderSizePixel = 0
     fill.ZIndex = 12
     corner(fill, 5)
@@ -194,47 +140,39 @@ function Module:_createDashboard()
 
     local grad = Instance.new("UIGradient")
     grad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0.00, Color3.fromRGB(40, 200, 80)),
-        ColorSequenceKeypoint.new(0.50, Color3.fromRGB(40, 200, 80)),
-        ColorSequenceKeypoint.new(0.72, Color3.fromRGB(240, 200, 40)),
-        ColorSequenceKeypoint.new(0.88, Color3.fromRGB(255, 130, 40)),
-        ColorSequenceKeypoint.new(1.00, Color3.fromRGB(240, 40, 40)),
+        ColorSequenceKeypoint.new(0.00, Color3.fromRGB(40,200,80)),
+        ColorSequenceKeypoint.new(0.50, Color3.fromRGB(40,200,80)),
+        ColorSequenceKeypoint.new(0.72, Color3.fromRGB(240,200,40)),
+        ColorSequenceKeypoint.new(0.88, Color3.fromRGB(255,130,40)),
+        ColorSequenceKeypoint.new(1.00, Color3.fromRGB(240,40,40)),
     })
     grad.Parent = fill
 
-    -- Rev limiter flash overlay
     local flash = Instance.new("Frame")
-    flash.Name = "RPMFlash"
-    flash.Size = UDim2.new(1, 0, 1, 0)
-    flash.BackgroundColor3 = Color3.fromRGB(255, 50, 50)
+    flash.Size = UDim2.new(1,0,1,0)
+    flash.BackgroundColor3 = Color3.fromRGB(255,50,50)
     flash.BackgroundTransparency = 1
-    flash.BorderSizePixel = 0
     flash.ZIndex = 13
     corner(flash, 5)
     flash.Parent = fill
 
-    -- Speed
     local speed = Instance.new("TextLabel")
-    speed.Name = "SpeedText"
-    speed.Size = UDim2.new(0.42, 0, 0, 44)
-    speed.Position = UDim2.new(0, 10, 0, 24)
+    speed.Size = UDim2.new(0.42,0,0,44)
+    speed.Position = UDim2.new(0,10,0,24)
     speed.Text = "0"
-    speed.TextColor3 = Color3.fromRGB(255, 255, 255)
+    speed.TextColor3 = Color3.fromRGB(255,255,255)
     speed.TextScaled = true
     speed.Font = Enum.Font.GothamBlack
     speed.BackgroundTransparency = 1
     speed.TextXAlignment = Enum.TextXAlignment.Left
-    speed.TextYAlignment = Enum.TextYAlignment.Center
     speed.ZIndex = 11
     speed.Parent = dash
 
-    -- Unit
     local unit = Instance.new("TextLabel")
-    unit.Name = "UnitText"
-    unit.Size = UDim2.new(0.15, 0, 0, 14)
-    unit.Position = UDim2.new(0, 12, 0, 70)
+    unit.Size = UDim2.new(0.15,0,0,14)
+    unit.Position = UDim2.new(0,12,0,70)
     unit.Text = "mph"
-    unit.TextColor3 = Color3.fromRGB(150, 150, 150)
+    unit.TextColor3 = Color3.fromRGB(150,150,150)
     unit.TextScaled = true
     unit.Font = Enum.Font.GothamBold
     unit.BackgroundTransparency = 1
@@ -242,26 +180,22 @@ function Module:_createDashboard()
     unit.ZIndex = 11
     unit.Parent = dash
 
-    -- Gear
     local gear = Instance.new("TextLabel")
-    gear.Name = "GearText"
-    gear.Size = UDim2.new(0.28, 0, 0, 24)
-    gear.Position = UDim2.new(0.36, 0, 0, 42)
+    gear.Size = UDim2.new(0.28,0,0,24)
+    gear.Position = UDim2.new(0.36,0,0,42)
     gear.Text = "GEAR 1"
-    gear.TextColor3 = Color3.fromRGB(255, 255, 255)
+    gear.TextColor3 = Color3.fromRGB(255,255,255)
     gear.TextScaled = true
     gear.Font = Enum.Font.GothamBold
     gear.BackgroundTransparency = 1
     gear.ZIndex = 11
     gear.Parent = dash
 
-    -- PSI
     local psi = Instance.new("TextLabel")
-    psi.Name = "PSIText"
-    psi.Size = UDim2.new(0.30, 0, 0, 20)
-    psi.Position = UDim2.new(0.66, 0, 0, 44)
+    psi.Size = UDim2.new(0.30,0,0,20)
+    psi.Position = UDim2.new(0.66,0,0,44)
     psi.Text = "0.0 PSI"
-    psi.TextColor3 = Color3.fromRGB(100, 200, 255)
+    psi.TextColor3 = Color3.fromRGB(100,200,255)
     psi.TextScaled = true
     psi.Font = Enum.Font.GothamBold
     psi.BackgroundTransparency = 1
@@ -269,13 +203,11 @@ function Module:_createDashboard()
     psi.ZIndex = 11
     psi.Parent = dash
 
-    -- Launch indicator
     local launchInd = Instance.new("TextLabel")
-    launchInd.Name = "LaunchIndicator"
-    launchInd.Size = UDim2.new(0.6, 0, 0, 14)
-    launchInd.Position = UDim2.new(0.2, 0, 1, -16)
+    launchInd.Size = UDim2.new(0.6,0,0,14)
+    launchInd.Position = UDim2.new(0.2,0,1,-16)
     launchInd.Text = ""
-    launchInd.TextColor3 = Color3.fromRGB(255, 220, 60)
+    launchInd.TextColor3 = Color3.fromRGB(255,220,60)
     launchInd.BackgroundTransparency = 1
     launchInd.TextScaled = true
     launchInd.Font = Enum.Font.GothamBlack
@@ -286,7 +218,6 @@ function Module:_createDashboard()
     self.dashboard = dash
     self.dashboardRefs.root = dash
     self.dashboardRefs.speedText = speed
-    self.dashboardRefs.unitText = unit
     self.dashboardRefs.gearText = gear
     self.dashboardRefs.psiText = psi
     self.dashboardRefs.rpmFill = fill
@@ -299,51 +230,38 @@ end
 function Module:_makeDraggable(frame)
     local dragging = false
     local startPos, startFramePos
-
+    local uis = game:GetService("UserInputService")
     frame.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            startPos = input.Position
-            startFramePos = frame.Position
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; startPos = input.Position; startFramePos = frame.Position
         end
     end)
-    local uis = game:GetService("UserInputService")
     uis.InputChanged:Connect(function(input)
         if not dragging then return end
-        if input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch then
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
             local delta = input.Position - startPos
-            frame.Position = UDim2.new(
-                startFramePos.X.Scale, startFramePos.X.Offset + delta.X,
-                startFramePos.Y.Scale, startFramePos.Y.Offset + delta.Y
-            )
+            frame.Position = UDim2.new(startFramePos.X.Scale, startFramePos.X.Offset + delta.X, startFramePos.Y.Scale, startFramePos.Y.Offset + delta.Y)
         end
     end)
     uis.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
     end)
 end
 
--- ==================== SETTINGS BUTTON ====================
 function Module:_createSettingsButton()
     local btn = Instance.new("TextButton")
-    btn.Name = "VXSettingsButton"
-    btn.Size = UDim2.new(0, 44, 0, 44)
-    btn.Position = UDim2.new(1, -56, 0, 16)
-    btn.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    btn.Size = UDim2.new(0,44,0,44)
+    btn.Position = UDim2.new(1,-56,0,16)
+    btn.BackgroundColor3 = Color3.fromRGB(30,30,35)
     btn.BackgroundTransparency = 0.25
     btn.Text = "⚙"
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.TextColor3 = Color3.fromRGB(255,255,255)
     btn.TextScaled = true
     btn.Font = Enum.Font.GothamBold
     btn.AutoButtonColor = false
     btn.ZIndex = 20
     corner(btn, 22)
-    stroke(btn, Color3.fromRGB(100, 200, 255), 2)
+    stroke(btn, Color3.fromRGB(100,200,255), 2)
     btn.Parent = self.gui
 
     btn.MouseButton1Click:Connect(function()
@@ -351,11 +269,9 @@ function Module:_createSettingsButton()
         if not panel then return end
         if panel:isOpen() then panel:close() else panel:open() end
     end)
-
     self.settingsBtn = btn
 end
 
--- ==================== STATE CHANGE ====================
 function Module:_onStateChange(evt)
     if evt.to == "Ready" or evt.to == "Idle" then
         self.dashboard.Visible = true
@@ -369,18 +285,15 @@ function Module:_onStateChange(evt)
     end
 end
 
--- ==================== UPDATE LOOP ====================
 function Module:_startLoop()
     if self._running then return end
     self._running = true
-
     local perf = self.core.settings._effectivePerformance
     self._updateInterval = (perf == "low") and 0.1 or 0.05
-
     self._loopThread = task.spawn(function()
         while self._running do
             task.wait(self._updateInterval)
-            pcall(self._update, self)
+            pcall(function() self:_update() end)
         end
     end)
 end
@@ -388,15 +301,11 @@ end
 function Module:_stopLoop()
     if not self._running then return end
     self._running = false
-    if self._loopThread then
-        pcall(function() task.cancel(self._loopThread) end)
-        self._loopThread = nil
-    end
+    if self._loopThread then pcall(function() task.cancel(self._loopThread) end); self._loopThread = nil end
 end
 
 function Module:_update()
     if not self.dashboard or not self.dashboard.Visible then return end
-
     local speed = 0
     local handle = _G.VX.Authority and _G.VX.Authority:getHandle()
     if handle and handle.root and handle.root.PrimaryPart then
@@ -407,167 +316,106 @@ function Module:_update()
     local rpm = self.powertrain:getRPM()
     local gear = self.powertrain:getGear()
     local boost = self.drive:getBoost()
-    local stage = self.drive:getTurboStage()
     local prof = self.profiles:current()
-    local launchState = self.powertrain:getLaunchState()
     local isLimited = self.powertrain:isRevLimiting()
 
-    -- Speed
     self.dashboardRefs.speedText.Text = tostring(speed)
-    self.dashboardRefs.speedText.TextColor3 = speed > 100
-        and Color3.fromRGB(255, 220, 100) or Color3.fromRGB(255, 255, 255)
+    self.dashboardRefs.speedText.TextColor3 = speed > 100 and Color3.fromRGB(255,220,100) or Color3.fromRGB(255,255,255)
 
-    -- Gear
     local gearLabel = (gear == -1) and "R" or tostring(gear)
     self.dashboardRefs.gearText.Text = "GEAR " .. gearLabel
-    if isLimited then
-        self.dashboardRefs.gearText.TextColor3 = Color3.fromRGB(255, 40, 40)
-    elseif rpm > prof.redlineRPM * 0.9 then
-        self.dashboardRefs.gearText.TextColor3 = Color3.fromRGB(255, 200, 40)
-    else
-        self.dashboardRefs.gearText.TextColor3 = Color3.fromRGB(255, 255, 255)
-    end
+    if isLimited then self.dashboardRefs.gearText.TextColor3 = Color3.fromRGB(255,40,40)
+    elseif rpm > prof.redlineRPM * 0.9 then self.dashboardRefs.gearText.TextColor3 = Color3.fromRGB(255,200,40)
+    else self.dashboardRefs.gearText.TextColor3 = Color3.fromRGB(255,255,255) end
 
-    -- PSI
-    local cfgStage = self.core.config.turboStages[stage] or self.core.config.turboStages[1]
-    local maxBoost = math.max(cfgStage.maxBoost, 0.01)
-    local psi = boost * 25 / maxBoost
-    self.dashboardRefs.psiText.Text = string.format("%.1f PSI", psi)
-    if psi > 16 then
-        self.dashboardRefs.psiText.TextColor3 = Color3.fromRGB(255, 100, 100)
-    elseif psi > 8 then
-        self.dashboardRefs.psiText.TextColor3 = Color3.fromRGB(240, 200, 60)
-    else
-        self.dashboardRefs.psiText.TextColor3 = Color3.fromRGB(100, 200, 255)
-    end
+    -- PSI: direct boost value (already in PSI)
+    self.dashboardRefs.psiText.Text = string.format("%.1f PSI", boost)
+    if boost > 60 then self.dashboardRefs.psiText.TextColor3 = Color3.fromRGB(255,100,100)
+    elseif boost > 30 then self.dashboardRefs.psiText.TextColor3 = Color3.fromRGB(240,200,60)
+    else self.dashboardRefs.psiText.TextColor3 = Color3.fromRGB(100,200,255) end
 
-    -- RPM bar
-    local fillTarget = math.clamp(
-        (rpm - prof.idleRPM) / math.max(prof.maxRPM - prof.idleRPM, 1), 0, 1
-    )
+    local fillTarget = math.clamp((rpm - prof.idleRPM) / math.max(prof.maxRPM - prof.idleRPM, 1), 0, 1)
     if math.abs(fillTarget - self.dashboardRefs.lastFill) > 0.005 then
         self.dashboardRefs.lastFill = fillTarget
-        if self.dashboardRefs.fillTween then
-            pcall(function() self.dashboardRefs.fillTween:Cancel() end)
-        end
-        self.dashboardRefs.fillTween = TweenService:Create(
-            self.dashboardRefs.rpmFill,
-            TweenInfo.new(0.06, Enum.EasingStyle.Linear),
-            { Size = UDim2.new(fillTarget, 0, 1, 0) }
-        )
+        if self.dashboardRefs.fillTween then pcall(function() self.dashboardRefs.fillTween:Cancel() end) end
+        self.dashboardRefs.fillTween = TweenService:Create(self.dashboardRefs.rpmFill, TweenInfo.new(0.06, Enum.EasingStyle.Linear), { Size = UDim2.new(fillTarget, 0, 1, 0) })
         self.dashboardRefs.fillTween:Play()
     end
 
-    -- Rev limiter flash
     if isLimited then
         self.dashboardRefs.flashPhase = self.dashboardRefs.flashPhase + self._updateInterval
-        self.dashboardRefs.rpmFlash.BackgroundTransparency =
-            0.5 + math.sin(self.dashboardRefs.flashPhase * 20) * 0.4
+        self.dashboardRefs.rpmFlash.BackgroundTransparency = 0.5 + math.sin(self.dashboardRefs.flashPhase * 20) * 0.4
     else
         self.dashboardRefs.rpmFlash.BackgroundTransparency = 1
         self.dashboardRefs.flashPhase = 0
     end
 
     -- Launch indicator
-    if launchState == "holding" then
+    if self.powertrain:isTwostepActive and self.powertrain:isTwostepActive() then
+        self.dashboardRefs.launchInd.Visible = true
+        self.dashboardRefs.launchInd.Text = "2-STEP"
+        self.dashboardRefs.launchInd.TextColor3 = Color3.fromRGB(255,100,50)
+        self.dashboardRefs.launchInd.TextTransparency = 0.5 + math.sin(os.clock() * 25) * 0.5
+    elseif self.powertrain:getLaunchState() == "holding" then
         self.dashboardRefs.launchInd.Visible = true
         self.dashboardRefs.launchInd.Text = "LAUNCH READY"
-        self.dashboardRefs.launchInd.TextTransparency =
-            0.5 + math.sin(os.clock() * 12) * 0.5
-    elseif launchState == "releasing" then
+        self.dashboardRefs.launchInd.TextColor3 = Color3.fromRGB(255,220,60)
+        self.dashboardRefs.launchInd.TextTransparency = 0.5 + math.sin(os.clock() * 12) * 0.5
+    elseif self.powertrain:getLaunchState() == "releasing" then
         self.dashboardRefs.launchInd.Visible = true
         self.dashboardRefs.launchInd.Text = "GO!"
+        self.dashboardRefs.launchInd.TextColor3 = Color3.fromRGB(255,220,60)
         self.dashboardRefs.launchInd.TextTransparency = 0
-    elseif self.drive:getLaunchQuality() ~= "miss" then
-        local quality = self.drive:getLaunchQuality()
-        self.dashboardRefs.launchInd.Visible = true
-        self.dashboardRefs.launchInd.Text = string.upper(quality)
-        self.dashboardRefs.launchInd.TextTransparency = 0
-        task.delay(1.5, function()
-            if self.dashboardRefs.launchInd then
-                self.dashboardRefs.launchInd.Visible = false
-            end
-        end)
     else
         self.dashboardRefs.launchInd.Visible = false
     end
 
-    -- Telemetry
-    if self.telemetry and self.telemetry.Visible then
-        self:_updateTelemetry()
-    end
+    if self.telemetry and self.telemetry.Visible then self:_updateTelemetry() end
 end
 
--- ==================== NOTIFICATIONS ====================
+-- Notifications (abbreviated)
 function Module:notify(text, duration)
     if self.videoMode then return end
     duration = duration or 2.5
-
     local n = Instance.new("TextLabel")
     n.Size = UDim2.new(0.30, 0, 0.06, 0)
     n.Position = UDim2.new(0.35, 0, 0.15, -#self.notifQueue * 60)
-    n.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+    n.BackgroundColor3 = Color3.fromRGB(20,20,25)
     n.BackgroundTransparency = 0.15
-    n.TextColor3 = Color3.fromRGB(255, 255, 255)
+    n.TextColor3 = Color3.fromRGB(255,255,255)
     n.TextScaled = true
     n.Font = Enum.Font.GothamBold
     n.Text = text
     n.ZIndex = 55
-    corner(n, 12)
-    stroke(n, Color3.fromRGB(100, 200, 255), 2)
+    corner(n, 12); stroke(n, Color3.fromRGB(100,200,255), 2)
     n.Parent = self.notifScreen
-
     table.insert(self.notifQueue, n)
-
-    local fade = TweenService:Create(
-        n,
-        TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        { BackgroundTransparency = 1, TextTransparency = 1 }
-    )
-
+    local fade = TweenService:Create(n, TweenInfo.new(0.35), { BackgroundTransparency = 1, TextTransparency = 1 })
     task.delay(duration, function()
-        fade:Play()
-        fade.Completed:Wait()
-        pcall(function() n:Destroy() end)
-        for i, item in ipairs(self.notifQueue) do
-            if item == n then
-                table.remove(self.notifQueue, i)
-                break
-            end
-        end
+        fade:Play(); fade.Completed:Wait(); pcall(function() n:Destroy() end)
+        for i, item in ipairs(self.notifQueue) do if item == n then table.remove(self.notifQueue, i); break end end
     end)
 end
 
--- ==================== TELEMETRY ====================
 function Module:_createTelemetry()
     if self.telemetry then return end
-
     local t = Instance.new("Frame")
-    t.Name = "VXTelemetry"
     t.Size = UDim2.new(0, 220, 0, 240)
     t.Position = UDim2.new(1, -240, 0.4, 0)
-    t.BackgroundColor3 = Color3.fromRGB(10, 10, 15)
+    t.BackgroundColor3 = Color3.fromRGB(10,10,15)
     t.BackgroundTransparency = 0.25
     t.Visible = false
     t.ZIndex = 10
-    corner(t, 10)
-    stroke(t, Color3.fromRGB(80, 160, 200), 1.5)
+    corner(t, 10); stroke(t, Color3.fromRGB(80,160,200), 1.5)
     t.Parent = self.gui
-
-    local keys = {
-        "Torque", "Load", "Slip", "Drag",
-        "Grip Front", "Grip Rear", "Slope",
-        "Shift", "Launch", "TCS",
-        "Boost", "Brake Temp", "Spin", "Tire Temp",
-        "RPM", "Gear",
-    }
+    local keys = {"RPM","Gear","Slip","Grip Front","Grip Rear","Slope","Shift","Launch","Boost","Tire Temp"}
     local refs = {}
     for i, key in ipairs(keys) do
         local l = Instance.new("TextLabel")
-        l.Size = UDim2.new(1, -12, 0, 14)
-        l.Position = UDim2.new(0, 6, 0, 6 + (i-1) * 14)
+        l.Size = UDim2.new(1,-12,0,14)
+        l.Position = UDim2.new(0,6,0,6+(i-1)*14)
         l.Text = key .. ": --"
-        l.TextColor3 = Color3.fromRGB(150, 220, 255)
+        l.TextColor3 = Color3.fromRGB(150,220,255)
         l.BackgroundTransparency = 1
         l.TextXAlignment = Enum.TextXAlignment.Left
         l.TextSize = 11
@@ -577,7 +425,6 @@ function Module:_createTelemetry()
         refs[key] = l
     end
     t.Visible = self.core.settings.physics.telemetryHud
-
     self.telemetry = t
     self.telemetryRefs = refs
     self:_makeDraggable(t)
@@ -586,47 +433,24 @@ end
 function Module:_updateTelemetry()
     if not self.telemetryRefs then return end
     local r = self.telemetryRefs
-    local rpm = self.powertrain:getRPM()
-    local gear = self.powertrain:getGear()
-    local boost = self.drive:getBoost()
-    local slip = self.chassis:getSlipRatio()
-    local slope = self.chassis:getSlopeAngle()
-    local gf = self.chassis:getEffectiveGripFront()
-    local gr = self.chassis:getEffectiveGripRear()
-    local wtx = self.chassis:getWeightTransfer()
-    local launchState = self.powertrain:getLaunchState()
-    local shiftState = self.powertrain:getShiftState()
-
-    r["RPM"].Text = string.format("RPM: %d", math.floor(rpm))
-    r["Gear"].Text = string.format("Gear: %s", tostring(gear == -1 and "R" or gear))
-    r["Torque"].Text = string.format("Torque: %.2fx", rpm / 8500)
-    r["Load"].Text = string.format("Load: %.2f", self.powertrain:getSlopeLoadFactor())
-    r["Slip"].Text = string.format("Slip: %.2f", slip)
-    r["Drag"].Text = string.format("Drag: --")
-    r["Grip Front"].Text = string.format("Front μ: %.2f", gf)
-    r["Grip Rear"].Text = string.format("Rear μ: %.2f", gr)
-    r["Slope"].Text = string.format("Slope: %.1f°", slope)
-    r["Shift"].Text = string.format("Shift: %s", shiftState)
-    r["Launch"].Text = string.format("Launch: %s", launchState)
-    r["TCS"].Text = string.format("TCS: %s", self.core.settings.physics.tractionControl and "ON" or "OFF")
-    r["Boost"].Text = string.format("Boost: %.2f", boost)
-    r["Brake Temp"].Text = string.format("Brake T: %.2f", self.drive.brakeTemp or 0)
-    r["Spin"].Text = string.format("Spin: %s", self.chassis.spinActive and "YES" or "no")
+    r["RPM"].Text = string.format("RPM: %d", math.floor(self.powertrain:getRPM()))
+    r["Gear"].Text = string.format("Gear: %s", tostring(self.powertrain:getGear()))
+    r["Slip"].Text = string.format("Slip: %.2f", self.chassis:getSlipRatio())
+    r["Grip Front"].Text = string.format("Front μ: %.2f", self.chassis:getEffectiveGripFront())
+    r["Grip Rear"].Text = string.format("Rear μ: %.2f", self.chassis:getEffectiveGripRear())
+    r["Slope"].Text = string.format("Slope: %.1f°", self.chassis:getSlopeAngle())
+    r["Shift"].Text = string.format("Shift: %s", self.powertrain:getShiftState())
+    r["Launch"].Text = string.format("Launch: %s", self.powertrain:getLaunchState())
+    r["Boost"].Text = string.format("Boost: %.1f PSI", self.drive:getBoost())
     r["Tire Temp"].Text = string.format("Tire T: %.2f", self.chassis:getTireTemp("front"))
 end
 
--- ==================== VIDEO MODE ====================
+-- ==================== VIDEO MODE (REWRITE) ====================
 function Module:toggleVideoMode()
     self.videoMode = not self.videoMode
     _G.VX.setSetting("videoMode", self.videoMode)
-
-    if self.videoMode then
-        self:_enterVideoMode()
-        self:notify("Video Mode: ON", 1.5)
-    else
-        self:_exitVideoMode()
-        self:notify("Video Mode: OFF", 1.5)
-    end
+    if self.videoMode then self:_enterVideoMode(); self:notify("Video Mode: ON", 1.5)
+    else self:_exitVideoMode(); self:notify("Video Mode: OFF", 1.5) end
 end
 
 function Module:isVideoMode() return self.videoMode end
@@ -646,46 +470,92 @@ function Module:_enterVideoMode()
     if self.diagnosticsPanel then tryHide(self.diagnosticsPanel) end
     if self.notifScreen then self.notifScreen.Visible = false end
 
-    -- Hide game UI (not pedals / steering / exit / dashboard / settings)
+    -- Hide ALL MainGUIHandler descendants EXCEPT pedals, steering, and their ancestors
     pcall(function()
         local handler = PlayerGui:FindFirstChild("MainGUIHandler")
         if not handler then return end
-        local controls = handler:FindFirstChild("VehicleControls")
-        if not controls then return end
-        local ctrls = controls:FindFirstChild("Controls")
-        if not ctrls then return end
-        -- Hide buttons frame
-        tryHide(ctrls:FindFirstChild("Buttons"))
-        -- Hide exit frames
-        tryHide(ctrls:FindFirstChild("ExitFrame"))
-        tryHide(ctrls:FindFirstChild("Exit2"))
-        -- Hide top bar if exists
-        tryHide(handler:FindFirstChild("TopBar"))
-        tryHide(handler:FindFirstChild("BoostBar"))
-        tryHide(handler:FindFirstChild("SpeedBar"))
+
+        local keepRoots = {}
+        local function addKeepRoot(inst)
+            if inst then keepRoots[inst] = true end
+        end
+
+        -- Find Pedals and Steering in current UI
+        for _, descendant in ipairs(handler:GetDescendants()) do
+            if descendant.Name == "Pedals" or descendant.Name == "Steering" then
+                addKeepRoot(descendant)
+                local cur = descendant
+                while cur and cur ~= handler do
+                    addKeepRoot(cur)
+                    cur = cur.Parent
+                end
+            end
+        end
+
+        -- Now hide everything else
+        for _, descendant in ipairs(handler:GetDescendants()) do
+            if descendant:IsA("GuiObject") then
+                if not keepRoots[descendant] then
+                    -- Make sure it's not a descendant of a kept root
+                    local isKept = false
+                    for kept, _ in pairs(keepRoots) do
+                        if descendant == kept or descendant:IsDescendantOf(kept) then
+                            isKept = true
+                            break
+                        end
+                    end
+                    if not isKept then
+                        tryHide(descendant)
+                    end
+                end
+            end
+        end
     end)
 
-    -- Close our panel if open
-    if _G.VX.Panel and _G.VX.Panel:isOpen() then
-        pcall(function() _G.VX.Panel:close() end)
-    end
+    if _G.VX.Panel and _G.VX.Panel:isOpen() then pcall(function() _G.VX.Panel:close() end) end
 
-    -- Watch for game UI to respawn (in case game re-shows)
     self.videoModeWatcher = task.spawn(function()
         while self.videoMode do
             task.wait(1.0)
             if self.videoMode then
                 pcall(function()
                     local handler = PlayerGui:FindFirstChild("MainGUIHandler")
-                    if handler then
-                        local controls = handler:FindFirstChild("VehicleControls")
-                        if controls then
-                            local ctrls = controls:FindFirstChild("Controls")
-                            if ctrls then
-                                local btnFrame = ctrls:FindFirstChild("Buttons")
-                                if btnFrame and btnFrame.Visible then
-                                    btnFrame.Visible = false
+                    if not handler then return end
+                    for _, descendant in ipairs(handler:GetDescendants()) do
+                        if descendant:IsA("GuiObject") and descendant.Visible then
+                            -- Skip if part of keep list
+                            local isKept = false
+                            for kept, _ in pairs(self.hiddenElements) do
+                                if descendant == kept or descendant:IsDescendantOf(kept) then
+                                    -- Actually hiddenElements stores hidden ones; we need a keep list
                                 end
+                            end
+                        end
+                    end
+                    -- Simpler re-hide: any newly-visible UI element not in keep list → hide
+                    -- Recompute keep roots
+                    local keepRoots = {}
+                    for _, d in ipairs(handler:GetDescendants()) do
+                        if d.Name == "Pedals" or d.Name == "Steering" then
+                            keepRoots[d] = true
+                            local cur = d
+                            while cur and cur ~= handler do
+                                keepRoots[cur] = true
+                                cur = cur.Parent
+                            end
+                        end
+                    end
+                    for _, d in ipairs(handler:GetDescendants()) do
+                        if d:IsA("GuiObject") and d.Visible then
+                            local isKept = false
+                            for kept, _ in pairs(keepRoots) do
+                                if d == kept or d:IsDescendantOf(kept) then
+                                    isKept = true; break
+                                end
+                            end
+                            if not isKept then
+                                self.hiddenElements[d] = d.Visible
+                                d.Visible = false
                             end
                         end
                     end
@@ -696,58 +566,45 @@ function Module:_enterVideoMode()
 end
 
 function Module:_exitVideoMode()
-    -- Restore all hidden elements
     for inst, wasVisible in pairs(self.hiddenElements) do
-        if inst and inst.Parent then
-            inst.Visible = wasVisible
-        end
+        if inst and inst.Parent then inst.Visible = wasVisible end
     end
     self.hiddenElements = {}
-
     if self.notifScreen then self.notifScreen.Visible = true end
-
-    if self.videoModeWatcher then
-        pcall(function() task.cancel(self.videoModeWatcher) end)
-        self.videoModeWatcher = nil
-    end
+    if self.videoModeWatcher then pcall(function() task.cancel(self.videoModeWatcher) end); self.videoModeWatcher = nil end
 end
 
 -- ==================== DIAGNOSTICS PANEL ====================
 function Module:_createDiagnosticsPanel()
     local p = Instance.new("Frame")
-    p.Name = "VXDiagnostics"
     p.Size = UDim2.new(0, 340, 0, 440)
     p.Position = UDim2.new(0, 20, 0.5, -220)
-    p.BackgroundColor3 = Color3.fromRGB(8, 8, 12)
+    p.BackgroundColor3 = Color3.fromRGB(8,8,12)
     p.BackgroundTransparency = 0.2
     p.Visible = false
     p.ZIndex = 100
-    corner(p, 10)
-    stroke(p, Color3.fromRGB(80, 160, 200), 1.5)
+    corner(p, 10); stroke(p, Color3.fromRGB(80,160,200), 1.5)
     p.Parent = self.gui
-
     local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -20, 0, 24)
-    title.Position = UDim2.new(0, 10, 0, 6)
+    title.Size = UDim2.new(1,-20,0,24)
+    title.Position = UDim2.new(0,10,0,6)
     title.Text = "VX Diagnostics (F3)"
-    title.TextColor3 = Color3.fromRGB(100, 200, 255)
+    title.TextColor3 = Color3.fromRGB(100,200,255)
     title.BackgroundTransparency = 1
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.Font = Enum.Font.GothamBold
     title.TextSize = 13
     title.ZIndex = 101
     title.Parent = p
-
     local scroll = Instance.new("ScrollingFrame")
-    scroll.Size = UDim2.new(1, -12, 1, -36)
-    scroll.Position = UDim2.new(0, 6, 0, 32)
+    scroll.Size = UDim2.new(1,-12,1,-36)
+    scroll.Position = UDim2.new(0,6,0,32)
     scroll.BackgroundTransparency = 1
     scroll.BorderSizePixel = 0
     scroll.ScrollBarThickness = 4
-    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.CanvasSize = UDim2.new(0,0,0,0)
     scroll.ZIndex = 101
     scroll.Parent = p
-
     self.diagnosticsPanel = p
     self.diagRefs.scroll = scroll
     self:_makeDraggable(p)
@@ -757,43 +614,31 @@ function Module:toggleDiagnostics()
     if not self.diagnosticsPanel then return end
     self.diagOpen = not self.diagOpen
     self.diagnosticsPanel.Visible = self.diagOpen
-    if self.diagOpen then
-        self:_refreshDiagnostics()
-    end
+    if self.diagOpen then self:_refreshDiagnostics() end
 end
 
 function Module:_refreshDiagnostics()
     if not self.diagOpen then return end
     local scroll = self.diagRefs.scroll
     if not scroll then return end
-
-    -- Clear old
     for _, child in ipairs(scroll:GetChildren()) do
         if child:IsA("TextLabel") then child:Destroy() end
     end
-
-    -- Get all diagnostics
     local all = _G.VX.diagnostics.getAll()
     local keys = {}
     for k in pairs(all) do table.insert(keys, k) end
     table.sort(keys)
-
     local y = 0
     for _, key in ipairs(keys) do
         local diag = all[key]
-        local val = diag.value
         local text
-        if type(val) == "table" then
-            text = string.format("%s: %s", key, tostring(val.value))
-        else
-            text = string.format("%s: %s", key, tostring(val))
-        end
-
+        if type(diag.value) == "table" then text = string.format("%s: %s", key, tostring(diag.value.value))
+        else text = string.format("%s: %s", key, tostring(diag.value)) end
         local l = Instance.new("TextLabel")
-        l.Size = UDim2.new(1, -6, 0, 16)
-        l.Position = UDim2.new(0, 0, 0, y)
+        l.Size = UDim2.new(1,-6,0,16)
+        l.Position = UDim2.new(0,0,0,y)
         l.Text = text
-        l.TextColor3 = Color3.fromRGB(180, 220, 255)
+        l.TextColor3 = Color3.fromRGB(180,220,255)
         l.BackgroundTransparency = 1
         l.TextXAlignment = Enum.TextXAlignment.Left
         l.TextSize = 11
@@ -802,16 +647,10 @@ function Module:_refreshDiagnostics()
         l.Parent = scroll
         y = y + 16
     end
-
-    scroll.CanvasSize = UDim2.new(0, 0, 0, y + 20)
-
-    -- Auto-refresh every 1s while open
-    task.delay(1.0, function()
-        if self.diagOpen then self:_refreshDiagnostics() end
-    end)
+    scroll.CanvasSize = UDim2.new(0,0,0,y+20)
+    task.delay(1.0, function() if self.diagOpen then self:_refreshDiagnostics() end end)
 end
 
--- ==================== SETTINGS CHANGE ====================
 function Module:_onSettingChange(evt)
     if not evt then return end
     if evt.path == "physics.telemetryHud" then
@@ -822,41 +661,16 @@ function Module:_onSettingChange(evt)
     end
 end
 
--- ==================== SHIFT / LAUNCH NOTIFICATIONS ====================
 function Module:_onShift(evt)
-    if evt.emergency then
-        self:notify("EMERGENCY DOWNSHIFT", 1.2)
-    end
+    if evt.emergency then self:notify("EMERGENCY DOWNSHIFT", 1.2) end
 end
 
 function Module:_onLaunchRelease(evt)
     local q = evt.quality or "miss"
-    if q == "perfect" then
-        self:notify("PERFECT LAUNCH!", 1.5)
-    elseif q == "good" then
-        self:notify("Good launch", 1.2)
-    end
+    if q == "perfect" then self:notify("PERFECT LAUNCH!", 1.5)
+    elseif q == "good" then self:notify("Good launch", 1.2) end
 end
 
--- ==================== PANEL DELEGATION ====================
-function Module:openPanel()
-    if _G.VX.Panel then _G.VX.Panel:open() end
-end
-
-function Module:closePanel()
-    if _G.VX.Panel then _G.VX.Panel:close() end
-end
-
--- ==================== PUBLIC ====================
-function Module:getDashboardRefs()
-    return self.dashboardRefs
-end
-
-function Module:getTelemetryRefs()
-    if not self.telemetryRefs and self.core.settings.physics.telemetryHud then
-        self:_createTelemetry()
-    end
-    return self.telemetryRefs
-end
+function Module:getDashboardRefs() return self.dashboardRefs end
 
 return Module
