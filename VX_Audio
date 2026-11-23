@@ -1,7 +1,7 @@
 --[[
-    VX_Audio v3.1.2
-    - Turbo spool pitch/volume normalize by maxPSI (0-78 range)
-    - Restored OLD engine pitch formula: pitch = 0.7 + (rpm/maxRPM) * 1.8
+    VX_Audio v3.1.3
+    - Turbo spool: reduced max pitch (1.5) and volume (0.35), added threshold gate
+    - Restored OLD engine pitch: pitch = 0.7 + (rpm/maxRPM) * 1.8
 ]]
 
 local VX = _G.VX
@@ -13,7 +13,7 @@ local Player = Players.LocalPlayer
 local Module = VX.Framework.Module.new({
     Name = "Audio",
     Dependencies = { "Core", "Profiles", "Remote", "Powertrain", "DriveSystem" },
-    Version = "3.1.2",
+    Version = "3.1.3",
 })
 
 local TURBO_SPOOL_ID   = "89818258229795"
@@ -37,6 +37,8 @@ function Module:Construct()
     self._running = false
     self._totalBackfires = 0
     self._totalShifts = 0
+    self._smoothedSpoolVol = 0
+    self._smoothedSpoolPitch = 0.5
 end
 
 function Module:Init(deps)
@@ -49,10 +51,8 @@ end
 
 function Module:Start()
     _G.VX.Audio = self
-
     self:_registerSounds()
     self:_registerDiagnostics()
-
     _G.VX.bus:on("vehicle.stateChanged", function(evt) self:_onStateChange(evt) end)
     _G.VX.bus:on("vehicle.shift", function(evt) self:_onShift(evt) end)
     _G.VX.bus:on("vehicle.backfire", function(evt) self:_onBackfire(evt) end)
@@ -113,6 +113,8 @@ function Module:_attach()
     local prof = self.profiles:current()
     self.fastRpm = prof.idleRPM
     self.slowRpm = prof.idleRPM
+    self._smoothedSpoolVol = 0
+    self._smoothedSpoolPitch = 0.5
     self:_createEngine(prof)
     self:_createSpool()
     self._loopThread = task.spawn(function()
@@ -180,7 +182,6 @@ function Module:_baseVolume(prof)
     return math.clamp(master * boost * profileVol, 0, 1)
 end
 
--- ========== KEY FIX: OLD PITCH + TURBO NORMALIZE ==========
 function Module:_update(dt)
     if not self._running then return end
     local prof = self.profiles:current()
@@ -190,14 +191,13 @@ function Module:_update(dt)
     local fastRate = 40
     if os.clock() < self.downshiftBoostUntil then fastRate = fastRate + 15 end
 
-    -- Two-stage smoothing
     self.fastRpm = self.fastRpm + (rpm - self.fastRpm) * math.min(fastRate * dt, 1)
     self.slowRpm = self.slowRpm + (self.fastRpm - self.slowRpm) * math.min(15 * dt, 1)
 
     local smoothRpm = self.slowRpm
     if self.powertrain:isRevLimiting() then smoothRpm = prof.redlineRPM end
 
-    -- Engine pitch (OLD FORMULA)
+    -- OLD ENGINE PITCH FORMULA
     if self.engineSound and self.engineSound.Parent then
         local rpmPercent = smoothRpm / math.max(prof.maxRPM, 1)
         local pitchOffset = 1 + (prof.pitchOffset or 0) + (self.core.settings.pitchOffset or 0)
@@ -212,20 +212,31 @@ function Module:_update(dt)
         end
     end
 
-    -- Turbo spool (NORMALIZE boost by maxPSI)
+    -- TURBO SPOOL (smoother, less extreme)
     if self.spoolSound and self.spoolSound.Parent then
         local boost = self.drive:getBoost()
         local stage = self.drive:getTurboStage()
         local cfg = self.core.config.turboStages[stage]
         local maxPSI = (cfg and cfg.targetBoostPSI or 78) * (self.core.settings.turboCustomMultiplier or 1.0)
         local normalized = math.clamp(boost / math.max(maxPSI, 0.01), 0, 1)
-        local targetVol = normalized * 0.55
-        local targetPitch = 0.5 + normalized * 1.5
-        self.spoolSound.Volume = self.spoolSound.Volume + (targetVol - self.spoolSound.Volume) * math.min(dt * 8, 1)
-        self.spoolSound.PlaybackSpeed = self.spoolSound.PlaybackSpeed + (targetPitch - self.spoolSound.PlaybackSpeed) * math.min(dt * 8, 1)
+
+        -- Gentler max: 0.35 vol, 1.5 pitch
+        local targetVol = normalized * 0.35
+        local targetPitch = 0.5 + normalized * 1.0
+
+        -- Only audible above 3% boost (gate)
+        if normalized < 0.03 then
+            targetVol = 0
+            targetPitch = 0.5
+        end
+
+        -- Slow smoothing (avoid flutter)
+        self._smoothedSpoolVol = self._smoothedSpoolVol + (targetVol - self._smoothedSpoolVol) * math.min(dt * 6, 1)
+        self._smoothedSpoolPitch = self._smoothedSpoolPitch + (targetPitch - self._smoothedSpoolPitch) * math.min(dt * 6, 1)
+        self.spoolSound.Volume = self._smoothedSpoolVol
+        self.spoolSound.PlaybackSpeed = self._smoothedSpoolPitch
     end
 
-    -- Compressor
     self:_updateCompressor(dt)
 end
 
