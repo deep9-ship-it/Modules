@@ -376,4 +376,489 @@ function Module:_createFooter(panel)
 end
 
 function Module:open()
-    if not
+    if not self._panel then return end
+    self._isOpen = true
+    self._panel.Visible = true
+    TweenService:Create(self._panel, TweenInfo.new(0.24, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Position = UDim2.new(0, 14, 0.5, 0),
+    }):Play()
+    if self._toggleBtn then
+        TweenService:Create(self._toggleBtn, TweenInfo.new(0.24, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Position = UDim2.new(0, 368, 0.5, 0),
+        }):Play()
+    end
+end
+
+function Module:close()
+    if not self._panel then return end
+    self._isOpen = false
+    local tw = TweenService:Create(self._panel, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+        Position = UDim2.new(0, -368, 0.5, 0),
+    })
+    tw:Play()
+    if self._toggleBtn then
+        TweenService:Create(self._toggleBtn, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+            Position = UDim2.new(0, 14, 0.5, 0),
+        }):Play()
+    end
+    tw.Completed:Once(function()
+        if not self._isOpen and self._panel then
+            self._panel.Visible = false
+        end
+    end)
+end
+
+function Module:toggle()
+    if self._isOpen then self:close() else self:open() end
+end
+
+function Module:_switchTab(tabName)
+    self._activeTab = tabName
+    self._rowUpdaters = {}
+    self._profileCards = {}
+    self._sysInfoLbl = nil
+
+    for name, b in pairs(self._tabBtns) do
+        local sel = (name == tabName)
+        b.BackgroundColor3 = sel and C.accent or C.row
+        b.TextColor3 = sel and C.bg or C.muted
+    end
+
+    for _, child in ipairs(self._scroll:GetChildren()) do
+        if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
+            child:Destroy()
+        end
+    end
+    self._scroll.CanvasPosition = Vector2.new(0, 0)
+
+    if tabName == "Dynamics" then
+        self:_buildDynamics()
+    elseif tabName == "Engine" then
+        self:_buildEngine()
+    elseif tabName == "Audio" then
+        self:_buildAudio()
+    elseif tabName == "Visuals" then
+        self:_buildVisuals()
+    elseif tabName == "System" then
+        self:_buildSystem()
+    end
+end
+
+function Module:_addSection(title)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 0, 22)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamBlack
+    lbl.TextSize = 11
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextColor3 = C.accent
+    lbl.Text = "  " .. string.upper(title)
+    lbl.Parent = self._scroll
+end
+
+function Module:_addButtonRow(text, col, fn)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 34)
+    btn.BackgroundColor3 = C.row
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 12
+    btn.TextColor3 = col or C.accent
+    btn.Text = text
+    btn.Parent = self._scroll
+    _corner(btn, 7)
+    _stroke(btn, col or C.accent, 0.55)
+    self:_trackConn(btn.MouseButton1Click:Connect(fn))
+end
+
+function Module:_addSettingRow(path)
+    local reg = _G.VX.registry and _G.VX.registry:get("settings", path)
+    local schema = reg and reg.schema or reg
+    if not schema then return end
+
+    local isNumeric = (schema.type == "float" or schema.type == "int") and not schema.enumLabels
+    local isSegmented = (schema.type == "enum" and schema.options) or (schema.type == "int" and schema.enumLabels)
+
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, isNumeric and 58 or (isSegmented and 60 or 38))
+    row.BackgroundColor3 = C.row
+    row.Parent = self._scroll
+    _corner(row, 7)
+    _stroke(row, C.border, 0.72)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(isNumeric and 0.65 or (isSegmented and 1 or 0.72), -14, 0, 22)
+    lbl.Position = UDim2.new(0, 10, 0, (schema.type == "boolean") and 8 or 4)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextColor3 = C.text
+    lbl.Text = schema.label or path
+    lbl.Parent = row
+
+    -- BOOLEAN: Animated toggle switch
+    if schema.type == "boolean" then
+        local switch = Instance.new("TextButton")
+        switch.Size = UDim2.new(0, 48, 0, 22)
+        switch.Position = UDim2.new(1, -58, 0, 8)
+        switch.BackgroundColor3 = C.panel
+        switch.Text = ""
+        switch.Parent = row
+        _corner(switch, 11)
+
+        local knob = Instance.new("Frame")
+        knob.Size = UDim2.new(0, 16, 0, 16)
+        knob.Position = UDim2.new(0, 3, 0, 3)
+        knob.BackgroundColor3 = C.text
+        knob.Parent = switch
+        _corner(knob, 8)
+
+        local function sync(animate)
+            local v = _G.VX.getSetting(path) == true
+            local targetBg = v and C.green or C.panel
+            local targetPos = v and UDim2.new(1, -19, 0, 3) or UDim2.new(0, 3, 0, 3)
+            if animate then
+                TweenService:Create(switch, TweenInfo.new(0.14), { BackgroundColor3 = targetBg }):Play()
+                TweenService:Create(knob, TweenInfo.new(0.14), { Position = targetPos }):Play()
+            else
+                switch.BackgroundColor3 = targetBg
+                knob.Position = targetPos
+            end
+        end
+        sync(false)
+        self._rowUpdaters[path] = function() sync(true) end
+
+        self:_trackConn(switch.MouseButton1Click:Connect(function()
+            _G.VX.setSetting(path, not (_G.VX.getSetting(path) == true))
+            sync(true)
+        end))
+
+    -- SEGMENTED ENUM OR LABELED INT
+    elseif isSegmented then
+        local holder = Instance.new("Frame")
+        holder.Size = UDim2.new(1, -20, 0, 26)
+        holder.Position = UDim2.new(0, 10, 0, 28)
+        holder.BackgroundTransparency = 1
+        holder.Parent = row
+
+        local hl = Instance.new("UIListLayout")
+        hl.FillDirection = Enum.FillDirection.Horizontal
+        hl.Padding = UDim.new(0, 4)
+        hl.Parent = holder
+
+        local items = {}
+        if schema.options then
+            for _, opt in ipairs(schema.options) do
+                table.insert(items, { val = opt, label = tostring(opt) })
+            end
+        else
+            local minV = schema.min or 0
+            for idx, txt in ipairs(schema.enumLabels) do
+                table.insert(items, { val = minV + idx - 1, label = txt })
+            end
+        end
+
+        local btns = {}
+        for _, item in ipairs(items) do
+            local b = Instance.new("TextButton")
+            b.Size = UDim2.new(1 / #items, -3, 1, 0)
+            b.Font = Enum.Font.GothamBold
+            b.TextSize = (#items >= 4) and 10 or 11
+            b.Text = item.label
+            b.TextTruncate = Enum.TextTruncate.AtEnd
+            b.Parent = holder
+            _corner(b, 5)
+            btns[item.val] = b
+            self:_trackConn(b.MouseButton1Click:Connect(function()
+                _G.VX.setSetting(path, item.val)
+            end))
+        end
+
+        local function sync()
+            local v = _G.VX.getSetting(path)
+            if v == nil then v = schema.default end
+            for val, b in pairs(btns) do
+                local active = (v == val)
+                b.BackgroundColor3 = active and C.accent or C.panel
+                b.TextColor3 = active and C.bg or C.muted
+            end
+        end
+        sync()
+        self._rowUpdaters[path] = sync
+
+    -- FLOAT / INT SLIDER + STEPPER BUTTONS
+    elseif isNumeric then
+        local minV = schema.min or 0
+        local maxV = schema.max or 1
+        local step = schema.step or (schema.type == "int" and 1 or 0.05)
+
+        local valLbl = Instance.new("TextLabel")
+        valLbl.Size = UDim2.new(0.35, -10, 0, 20)
+        valLbl.Position = UDim2.new(0.65, 0, 0, 4)
+        valLbl.BackgroundTransparency = 1
+        valLbl.Font = Enum.Font.GothamBold
+        valLbl.TextSize = 11
+        valLbl.TextXAlignment = Enum.TextXAlignment.Right
+        valLbl.TextColor3 = C.accent
+        valLbl.Parent = row
+
+        local minusBtn = Instance.new("TextButton")
+        minusBtn.Size = UDim2.new(0, 22, 0, 20)
+        minusBtn.Position = UDim2.new(0, 10, 0, 30)
+        minusBtn.BackgroundColor3 = C.panel
+        minusBtn.Font = Enum.Font.GothamBold
+        minusBtn.TextSize = 13
+        minusBtn.TextColor3 = C.muted
+        minusBtn.Text = "-"
+        minusBtn.Parent = row
+        _corner(minusBtn, 5)
+
+        local plusBtn = Instance.new("TextButton")
+        plusBtn.Size = UDim2.new(0, 22, 0, 20)
+        plusBtn.Position = UDim2.new(1, -32, 0, 30)
+        plusBtn.BackgroundColor3 = C.panel
+        plusBtn.Font = Enum.Font.GothamBold
+        plusBtn.TextSize = 13
+        plusBtn.TextColor3 = C.muted
+        plusBtn.Text = "+"
+        plusBtn.Parent = row
+        _corner(plusBtn, 5)
+
+        local track = Instance.new("Frame")
+        track.Size = UDim2.new(1, -76, 0, 8)
+        track.Position = UDim2.new(0, 38, 0, 36)
+        track.BackgroundColor3 = C.panel
+        track.Parent = row
+        _corner(track, 4)
+
+        local fill = Instance.new("Frame")
+        fill.BackgroundColor3 = C.accent
+        fill.Size = UDim2.new(0, 0, 1, 0)
+        fill.Parent = track
+        _corner(fill, 4)
+
+        local knob = Instance.new("Frame")
+        knob.Size = UDim2.new(0, 14, 0, 14)
+        knob.AnchorPoint = Vector2.new(0.5, 0.5)
+        knob.Position = UDim2.new(0, 0, 0.5, 0)
+        knob.BackgroundColor3 = C.text
+        knob.ZIndex = 3
+        knob.Parent = track
+        _corner(knob, 7)
+
+        local function formatVal(v)
+            if schema.type == "int" then
+                return string.format("%d", math.floor(v + 0.5))
+            elseif step < 0.05 then
+                return string.format("%.2f", v)
+            end
+            return string.format("%.2f", v)
+        end
+
+        local function sync()
+            local v = tonumber(_G.VX.getSetting(path))
+            if v == nil then v = schema.default or minV end
+            local pct = math.clamp((v - minV) / math.max(0.0001, maxV - minV), 0, 1)
+            fill.Size = UDim2.new(pct, 0, 1, 0)
+            knob.Position = UDim2.new(pct, 0, 0.5, 0)
+            valLbl.Text = formatVal(v)
+        end
+        sync()
+        self._rowUpdaters[path] = sync
+
+        local function nudge(delta)
+            local cur = tonumber(_G.VX.getSetting(path)) or schema.default or minV
+            local nextV = math.clamp(math.floor((cur + delta) / step + 0.5) * step, minV, maxV)
+            if schema.type == "int" then nextV = math.floor(nextV + 0.5) end
+            _G.VX.setSetting(path, nextV)
+            sync()
+        end
+
+        self:_trackConn(minusBtn.MouseButton1Click:Connect(function() nudge(-step) end))
+        self:_trackConn(plusBtn.MouseButton1Click:Connect(function() nudge(step) end))
+
+        local dragging = false
+        local function applyX(x)
+            local rel = math.clamp((x - track.AbsolutePosition.X) / math.max(1, track.AbsoluteSize.X), 0, 1)
+            local raw = minV + rel * (maxV - minV)
+            local snapped = math.clamp(math.floor(raw / step + 0.5) * step, minV, maxV)
+            if schema.type == "int" then snapped = math.floor(snapped + 0.5) end
+            _G.VX.setSetting(path, snapped)
+            sync()
+        end
+
+        self:_trackConn(track.InputBegan:Connect(function(inp)
+            if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                applyX(inp.Position.X)
+            end
+        end))
+        self:_trackConn(UserInputService.InputChanged:Connect(function(inp)
+            if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+                applyX(inp.Position.X)
+            end
+        end))
+        self:_trackConn(UserInputService.InputEnded:Connect(function(inp)
+            if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end))
+    end
+end
+
+function Module:_buildDynamics()
+    self:_addSection("Drivetrain & Balance")
+    self:_addSettingRow("drivetrain")
+    self:_addSettingRow("physics.driveMode")
+    self:_addSettingRow("frontGrip")
+    self:_addSettingRow("rearGrip")
+    self:_addSettingRow("physics.aeroDownforce")
+    self:_addSettingRow("steeringSensitivity")
+    self:_addSettingRow("brakingPower")
+    self:_addSettingRow("physicsTiltLevel")
+
+    self:_addSection("Assists & Chassis Simulation")
+    self:_addSettingRow("physics.tractionControl")
+    self:_addSettingRow("physics.abs")
+    self:_addSettingRow("physics.tireTemp")
+    self:_addSettingRow("physics.brakeFade")
+    self:_addSettingRow("physics.slopeLoad")
+    self:_addSettingRow("physics.engineBraking")
+end
+
+function Module:_buildEngine()
+    self:_addSection("Engine Profile")
+
+    local grid = Instance.new("Frame")
+    grid.Size = UDim2.new(1, 0, 0, 210)
+    grid.BackgroundTransparency = 1
+    grid.Parent = self._scroll
+
+    local gl = Instance.new("UIGridLayout")
+    gl.CellSize = UDim2.new(0.5, -3, 0, 36)
+    gl.CellPadding = UDim2.new(0, 6, 0, 6)
+    gl.Parent = grid
+
+    for i, prof in ipairs(self.profiles:getAll()) do
+        local b = Instance.new("TextButton")
+        b.Text = ""
+        b.Parent = grid
+        _corner(b, 6)
+        _stroke(b, C.border, 0.7)
+
+        local nameLbl = Instance.new("TextLabel")
+        nameLbl.Size = UDim2.new(1, -10, 0, 18)
+        nameLbl.Position = UDim2.new(0, 6, 0, 2)
+        nameLbl.BackgroundTransparency = 1
+        nameLbl.Font = Enum.Font.GothamBold
+        nameLbl.TextSize = 11
+        nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+        nameLbl.Text = prof.name
+        nameLbl.Parent = b
+
+        local subLbl = Instance.new("TextLabel")
+        subLbl.Size = UDim2.new(1, -10, 0, 14)
+        subLbl.Position = UDim2.new(0, 6, 0, 19)
+        subLbl.BackgroundTransparency = 1
+        subLbl.Font = Enum.Font.Code
+        subLbl.TextSize = 10
+        subLbl.TextXAlignment = Enum.TextXAlignment.Left
+        subLbl.Text = string.format("%d RPM | %dG", prof.redline, #prof.gearRatios)
+        subLbl.Parent = b
+
+        self._profileCards[i] = { btn = b, nameLbl = nameLbl, subLbl = subLbl }
+        self:_trackConn(b.MouseButton1Click:Connect(function()
+            self.profiles:setCurrent(i)
+        end))
+    end
+    self:_refreshProfileCards()
+
+    self:_addSection("Forced Induction")
+    self:_addSettingRow("turboStage")
+
+    self:_addSection("Transmission & Launch")
+    self:_addSettingRow("physics.realisticShifting")
+    self:_addSettingRow("physics.shiftDelay")
+    self:_addSettingRow("physics.revLimiter")
+    self:_addSettingRow("physics.launchControl")
+    self:_addSettingRow("physics.launchTargetRPM")
+    self:_addSettingRow("physics.twostep")
+    self:_addSettingRow("physics.coldStart")
+    self:_addSettingRow("physics.idleHunting")
+    self:_addButtonRow("Trigger Cold Start", C.amber, function()
+        self.powertrain:triggerColdStart()
+    end)
+end
+
+function Module:_buildAudio()
+    self:_addSection("Gain & Pitch")
+    self:_addSettingRow("masterVolume")
+    self:_addSettingRow("engineBoost")
+    self:_addSettingRow("audio.volumeBoost")
+    self:_addSettingRow("pitchOffset")
+
+    self:_addSection("Sound Effects")
+    self:_addSettingRow("audio.compressor")
+    self:_addSettingRow("audio.turboSpool")
+    self:_addSettingRow("audio.shiftSounds")
+    self:_addSettingRow("audio.backfires")
+    self:_addSettingRow("audio.exhaustPops")
+end
+
+function Module:_buildVisuals()
+    self:_addSection("Camera & Vehicle Effects")
+    self:_addSettingRow("visuals.cameraFOV")
+    self:_addSettingRow("visuals.cameraVibration")
+    self:_addSettingRow("visuals.bodyTilt")
+    self:_addSettingRow("visuals.exhaustFlames")
+
+    self:_addSection("HUD Overlays")
+    self:_addSettingRow("visuals.telemetry")
+    self:_addSettingRow("visuals.notifications")
+end
+
+function Module:_buildSystem()
+    self:_addSection("Core & Interface")
+    self:_addSettingRow("enabled")
+    self:_addSettingRow("performanceMode")
+    self:_addSettingRow("ui.units")
+    self:_addSettingRow("ui.scale")
+    self:_addSettingRow("ui.videoMode")
+    self:_addSettingRow("ui.diagnostics")
+
+    self:_addSection("Live Status")
+    local card = Instance.new("Frame")
+    card.Size = UDim2.new(1, 0, 0, 72)
+    card.BackgroundColor3 = C.row
+    card.Parent = self._scroll
+    _corner(card, 7)
+    _stroke(card, C.border, 0.72)
+
+    local info = Instance.new("TextLabel")
+    info.Size = UDim2.new(1, -16, 1, -10)
+    info.Position = UDim2.new(0, 8, 0, 5)
+    info.BackgroundTransparency = 1
+    info.Font = Enum.Font.Code
+    info.TextSize = 11
+    info.TextXAlignment = Enum.TextXAlignment.Left
+    info.TextYAlignment = Enum.TextYAlignment.Top
+    info.TextColor3 = C.text
+    info.Parent = card
+    self._sysInfoLbl = info
+    self:_refreshSystemCard()
+end
+
+function Module:heartbeat()
+    return self._gui ~= nil and self._gui.Parent ~= nil
+end
+
+function Module:Stop()
+    self:_clearConns()
+    if self._gui then
+        self._gui:Destroy()
+        self._gui = nil
+    end
+    _G.VX.Panel = nil
+end
+
+return Module
