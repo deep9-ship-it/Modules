@@ -1,46 +1,364 @@
 --[[
-    VX_Authority v3.0.2
-    - Kills ONLY VehicleSteering (physics writer)
-    - Leaves VehicleControls running → pedals exist and respond
-    - Forces pedal UI visible
-    - Verifies every 1.5s
+    VX_authority.lua — Seat/Chassis/Wheel Discovery, Selective Steering Isolation, Weld & Restoration
+    Version: 3.0.3
 ]]
 
 local VX = _G.VX
-if not VX or not VX.Framework then error("VX_Authority requires VX_Kernel") end
+if not VX or not VX.Framework then
+    error("[VX_authority] Requires VX_Kernel")
+end
 
-local CS        = game:GetService("CollectionService")
-local Players   = game:GetService("Players")
+local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local Player    = Players.LocalPlayer
+local CollectionService = game:GetService("CollectionService")
 
 local Module = VX.Framework.Module.new({
     Name = "Authority",
     Dependencies = { "Core" },
-    Version = "3.0.2",
+    Version = "3.0.3",
 })
 
-local ALIASES = {
-    FrontLeft  = { "WheelFL", "FrontLeft", "FrontLeftWheel", "FLWheel", "FL" },
-    FrontRight = { "WheelFR", "FrontRight", "FrontRightWheel", "FRWheel", "FR" },
-    BackLeft   = { "WheelBL", "BackLeft", "RearLeft", "BackLeftWheel", "BLWheel", "BL", "RL" },
-    BackRight  = { "WheelBR", "BackRight", "RearRight", "BackRightWheel", "BRWheel", "BR", "RR" },
-    Chassis    = { "Chassis" },
-    Platform   = { "Platform", "ChassisPlatform", "Base" },
-    Mass       = { "Mass", "MassPart", "ChassisMass", "Weight" },
-    Wheels     = { "Wheels", "WheelContainer", "WheelGroup" },
-    Body       = { "Body", "CarBody" },
-    Emitter    = { "SoundEmmiter", "SoundEmitter" },
-    Nitrous    = { "NitrousPoint", "ExhaustPoint", "FlamePoint" },
-    VfxAttach  = { "VfxAttachmentPoint", "Attachment" },
-}
+local REVERIFY_INTERVAL = 1.5
+local FRONT_NAMES = { "FL", "FR" }
+local REAR_NAMES = { "RL", "RR" }
+local ALL_WHEELS = { "FL", "FR", "RL", "RR" }
 
-function Module:Construct()
+local function _findVehicleFromSeat(seat)
+    if not seat or not seat:IsA("VehicleSeat") then return nil end
+    local model = seat:FindFirstAncestorOfClass("Model")
+    while model and model.Parent and model.Parent:IsA("Model") do
+        if model:FindFirstChild("Wheels") or model:FindFirstChild("Chassis") then
+            break
+        end
+        model = model.Parent
+    end
+    if not model then model = seat.Parent end
+    local chassis = model:FindFirstChild("Chassis") or model
+    local platform = chassis:FindFirstChild("Platform") or model:FindFirstChild("Platform") or chassis:FindFirstChild("Base")
+    local mass = chassis:FindFirstChild("Mass") or model:FindFirstChild("Mass")
+    return model, chassis, platform, mass
+end
+
+local function _findWheels(root, chassis)
+    local wheels = { FL = nil, FR = nil, RL = nil, RR = nil }
+    local wheelFolder = root:FindFirstChild("Wheels") or chassis:FindFirstChild("Wheels") or root
+
+    for _, name in ipairs(ALL_WHEELS) do
+        local wModel = wheelFolder:FindFirstChild(name) or root:FindFirstChild(name, true)
+        if wModel then
+            local phys = wModel:FindFirstChild("PhysicalWheel") or wModel:FindFirstChild("Wheel") or wModel:FindFirstChildWhichIsA("BasePart")
+            local spring = wModel:FindFirstChildWhichIsA("SpringConstraint", true)
+            local cyl = wModel:FindFirstChildWhichIsA("CylindricalConstraint", true)
+            local attHolder = wModel:FindFirstChild("AttachmentHolder") or wModel:FindFirstChild("Steer")
+            local att = attHolder and attHolder:FindFirstChildWhichIsA("Attachment")
+            if not att then
+                att = wModel:FindFirstChildWhichIsA("Attachment", true)
+            end
+
+            local origProps = phys and phys.CustomPhysicalProperties
+            wheels[name] = {
+                name = name,
+                model = wModel,
+                physical = phys,
+                spring = spring,
+                cylindrical = cyl,
+                attachment = att,
+                origProperties = origProps,
+                origFriction = origProps and origProps.Friction or 1.5,
+                origSpringDamping = spring and spring.Damping,
+                origSpringStiffness = spring and spring.Stiffness,
+                origAttOrientation = att and att.Orientation,
+                isFront = (name == "FL" or name == "FR"),
+                isRear = (name == "RL" or name == "RR"),
+            }
+        end
+    end
+    return wheels
+end
+
+local function _findSoundAndVFX(root, seat)
+    local emitter = seat:FindFirstChild("EngineSoundEmitter")
+        or root:FindFirstChild("EngineSoundEmitter", true)
+        or root:FindFirstChild("Exhaust", true)
+        or seat
+
+    local flames = {}
+    for _, desc in ipairs(root:GetDescendants()) do
+        if desc:IsA("ParticleEmitter") then
+            local n = string.lower(desc.Name)
+            if string.find(n, "flame") or string.find(n, "backfire") or string.find(n, "exhaust") then
+                table.insert(flames, desc)
+            end
+        end
+    end
+
+    local origSound = nil
+    for _, desc in ipairs(root:GetDescendants()) do
+        if desc:IsA("Sound") and desc.Name ~= "VX_Engine" and desc.Name ~= "VX_TurboSpool" then
+            local n = string.lower(desc.Name)
+            if string.find(n, "engine") or string.find(n, "rev") or string.find(n, "idle") then
+                origSound = desc
+                break
+            end
+        end
+    end
+
+    return emitter, flames, origSound
+end
+
+function Module:_disableGameSteering(seat)
+    local disabledScripts = {}
+    local disabledConns = {}
+
+    for _, inst in ipairs(CollectionService:GetTagged("VehicleSteering")) do
+        if inst:IsA("LocalScript") or inst:IsA("Script") then
+            if not inst.Disabled then
+                inst.Disabled = true
+                table.insert(disabledScripts, inst)
+            end
+        end
+    end
+
+    local player = Players.LocalPlayer
+    local containers = { seat, player and player:FindFirstChild("PlayerScripts"), player and player:FindFirstChild("PlayerGui") }
+    for _, root in ipairs(containers) do
+        if root then
+            for _, d in ipairs(root:GetDescendants()) do
+                if (d:IsA("LocalScript") or d:IsA("Script")) and not d.Disabled then
+                    local lower = string.lower(d.Name)
+                    if string.find(lower, "vehiclesteering") and not string.find(lower, "vehiclecontrols") then
+                        d.Disabled = true
+                        table.insert(disabledScripts, d)
+                    end
+                end
+            end
+        end
+    end
+
+    if type(getconnections) == "function" then
+        pcall(function()
+            for _, conn in ipairs(getconnections(RunService.Heartbeat)) do
+                local fn = conn.Function
+                if fn then
+                    local info = debug.info(fn, "s")
+                    if info and string.find(string.lower(info), "vehiclesteering") then
+                        if conn.Disable then
+                            conn:Disable()
+                            table.insert(disabledConns, conn)
+                        end
+                    end
+                end
+            end
+        end)
+    end
+
+    -- Preserve VehicleControls & force mobile pedal UI visible
+    if player then
+        local pg = player:FindFirstChild("PlayerGui")
+        local mgh = pg and pg:FindFirstChild("MainGUIHandler")
+        local vc = mgh and mgh:FindFirstChild("VehicleControls")
+        if vc then
+            if vc:IsA("GuiObject") then vc.Visible = true end
+            if vc:IsA("ScreenGui") then vc.Enabled = true end
+            for _, btnName in ipairs({ "Accelerator", "Brake", "Left", "Right" }) do
+                local b = vc:FindFirstChild(btnName, true)
+                if b and b:IsA("GuiObject") then
+                    b.Visible = true
+                end
+            end
+        end
+    end
+
+    return disabledScripts, disabledConns
+end
+
+function Module:_setupMassTiltWeld(root, chassis, mass)
+    if not mass or not mass:IsA("BasePart") then return nil end
+
+    local origWeld = nil
+    local otherPart = chassis:IsA("BasePart") and chassis or root.PrimaryPart
+    for _, d in ipairs(root:GetDescendants()) do
+        if d:IsA("WeldConstraint") and (d.Part0 == mass or d.Part1 == mass) then
+            origWeld = d
+            otherPart = (d.Part0 == mass) and d.Part1 or d.Part0
+            d.Enabled = false
+            break
+        end
+    end
+    if not otherPart then return nil end
+
+    local existing = mass:FindFirstChild("VX_MassTiltWeld")
+    if existing then existing:Destroy() end
+
+    local origSize = mass.Size
+    local relCF = otherPart.CFrame:ToObjectSpace(mass.CFrame)
+    local weld = Instance.new("Weld")
+    weld.Name = "VX_MassTiltWeld"
+    weld.Part0 = otherPart
+    weld.Part1 = mass
+    weld.C0 = relCF
+    weld.C1 = CFrame.new()
+    weld.Parent = mass
+
+    mass.Size = Vector3.new(4, 4, 10)
+
+    return {
+        weld = weld,
+        origWeld = origWeld,
+        origC0 = relCF,
+        origSize = origSize,
+        mass = mass,
+    }
+end
+
+function Module:takeover(seat)
+    if not seat or not seat:IsA("VehicleSeat") then return false end
+    if self._active and self._handle and self._handle.seat == seat then
+        return true
+    end
+    if self._active then
+        self:release("new_takeover")
+    end
+
+    local root, chassis, platform, mass = _findVehicleFromSeat(seat)
+    if not root then return false end
+
+    local wheels = _findWheels(root, chassis)
+    local emitter, flames, origSound = _findSoundAndVFX(root, seat)
+    local origSoundVol = origSound and origSound.Volume or nil
+    if origSound then
+        origSound.Volume = 0
+    end
+
+    local disabledScripts, disabledConns = self:_disableGameSteering(seat)
+    local tiltData = self:_setupMassTiltWeld(root, chassis, mass)
+
+    self._handle = {
+        seat = seat,
+        root = root,
+        chassis = chassis,
+        platform = platform,
+        mass = mass,
+        wheels = wheels,
+        frontNames = FRONT_NAMES,
+        rearNames = REAR_NAMES,
+        emitter = emitter,
+        exhaustFlames = flames,
+        origEngineSound = origSound,
+        origEngineSoundVol = origSoundVol,
+        tiltWeld = tiltData and tiltData.weld or nil,
+        origTiltC0 = tiltData and tiltData.origC0 or nil,
+        _tiltData = tiltData,
+        _disabledScripts = disabledScripts,
+        _disabledConns = disabledConns,
+    }
+    self._active = true
+    self._lastVerify = os.clock()
+
+    if _G.VX and _G.VX.bus then
+        _G.VX.bus:emit("authority.taken", { handle = self._handle })
+    end
+    return true
+end
+
+function Module:release(reason)
+    local h = self._handle
+    if not h then
+        self._active = false
+        return
+    end
+
+    for _, w in pairs(h.wheels or {}) do
+        if w.physical and w.physical.Parent then
+            if w.origProperties then
+                w.physical.CustomPhysicalProperties = w.origProperties
+            else
+                w.physical.CustomPhysicalProperties = PhysicalProperties.new(0.7, w.origFriction or 1.5, 0.2, 1, 1)
+            end
+        end
+        if w.cylindrical and w.cylindrical.Parent then
+            w.cylindrical.AngularVelocity = 0
+            w.cylindrical.MotorMaxTorque = 0
+        end
+        if w.attachment and w.attachment.Parent and w.origAttOrientation then
+            w.attachment.Orientation = w.origAttOrientation
+        end
+    end
+
+    if h._tiltData then
+        local td = h._tiltData
+        if td.weld and td.weld.Parent then td.weld:Destroy() end
+        if td.origWeld and td.origWeld.Parent then td.origWeld.Enabled = true end
+        if td.mass and td.mass.Parent and td.origSize then td.mass.Size = td.origSize end
+    end
+
+    for _, s in ipairs(h._disabledScripts or {}) do
+        if s and s.Parent then pcall(function() s.Disabled = false end) end
+    end
+    for _, c in ipairs(h._disabledConns or {}) do
+        if c and c.Enable then pcall(function() c:Enable() end) end
+    end
+
+    if h.origEngineSound and h.origEngineSound.Parent and h.origEngineSoundVol then
+        h.origEngineSound.Volume = h.origEngineSoundVol
+    end
+
     self._handle = nil
     self._active = false
-    self._verifyThread = nil
-    self._getConnections = getconnections
-    self._debugInfo = debug and debug.getinfo
+
+    if _G.VX and _G.VX.bus then
+        _G.VX.bus:emit("authority.lost", { reason = reason or "released" })
+    end
+end
+
+function Module:verify()
+    if not self._active or not self._handle then return false end
+    local h = self._handle
+    local player = Players.LocalPlayer
+    local char = player and player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+    if not h.seat or not h.seat.Parent or not hum or hum.SeatPart ~= h.seat then
+        self:release("seat_lost")
+        return false
+    end
+
+    local recovered = false
+    for _, s in ipairs(h._disabledScripts or {}) do
+        if s and s.Parent and not s.Disabled then
+            s.Disabled = true
+            recovered = true
+        end
+    end
+
+    if h.origEngineSound and h.origEngineSound.Parent and h.origEngineSound.Volume > 0 then
+        h.origEngineSound.Volume = 0
+        recovered = true
+    end
+
+    if _G.VX and _G.VX.bus then
+        _G.VX.bus:emit("authority.verified", { recovered = recovered })
+    end
+    return true
+end
+
+function Module:getHandle()
+    return self._handle
+end
+
+function Module:getRoot()
+    return self._handle and self._handle.root or nil
+end
+
+function Module:isActive()
+    return self._active == true
+end
+
+function Module:Construct()
+    self._active = false
+    self._handle = nil
+    self._lastVerify = 0
+    self._verifyConn = nil
 end
 
 function Module:Init(deps)
@@ -49,379 +367,26 @@ end
 
 function Module:Start()
     _G.VX.Authority = self
-end
-
-function Module:Stop()
-    if self._active then pcall(function() self:releaseControl() end) end
-    if self._verifyThread then
-        pcall(function() task.cancel(self._verifyThread) end)
-        self._verifyThread = nil
-    end
-    if _G.VX.Authority == self then _G.VX.Authority = nil end
-end
-
-function Module:heartbeat()
-    if not self._active then return true end
-    return self._handle ~= nil
-end
-
-function Module:getHandle() return self._handle end
-function Module:isHealthy()
-    if not self._handle then return false end
-    return self._handle.root and self._handle.root.Parent ~= nil
-end
-
-function Module:takeControl()
-    if self._active then return true, self._handle end
-
-    local handle, reason = self:_discover()
-    if not handle then
-        warn("[VX] Authority: discover failed — " .. tostring(reason))
-        return false, reason
-    end
-
-    self:_killGamePhysics(handle)
-    self:_setupTiltWeld(handle)
-    self:_adjustMassSize(handle)
-    self:_cacheOriginals(handle)
-    self:_forcePedalsVisible()
-
-    self._handle = handle
-    self._active = true
-    self:_startVerify()
-
-    _G.VX.bus:emit("authority.taken", { handle = handle })
-    print("[VX] Authority: takeover complete")
-    return true, handle
-end
-
-function Module:releaseControl()
-    if not self._active then return end
-    if self._verifyThread then
-        pcall(function() task.cancel(self._verifyThread) end)
-        self._verifyThread = nil
-    end
-    if self._handle then
-        pcall(function() self:_restoreAll(self._handle) end)
-    end
-    self._handle = nil
-    self._active = false
-    _G.VX.bus:emit("authority.lost", { reason = "release" })
-    print("[VX] Authority: released")
-end
-
--- ==================== DISCOVERY ====================
-function Module:_discover()
-    local char = Player.Character
-    if not char then return nil, "no character" end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum or not hum.Sit or not hum.SeatPart then return nil, "not seated" end
-    local seat = hum.SeatPart
-    if not seat:IsA("VehicleSeat") then return nil, "not VehicleSeat" end
-
-    local root = self:_findAncestorWithChassis(seat)
-    if not root then return nil, "no root" end
-
-    local chassis = self:_findPart(root, "Chassis")
-    if not chassis then return nil, "no chassis" end
-    local platform = self:_findPart(chassis, "Platform")
-    if not platform then return nil, "no platform" end
-    local mass = self:_findPart(chassis, "Mass")
-    if not mass then return nil, "no mass" end
-    local wheelsFolder = self:_findPart(chassis, "Wheels")
-    if not wheelsFolder then return nil, "no wheels folder" end
-
-    local wheels = self:_enumerateWheels(wheelsFolder)
-    if #wheels ~= 4 then return nil, "expected 4 wheels, got " .. #wheels end
-
-    local body = self:_findPart(root, "Body")
-    local emitter = body and self:_findPart(body, "Emitter") or nil
-    local nitrous = body and self:_findPart(body, "Nitrous") or nil
-    local vfxAttach = nitrous and self:_findPart(nitrous, "VfxAttach") or nil
-
-    return {
-        root = root, seat = seat, chassis = chassis,
-        platform = platform, mass = mass, wheels = wheels,
-        body = body, emitter = emitter, nitrous = nitrous, vfxAttach = vfxAttach,
-    }
-end
-
-function Module:_findAncestorWithChassis(inst)
-    local cur = inst
-    while cur and cur ~= workspace do
-        if cur:IsA("Model") and cur:FindFirstChild("Chassis") then return cur end
-        cur = cur.Parent
-    end
-    return nil
-end
-
-function Module:_findPart(parent, aliasKey)
-    local aliases = ALIASES[aliasKey]
-    if not aliases then return nil end
-    for _, name in ipairs(aliases) do
-        local found = parent:FindFirstChild(name)
-        if found then return found end
-    end
-    return nil
-end
-
-function Module:_enumerateWheels(folder)
-    local out = {}
-    local found = { FrontLeft = false, FrontRight = false, BackLeft = false, BackRight = false }
-    for _, child in ipairs(folder:GetChildren()) do
-        if not child:IsA("Model") then continue end
-        for slot, aliases in pairs({
-            FrontLeft  = ALIASES.FrontLeft,
-            FrontRight = ALIASES.FrontRight,
-            BackLeft   = ALIASES.BackLeft,
-            BackRight  = ALIASES.BackRight,
-        }) do
-            for _, name in ipairs(aliases) do
-                if child.Name == name and not found[slot] then
-                    local physical = child:FindFirstChild("PhysicalWheel")
-                    local spring   = child:FindFirstChild("Spring")
-                    local cylinder = child:FindFirstChild("Cylindrical")
-                    local attach   = child:FindFirstChild("AttachmentHolder")
-                        and child.AttachmentHolder:FindFirstChild("Attachment")
-                    if physical and spring and cylinder then
-                        table.insert(out, {
-                            name = slot, model = child, physical = physical,
-                            spring = spring, cylinder = cylinder, attach = attach,
-                            isFront = (slot == "FrontLeft" or slot == "FrontRight"),
-                            isLeft  = (slot == "FrontLeft" or slot == "BackLeft"),
-                        })
-                        found[slot] = true
-                    end
-                    break
-                end
-            end
-        end
-    end
-    return out
-end
-
--- ==================== KILL ONLY VehicleSteering ====================
-function Module:_killGamePhysics(handle)
-    local root = handle.root
-
-    -- Remove ONLY VehicleSteering tag (physics writer)
-    pcall(function()
-        CS:RemoveTag(root, "VehicleSteering")
-    end)
-
-    -- DO NOT remove VehicleControls tag — we want pedals to keep working.
-    -- VehicleControls only writes attribute values, which are ignored
-    -- because VehicleSteering (the reader) is dead.
-
-    -- Kill ONLY VehicleSteering connections
-    local killed = 0
-    if self._getConnections and self._debugInfo then
-        local conns = self._getConnections(RunService.Heartbeat)
-        if conns then
-            for _, conn in ipairs(conns) do
-                local fn = nil
-                pcall(function() fn = conn.Function end)
-                if fn then
-                    local info = nil
-                    pcall(function() info = self._debugInfo(fn) end)
-                    if info and info.source then
-                        local src = tostring(info.source)
-                        if src:find("VehicleSteering") and not src:find("VehicleControls") then
-                            pcall(function() conn:Disconnect() end)
-                            killed = killed + 1
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    print("[VX] Authority: killed " .. killed .. " VehicleSteering connections")
-    return true
-end
-
--- ==================== FORCE PEDALS VISIBLE ====================
-function Module:_forcePedalsVisible()
-    pcall(function()
-        local gui = Player:WaitForChild("PlayerGui", 2)
-        if not gui then return end
-        local handler = gui:FindFirstChild("MainGUIHandler")
-        if not handler then return end
-        local vc = handler:FindFirstChild("VehicleControls")
-        if not vc then return end
-
-        vc.Visible = true
-
-        local ctrls = vc:FindFirstChild("Controls")
-        if ctrls then
-            ctrls.Visible = true
-            local pedals = ctrls:FindFirstChild("Pedals")
-            if pedals then pedals.Visible = true end
-            local steering = ctrls:FindFirstChild("Steering")
-            if steering then steering.Visible = true end
-            local buttons = ctrls:FindFirstChild("Buttons")
-            if buttons then buttons.Visible = false end
-        end
-    end)
-end
-
--- ==================== TILT WELD ====================
-function Module:_setupTiltWeld(handle)
-    local mass = handle.mass
-    local platform = handle.platform
-    if not mass or not platform then return end
-
-    local wc = mass:FindFirstChildOfClass("WeldConstraint")
-    if wc then
-        handle.originalWC = { part0 = wc.Part0, part1 = wc.Part1, name = wc.Name }
-        wc:Destroy()
-    end
-
-    local offset = platform.CFrame:Inverse() * mass.CFrame
-    local weld = Instance.new("Weld")
-    weld.Name = "VX_MassTiltWeld"
-    weld.Part0 = platform
-    weld.Part1 = mass
-    weld.C0 = offset
-    weld.C1 = CFrame.new()
-    weld.Parent = mass
-
-    handle.tiltWeld = weld
-    handle.neutralC0 = offset
-end
-
-function Module:_restoreTiltWeld(handle)
-    if handle.tiltWeld then
-        pcall(function() handle.tiltWeld:Destroy() end)
-        handle.tiltWeld = nil
-    end
-    if handle.originalWC and handle.mass and handle.mass.Parent then
-        local wc = Instance.new("WeldConstraint")
-        wc.Name = handle.originalWC.name or "WeldConstraint"
-        wc.Part0 = handle.originalWC.part0
-        wc.Part1 = handle.originalWC.part1
-        wc.Parent = handle.mass
-    end
-    handle.originalWC = nil
-    handle.neutralC0 = nil
-end
-
--- ==================== MASS SIZE ====================
-function Module:_adjustMassSize(handle)
-    if not handle.mass then return end
-    handle.originalMassSize = handle.mass.Size
-    pcall(function() handle.mass.Size = Vector3.new(4, 4, 10) end)
-end
-
-function Module:_restoreMassSize(handle)
-    if handle.originalMassSize and handle.mass and handle.mass.Parent then
-        pcall(function() handle.mass.Size = handle.originalMassSize end)
-    end
-end
-
--- ==================== CACHE ORIGINALS ====================
-function Module:_cacheOriginals(handle)
-    handle.originalFriction = {}
-    handle.originalSpring = {}
-    for _, w in ipairs(handle.wheels) do
-        local props = w.physical.CustomPhysicalProperties
-        handle.originalFriction[w.name] = props and props.Friction or 1.0
-        handle.originalSpring[w.name] = {
-            stiffness = w.spring.Stiffness,
-            damping = w.spring.Damping,
-            freeLength = w.spring.FreeLength,
-        }
-    end
-end
-
--- ==================== RESTORE ====================
-function Module:_restoreAll(handle)
-    self:_restoreTiltWeld(handle)
-    self:_restoreMassSize(handle)
-    for _, w in ipairs(handle.wheels or {}) do
-        pcall(function()
-            if w.cylinder then
-                w.cylinder.AngularActuatorType = Enum.ActuatorType.None
-                w.cylinder.AngularVelocity = 0
-                w.cylinder.MotorMaxTorque = 0
-            end
-        end)
-        pcall(function()
-            local origF = handle.originalFriction[w.name]
-            if origF and w.physical and w.physical.Parent then
-                local props = w.physical.CustomPhysicalProperties
-                local d = props and props.Density or 0.7
-                local e = props and props.Elasticity or 0.5
-                local fw = props and props.FrictionWeight or 2
-                local ew = props and props.ElasticityWeight or 1
-                w.physical.CustomPhysicalProperties = PhysicalProperties.new(d, origF, e, fw, ew)
-            end
-        end)
-        pcall(function()
-            local origS = handle.originalSpring[w.name]
-            if origS and w.spring and w.spring.Parent then
-                w.spring.Stiffness = origS.stiffness
-                w.spring.Damping = origS.damping
-                w.spring.FreeLength = origS.freeLength
-            end
-        end)
-    end
-end
-
--- ==================== VERIFY ====================
-function Module:_startVerify()
-    if self._verifyThread then
-        pcall(function() task.cancel(self._verifyThread) end)
-    end
-    self._verifyThread = task.spawn(function()
-        while self._active do
-            task.wait(1.5)
-            if not self._active then break end
+    self._verifyConn = RunService.Heartbeat:Connect(function()
+        if self._active and (os.clock() - self._lastVerify >= REVERIFY_INTERVAL) then
+            self._lastVerify = os.clock()
             self:verify()
         end
     end)
 end
 
-function Module:verify()
-    if not self._active or not self._handle then return end
-    local root = self._handle.root
-    if not root or not root.Parent then
-        self:releaseControl()
-        return
+function Module:Stop()
+    if self._verifyConn then
+        self._verifyConn:Disconnect()
+        self._verifyConn = nil
     end
+    self:release("module_stop")
+    _G.VX.Authority = nil
+end
 
-    -- Only check VehicleSteering tag reappearing
-    if CS:HasTag(root, "VehicleSteering") then
-        pcall(function() CS:RemoveTag(root, "VehicleSteering") end)
-        _G.VX.bus:emit("authority.verified", { recovered = true })
-        warn("[VX] Authority: VehicleSteering tag reappeared — re-killed")
-    end
-
-    -- Kill any new VehicleSteering connections
-    if self._getConnections and self._debugInfo then
-        pcall(function()
-            local conns = self._getConnections(RunService.Heartbeat)
-            if conns then
-                for _, conn in ipairs(conns) do
-                    local fn = nil
-                    pcall(function() fn = conn.Function end)
-                    if fn then
-                        local info = nil
-                        pcall(function() info = self._debugInfo(fn) end)
-                        if info and info.source then
-                            local src = tostring(info.source)
-                            if src:find("VehicleSteering") and not src:find("VehicleControls") then
-                                pcall(function() conn:Disconnect() end)
-                            end
-                        end
-                    end
-                end
-            end
-        end)
-    end
-
-    -- Re-force pedals visible
-    self:_forcePedalsVisible()
+function Module:heartbeat()
+    if not self._active then return true end
+    return self._handle ~= nil and self._handle.seat ~= nil and self._handle.seat.Parent ~= nil
 end
 
 return Module
