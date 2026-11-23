@@ -1,0 +1,481 @@
+--[[
+    VX_Kernel v3.0.1
+    Framework + Registry + Loader + Hot-Reload + Diagnostics + Watchdog + Hotkeys
+
+    Load via:
+        loadstring(game:HttpGet("https://pastebin.com/raw/An52g8Tk"))()
+]]
+
+if _G.VX and _G.VX.Kernel then
+    warn("[VX] Kernel already loaded")
+    return _G.VX
+end
+
+-- ==================== FRAMEWORK: SIGNAL ====================
+local Signal = {}
+Signal.__index = Signal
+function Signal.new()
+    return setmetatable({ _handlers = {}, _nextId = 0 }, Signal)
+end
+function Signal:Connect(fn)
+    self._nextId = self._nextId + 1
+    local id = self._nextId
+    self._handlers[id] = fn
+    return {
+        Disconnect = function() self._handlers[id] = nil end,
+    }
+end
+function Signal:DisconnectAll()
+    self._handlers = {}
+end
+function Signal:Fire(...)
+    local snap = {}
+    for id, fn in pairs(self._handlers) do snap[id] = fn end
+    for id, fn in pairs(snap) do
+        if self._handlers[id] then
+            local ok, err = pcall(fn, ...)
+            if not ok then warn("[VX] Signal handler error: " .. tostring(err)) end
+        end
+    end
+end
+
+-- ==================== FRAMEWORK: JANITOR ====================
+local Janitor = {}
+Janitor.__index = Janitor
+function Janitor.new()
+    return setmetatable({ _items = {} }, Janitor)
+end
+function Janitor:Add(item)
+    table.insert(self._items, item)
+    return item
+end
+function Janitor:Cleanup()
+    for i = #self._items, 1, -1 do
+        local item = self._items[i]
+        self._items[i] = nil
+        if typeof(item) == "Instance" then
+            pcall(function() item:Destroy() end)
+        elseif type(item) == "table" and item.Disconnect then
+            pcall(function() item:Disconnect() end)
+        elseif type(item) == "function" then
+            pcall(item)
+        end
+    end
+end
+function Janitor:Clear() self:Cleanup() end
+
+-- ==================== FRAMEWORK: MODULE ====================
+local Module = {}
+Module.__index = Module
+function Module.new(spec)
+    assert(spec.Name, "Module requires Name")
+    return setmetatable({
+        _spec     = spec,
+        _name     = spec.Name,
+        _deps     = spec.Dependencies or {},
+        _state    = "loaded",
+        _janitor  = Janitor.new(),
+        _exports  = {},
+        _version  = spec.Version or "1.0.0",
+    }, Module)
+end
+function Module:getName() return self._name end
+function Module:getState() return self._state end
+function Module:getDeps() return self._deps end
+function Module:getVersion() return self._version end
+function Module:janitor() return self._janitor end
+function Module:setState(s) self._state = s end
+
+-- ==================== REGISTRY ====================
+local Registry = {
+    _settings    = {},
+    _sounds      = {},
+    _events      = {},
+    _diagnostics = {},
+    _presets     = {},
+    _hotkeys     = {},
+    _parts       = {},
+    _owners      = {},
+    _onAdded  = Signal.new(),
+    _onRemoved = Signal.new(),
+}
+
+function Registry:set(kind, key, schema, owner)
+    assert(schema, "schema required")
+    local bucket = self["_" .. kind]
+    if not bucket then error("Unknown registry kind: " .. kind) end
+    if bucket[key] and self._owners[kind .. "." .. key] ~= owner then
+        error("Registry conflict: " .. kind .. "." .. key)
+    end
+    bucket[key] = schema
+    self._owners[kind .. "." .. key] = owner
+    self._onAdded:Fire({ kind = kind, key = key, schema = schema, owner = owner })
+end
+
+function Registry:get(kind, key)
+    local bucket = self["_" .. kind]
+    return bucket and bucket[key]
+end
+
+function Registry:getAll(kind)
+    return self["_" .. kind] or {}
+end
+
+function Registry:remove(kind, key, owner)
+    local bucket = self["_" .. kind]
+    if not bucket then return end
+    if bucket[key] and self._owners[kind .. "." .. key] == owner then
+        bucket[key] = nil
+        self._owners[kind .. "." .. key] = nil
+        self._onRemoved:Fire({ kind = kind, key = key })
+    end
+end
+
+function Registry:removeAll(kind, owner)
+    local bucket = self["_" .. kind]
+    if not bucket then return end
+    local doomed = {}
+    for key in pairs(bucket) do
+        if self._owners[kind .. "." .. key] == owner then
+            table.insert(doomed, key)
+        end
+    end
+    for _, key in ipairs(doomed) do self:remove(kind, key, owner) end
+end
+
+function Registry:dump()
+    local counts = {}
+    for _, kind in ipairs({"settings","sounds","events","diagnostics","presets","hotkeys","parts"}) do
+        local n = 0
+        for _ in pairs(self["_" .. kind]) do n = n + 1 end
+        counts[kind] = n
+    end
+    return counts
+end
+
+function Registry:onAdded(fn)   return self._onAdded:Connect(fn) end
+function Registry:onRemoved(fn) return self._onRemoved:Connect(fn) end
+
+-- ==================== EVENT BUS ====================
+local EventBus = {}
+EventBus.__index = EventBus
+function EventBus.new()
+    return setmetatable({ _signals = {} }, EventBus)
+end
+function EventBus:on(name, fn)
+    if not self._signals[name] then self._signals[name] = Signal.new() end
+    return self._signals[name]:Connect(fn)
+end
+function EventBus:emit(name, payload)
+    if self._signals[name] then self._signals[name]:Fire(payload) end
+end
+function EventBus:clear()
+    for _, sig in pairs(self._signals) do sig:DisconnectAll() end
+    self._signals = {}
+end
+function EventBus:list()
+    local names = {}
+    for name in pairs(self._signals) do table.insert(names, name) end
+    return names
+end
+
+-- ==================== MODULE URLS ====================
+-- ⚠ THE 5 BELOW NEED RE-UPLOAD (they are the versions with syntax errors)
+--   • VehicleState  → use the fixed version from my last message
+--   • DriveSystem   → one-line fix (getState → getVehicleState)
+--   • Chassis       → use the fixed version (no goto)
+--   • Audio         → use the fixed version (no complex and/or)
+--   • Visuals       → use the fixed version (fixed BindToRenderStep)
+--
+-- After re-uploading to pastebin/GitHub, replace those 5 URLs here.
+
+local MODULE_URLS = {
+    Core         = "https://pastebin.com/raw/F7Z4h9G6",
+    Profiles     = "https://pastebin.com/raw/jzHtqTEZ",
+    Remote       = "https://pastebin.com/raw/YqUpQ1r6",
+    Authority    = "https://pastebin.com/raw/dysVUmit",
+
+    -- ⚠ NEEDS UPDATE — upload the fixed VX_VehicleState
+    VehicleState = "https://pastebin.com/raw/Xr0vdsyS",
+
+    Input        = "https://pastebin.com/raw/mtTpU38a",
+    Powertrain   = "https://pastebin.com/raw/Q16xEuM5",
+
+    -- ⚠ NEEDS UPDATE — upload the fixed VX_DriveSystem (one-line change)
+    DriveSystem  = "https://pastebin.com/raw/5Gub08jK",
+
+    -- ⚠ NEEDS UPDATE — upload the fixed VX_Chassis (no goto)
+    Chassis      = "https://pastebin.com/raw/vUbc4K02",
+
+    -- ⚠ NEEDS UPDATE — push the fixed VX_Audio to GitHub
+    Audio        = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Audio",
+
+    -- ⚠ NEEDS UPDATE — push the fixed VX_Visuals to GitHub
+    Visuals      = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Visuals",
+
+    -- ✅ Already correct (they were skipped only because Chassis was missing)
+    UI           = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_UI",
+    Panel        = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Panel",
+}
+
+-- ==================== NAMESPACE ====================
+local VX = _G.VX or {}
+_G.VX = VX
+VX.Kernel = true
+VX.Version = "20.0.1"
+VX.Framework = { Signal = Signal, Janitor = Janitor, Module = Module }
+VX.registry = Registry
+VX.bus = EventBus.new()
+VX.Modules = VX.Modules or {}
+
+-- ==================== LOADER ====================
+local function fetchSource(url)
+    local ok, src = pcall(function() return game:HttpGet(url, true) end)
+    if not ok or not src or #src < 10 then
+        return nil, "HttpGet failed: " .. tostring(src)
+    end
+    return src
+end
+
+local function compileModule(name, url)
+    local src, err = fetchSource(url)
+    if not src then return nil, err end
+    local chunk, cerr = loadstring(src, "VX_" .. name)
+    if not chunk then return nil, "loadstring: " .. tostring(cerr) end
+    local ok, result = pcall(chunk)
+    if not ok then return nil, "runtime: " .. tostring(result) end
+    if type(result) ~= "table" or not result._name then
+        return nil, "module did not return a valid instance"
+    end
+    return result
+end
+
+local function loadAllModules()
+    local loaded = {}
+    for name, url in pairs(MODULE_URLS) do
+        local module, err = compileModule(name, url)
+        if module then
+            VX.Modules[name] = module
+            loaded[name] = module
+            module:setState("loaded")
+            print("[VX] Loaded: " .. name)
+        else
+            warn("[VX] Failed: " .. name .. " — " .. tostring(err))
+        end
+    end
+    return loaded
+end
+
+local function topologicalSort(modules)
+    local indegree, adj = {}, {}
+    for name in pairs(modules) do
+        indegree[name] = 0
+        adj[name] = {}
+    end
+    for name, mod in pairs(modules) do
+        for _, dep in ipairs(mod:getDeps()) do
+            if modules[dep] then
+                indegree[name] = indegree[name] + 1
+                table.insert(adj[dep], name)
+            else
+                warn("[VX] " .. name .. " depends on missing: " .. dep)
+            end
+        end
+    end
+    local queue = {}
+    for name, deg in pairs(indegree) do
+        if deg == 0 then table.insert(queue, name) end
+    end
+    local sorted = {}
+    while #queue > 0 do
+        local n = table.remove(queue, 1)
+        table.insert(sorted, n)
+        for _, neighbor in ipairs(adj[n]) do
+            indegree[neighbor] = indegree[neighbor] - 1
+            if indegree[neighbor] == 0 then table.insert(queue, neighbor) end
+        end
+    end
+    return sorted
+end
+
+local function runLifecycle(sorted, modules)
+    -- Construct
+    for _, name in ipairs(sorted) do
+        local mod = modules[name]
+        if mod.Construct then
+            local ok, err = pcall(mod.Construct, mod)
+            if ok then mod:setState("constructed")
+            else mod:setState("failed"); warn("[VX] " .. name .. ".Construct: " .. tostring(err)) end
+        else mod:setState("constructed") end
+    end
+    -- Init
+    for _, name in ipairs(sorted) do
+        local mod = modules[name]
+        if mod:getState() == "constructed" then
+            local deps, ok = {}, true
+            for _, dep in ipairs(mod:getDeps()) do
+                local d = modules[dep]
+                if not d or d:getState() == "failed" or d:getState() == "skipped" then
+                    ok = false; break
+                end
+                deps[dep] = d
+            end
+            if ok then
+                if mod.Init then
+                    local iok, err = pcall(mod.Init, mod, deps)
+                    if iok then mod:setState("inited")
+                    else mod:setState("failed"); warn("[VX] " .. name .. ".Init: " .. tostring(err)) end
+                else mod:setState("inited") end
+            else mod:setState("skipped"); warn("[VX] " .. name .. " skipped (missing deps)") end
+        end
+    end
+    -- Start
+    for _, name in ipairs(sorted) do
+        local mod = modules[name]
+        if mod:getState() == "inited" then
+            if mod.Start then
+                local ok, err = pcall(mod.Start, mod)
+                if ok then mod:setState("started")
+                else mod:setState("failed"); warn("[VX] " .. name .. ".Start: " .. tostring(err)) end
+            else mod:setState("started") end
+        end
+    end
+end
+
+-- ==================== HOT-RELOAD ====================
+function VX.reload(name)
+    local existing = VX.Modules[name]
+    local url = MODULE_URLS[name]
+    if not url then warn("[VX] No URL for " .. name); return false end
+    if existing then
+        for _, kind in ipairs({"settings","sounds","events","diagnostics","presets","hotkeys","parts"}) do
+            Registry:removeAll(kind, name)
+        end
+        if existing.Stop then pcall(existing.Stop, existing) end
+    end
+    local module, err = compileModule(name, url)
+    if not module then warn("[VX] Reload failed " .. name .. ": " .. tostring(err)); return false end
+    if module.Construct then pcall(module.Construct, module) end
+    local deps = {}
+    for _, dep in ipairs(module:getDeps()) do deps[dep] = VX.Modules[dep] end
+    if module.Init then pcall(module.Init, module, deps) end
+    if module.Start then pcall(module.Start, module) end
+    VX.Modules[name] = module
+    module:setState("started")
+    print("[VX] Reloaded: " .. name)
+    return true
+end
+
+function VX.reloadAll()
+    for name in pairs(MODULE_URLS) do VX.reload(name) end
+end
+
+-- ==================== DIAGNOSTICS ====================
+VX.diagnostics = { _reg = {} }
+
+function VX.diagnostics.register(key, schema, owner)
+    VX.diagnostics._reg[key] = { schema = schema, owner = owner }
+end
+
+function VX.diagnostics.get(key)
+    local r = VX.diagnostics._reg[key]
+    if not r then return nil end
+    local ok, res = pcall(r.schema.fn)
+    return ok and res or nil
+end
+
+function VX.diagnostics.getAll()
+    local out = {}
+    for key, r in pairs(VX.diagnostics._reg) do
+        local ok, res = pcall(r.schema.fn)
+        out[key] = { value = ok and res or nil, schema = r.schema, owner = r.owner }
+    end
+    return out
+end
+
+-- ==================== BOOT ====================
+print("[VX] Booting system...")
+local loaded = loadAllModules()
+local sorted = topologicalSort(loaded)
+runLifecycle(sorted, loaded)
+
+print("========================================")
+print("  VX System Ready  —  v" .. VX.Version)
+print("========================================")
+for _, name in ipairs(sorted) do
+    local mod = loaded[name]
+    local icon = ({started="✓", failed="✗", skipped="⊘", inited="·", constructed="·"})[mod:getState()] or "?"
+    print(string.format("  %s %-16s %s", icon, name, mod:getState()))
+end
+print("========================================")
+local d = Registry:dump()
+print(string.format("  Registry: %d settings, %d sounds, %d events, %d diagnostics",
+    d.settings, d.sounds, d.events, d.diagnostics))
+print("========================================")
+
+-- ==================== WATCHDOG ====================
+local watchdogActive = true
+task.spawn(function()
+    while watchdogActive do
+        task.wait(2)
+        for name, mod in pairs(VX.Modules) do
+            if mod:getState() == "started" and mod.heartbeat then
+                local ok, res = pcall(mod.heartbeat, mod)
+                if not ok or res == false then
+                    warn("[VX] Watchdog: " .. name .. " unhealthy")
+                end
+            end
+        end
+    end
+end)
+
+-- ==================== SHUTDOWN ====================
+VX.shutdown = function()
+    watchdogActive = false
+    for i = #sorted, 1, -1 do
+        local mod = loaded[sorted[i]]
+        if mod and mod.Stop then pcall(mod.Stop, mod) end
+    end
+    VX.bus:clear()
+    print("[VX] Shutdown complete")
+end
+
+-- ==================== HOTKEYS ====================
+local UIS = game:GetService("UserInputService")
+local panicStart = 0
+
+UIS.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    local kc = input.KeyCode
+    if kc == Enum.KeyCode.V and VX.Modules.UI then
+        pcall(function() VX.Modules.UI:toggleVideoMode() end)
+    elseif kc == Enum.KeyCode.C and VX.Modules.Input then
+        pcall(function() VX.Modules.Input:toggleClutch() end)
+    elseif kc == Enum.KeyCode.F1 then
+        for _, name in ipairs(sorted) do
+            print(string.format("  %-16s %s", name, loaded[name]:getState()))
+        end
+    elseif kc == Enum.KeyCode.F2 then
+        if _G.VX.setSetting and _G.VX.settings then
+            local cur = _G.VX.settings.physics.telemetryHud
+            _G.VX.setSetting("physics.telemetryHud", not cur)
+        end
+    elseif kc == Enum.KeyCode.F3 and VX.Modules.UI then
+        pcall(function() VX.Modules.UI:toggleDiagnostics() end)
+    elseif kc == Enum.KeyCode.Backspace then
+        panicStart = tick()
+    end
+end)
+
+UIS.InputEnded:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.Backspace then
+        if panicStart > 0 and tick() - panicStart >= 2 then
+            VX.shutdown()
+        end
+        panicStart = 0
+    end
+end)
+
+print("[VX] Hotkeys: V=Video | C=Clutch | F1=Status | F2=Telemetry | F3=Diagnostics | Hold Shift+Backspace=Panic")
+
+return VX
