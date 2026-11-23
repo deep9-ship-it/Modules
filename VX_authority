@@ -1,6 +1,6 @@
 --[[
     VX_authority.lua — Seat/Chassis/Wheel Discovery, Selective Steering Isolation, Weld & Restoration
-    Version: 3.0.3
+    Version: 3.1.0
 ]]
 
 local VX = _G.VX
@@ -15,12 +15,10 @@ local CollectionService = game:GetService("CollectionService")
 local Module = VX.Framework.Module.new({
     Name = "Authority",
     Dependencies = { "Core" },
-    Version = "3.0.3",
+    Version = "3.1.0",
 })
 
 local REVERIFY_INTERVAL = 1.5
-local FRONT_NAMES = { "FL", "FR" }
-local REAR_NAMES = { "RL", "RR" }
 local ALL_WHEELS = { "FL", "FR", "RL", "RR" }
 
 local function _findVehicleFromSeat(seat)
@@ -40,7 +38,8 @@ local function _findVehicleFromSeat(seat)
 end
 
 local function _findWheels(root, chassis)
-    local wheels = { FL = nil, FR = nil, RL = nil, RR = nil }
+    local wheels = {}
+    local originalFriction = {}
     local wheelFolder = root:FindFirstChild("Wheels") or chassis:FindFirstChild("Wheels") or root
 
     for _, name in ipairs(ALL_WHEELS) do
@@ -56,24 +55,29 @@ local function _findWheels(root, chassis)
             end
 
             local origProps = phys and phys.CustomPhysicalProperties
-            wheels[name] = {
+            local origFric = origProps and origProps.Friction or 1.5
+            originalFriction[name] = origFric
+
+            table.insert(wheels, {
                 name = name,
                 model = wModel,
                 physical = phys,
                 spring = spring,
+                cylinder = cyl,
                 cylindrical = cyl,
+                attach = att,
                 attachment = att,
                 origProperties = origProps,
-                origFriction = origProps and origProps.Friction or 1.5,
+                origFriction = origFric,
                 origSpringDamping = spring and spring.Damping,
                 origSpringStiffness = spring and spring.Stiffness,
                 origAttOrientation = att and att.Orientation,
                 isFront = (name == "FL" or name == "FR"),
                 isRear = (name == "RL" or name == "RR"),
-            }
+            })
         end
     end
-    return wheels
+    return wheels, originalFriction
 end
 
 local function _findSoundAndVFX(root, seat)
@@ -82,12 +86,16 @@ local function _findSoundAndVFX(root, seat)
         or root:FindFirstChild("Exhaust", true)
         or seat
 
+    local vfxAttach = root:FindFirstChild("Exhaust", true) or emitter
     local flames = {}
     for _, desc in ipairs(root:GetDescendants()) do
         if desc:IsA("ParticleEmitter") then
             local n = string.lower(desc.Name)
-            if string.find(n, "flame") or string.find(n, "backfire") or string.find(n, "exhaust") then
+            if string.find(n, "flame") or string.find(n, "backfire") or string.find(n, "exhaust") or n == "fire" then
                 table.insert(flames, desc)
+                if not vfxAttach or vfxAttach == emitter then
+                    vfxAttach = desc.Parent
+                end
             end
         end
     end
@@ -103,7 +111,24 @@ local function _findSoundAndVFX(root, seat)
         end
     end
 
-    return emitter, flames, origSound
+    return emitter, vfxAttach, flames, origSound
+end
+
+function Module:_forcePedalsVisible()
+    local player = Players.LocalPlayer
+    local pg = player and player:FindFirstChild("PlayerGui")
+    local mgh = pg and pg:FindFirstChild("MainGUIHandler")
+    local vc = mgh and mgh:FindFirstChild("VehicleControls")
+    if vc then
+        if vc:IsA("GuiObject") then vc.Visible = true end
+        if vc:IsA("ScreenGui") then vc.Enabled = true end
+        for _, btnName in ipairs({ "Accelerator", "Brake", "Left", "Right" }) do
+            local b = vc:FindFirstChild(btnName, true)
+            if b and b:IsA("GuiObject") then
+                b.Visible = true
+            end
+        end
+    end
 end
 
 function Module:_disableGameSteering(seat)
@@ -111,11 +136,9 @@ function Module:_disableGameSteering(seat)
     local disabledConns = {}
 
     for _, inst in ipairs(CollectionService:GetTagged("VehicleSteering")) do
-        if inst:IsA("LocalScript") or inst:IsA("Script") then
-            if not inst.Disabled then
-                inst.Disabled = true
-                table.insert(disabledScripts, inst)
-            end
+        if (inst:IsA("LocalScript") or inst:IsA("Script")) and not inst.Disabled then
+            inst.Disabled = true
+            table.insert(disabledScripts, inst)
         end
     end
 
@@ -152,23 +175,7 @@ function Module:_disableGameSteering(seat)
         end)
     end
 
-    -- Preserve VehicleControls & force mobile pedal UI visible
-    if player then
-        local pg = player:FindFirstChild("PlayerGui")
-        local mgh = pg and pg:FindFirstChild("MainGUIHandler")
-        local vc = mgh and mgh:FindFirstChild("VehicleControls")
-        if vc then
-            if vc:IsA("GuiObject") then vc.Visible = true end
-            if vc:IsA("ScreenGui") then vc.Enabled = true end
-            for _, btnName in ipairs({ "Accelerator", "Brake", "Left", "Right" }) do
-                local b = vc:FindFirstChild(btnName, true)
-                if b and b:IsA("GuiObject") then
-                    b.Visible = true
-                end
-            end
-        end
-    end
-
+    self:_forcePedalsVisible()
     return disabledScripts, disabledConns
 end
 
@@ -211,6 +218,22 @@ function Module:_setupMassTiltWeld(root, chassis, mass)
     }
 end
 
+function Module:takeControl()
+    local player = Players.LocalPlayer
+    local char = player and player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local seat = hum and hum.SeatPart
+    if seat and seat:IsA("VehicleSeat") then
+        return self:takeover(seat)
+    end
+    return false
+end
+
+function Module:releaseControl()
+    self:release("vehicle_exit")
+    return true
+end
+
 function Module:takeover(seat)
     if not seat or not seat:IsA("VehicleSeat") then return false end
     if self._active and self._handle and self._handle.seat == seat then
@@ -223,12 +246,10 @@ function Module:takeover(seat)
     local root, chassis, platform, mass = _findVehicleFromSeat(seat)
     if not root then return false end
 
-    local wheels = _findWheels(root, chassis)
-    local emitter, flames, origSound = _findSoundAndVFX(root, seat)
+    local wheels, originalFriction = _findWheels(root, chassis)
+    local emitter, vfxAttach, flames, origSound = _findSoundAndVFX(root, seat)
     local origSoundVol = origSound and origSound.Volume or nil
-    if origSound then
-        origSound.Volume = 0
-    end
+    if origSound then origSound.Volume = 0 end
 
     local disabledScripts, disabledConns = self:_disableGameSteering(seat)
     local tiltData = self:_setupMassTiltWeld(root, chassis, mass)
@@ -240,13 +261,14 @@ function Module:takeover(seat)
         platform = platform,
         mass = mass,
         wheels = wheels,
-        frontNames = FRONT_NAMES,
-        rearNames = REAR_NAMES,
+        originalFriction = originalFriction,
         emitter = emitter,
+        vfxAttach = vfxAttach,
         exhaustFlames = flames,
         origEngineSound = origSound,
         origEngineSoundVol = origSoundVol,
         tiltWeld = tiltData and tiltData.weld or nil,
+        neutralC0 = tiltData and tiltData.origC0 or nil,
         origTiltC0 = tiltData and tiltData.origC0 or nil,
         _tiltData = tiltData,
         _disabledScripts = disabledScripts,
@@ -268,7 +290,7 @@ function Module:release(reason)
         return
     end
 
-    for _, w in pairs(h.wheels or {}) do
+    for _, w in ipairs(h.wheels or {}) do
         if w.physical and w.physical.Parent then
             if w.origProperties then
                 w.physical.CustomPhysicalProperties = w.origProperties
@@ -276,12 +298,13 @@ function Module:release(reason)
                 w.physical.CustomPhysicalProperties = PhysicalProperties.new(0.7, w.origFriction or 1.5, 0.2, 1, 1)
             end
         end
-        if w.cylindrical and w.cylindrical.Parent then
-            w.cylindrical.AngularVelocity = 0
-            w.cylindrical.MotorMaxTorque = 0
+        if w.cylinder and w.cylinder.Parent then
+            w.cylinder.AngularActuatorType = Enum.ActuatorType.None
+            w.cylinder.AngularVelocity = 0
+            w.cylinder.MotorMaxTorque = 0
         end
-        if w.attachment and w.attachment.Parent and w.origAttOrientation then
-            w.attachment.Orientation = w.origAttOrientation
+        if w.attach and w.attach.Parent and w.origAttOrientation then
+            w.attach.Orientation = w.origAttOrientation
         end
     end
 
