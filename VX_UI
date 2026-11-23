@@ -1,108 +1,103 @@
 --[[
-    VX_UI v3.2.0 — GT3 Carbon Edition
-    Digital Cluster + 18-LED Shift Bar + Boost/Tire HUD + Visual Telemetry + Diagnostics
+    VX_UI.lua — Middle-Bottom Dashboard HUD, Notifications, Telemetry (F2), Diagnostics (F3) & Video Mode (F4)
+    Version: 3.3.1
 ]]
 
-local Players      = game:GetService("Players")
-local RunService   = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
-local UIS          = game:GetService("UserInputService")
-local Player       = Players.LocalPlayer
+local VX = _G.VX
+if not VX or not VX.Framework then
+    error("[VX_UI] Requires VX_Kernel")
+end
 
-local F = _G.VX.Framework
-local Module = F.Module.new({
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local Module = VX.Framework.Module.new({
     Name = "UI",
-    Version = "3.2.0",
     Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "VehicleState" },
+    Version = "3.3.1",
 })
 
-local THEME = {
-    bg         = Color3.fromRGB(13, 13, 15),    -- #0D0D0F Carbon Glass
-    bgBottom   = Color3.fromRGB(8, 8, 10),      -- Deeper bottom gradient
-    card       = Color3.fromRGB(22, 22, 27),    -- Sub-card surface
-    track      = Color3.fromRGB(36, 36, 44),    -- Empty bar / LED track
-    border     = Color3.fromRGB(52, 52, 64),    -- Crisp 1px stroke
-    accent     = Color3.fromRGB(225, 29, 72),   -- #E11D48 GT3 Crimson
-    accentDim  = Color3.fromRGB(136, 19, 55),
-    amber      = Color3.fromRGB(245, 158, 11),  -- #F59E0B Caution / Shift
-    green      = Color3.fromRGB(16, 185, 129),  -- #10B981 Optimal / Active
-    ice        = Color3.fromRGB(56, 189, 248),  -- #38BDF8 Cold / Cool Tire / Clutch
-    text       = Color3.fromRGB(248, 250, 252), -- #F8FAFC Primary Readout
-    textDim    = Color3.fromRGB(148, 163, 184), -- Secondary Label
-    textMuted  = Color3.fromRGB(100, 116, 139), -- Units / Inactive
+local C = {
+    bg = Color3.fromRGB(13, 15, 21),
+    panel = Color3.fromRGB(20, 24, 34),
+    card = Color3.fromRGB(27, 32, 45),
+    accent = Color3.fromRGB(0, 190, 255),
+    accentDark = Color3.fromRGB(0, 115, 165),
+    green = Color3.fromRGB(68, 222, 122),
+    amber = Color3.fromRGB(255, 185, 48),
+    red = Color3.fromRGB(255, 72, 72),
+    text = Color3.fromRGB(242, 246, 252),
+    muted = Color3.fromRGB(135, 146, 168),
+    border = Color3.fromRGB(48, 56, 76),
 }
 
-local LED_COUNT = 18
-
-local function fmtInt(n)
-    local s = tostring(math.floor((tonumber(n) or 0) + 0.5))
-    return s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
-end
-
-local function addGlassStyle(frame, radius, strokeColor, strokeTransp)
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, radius or 10)
-    corner.Parent = frame
-
-    local grad = Instance.new("UIGradient")
-    grad.Rotation = 90
-    grad.Color = ColorSequence.new(THEME.bg, THEME.bgBottom)
-    grad.Parent = frame
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = strokeColor or THEME.border
-    stroke.Thickness = 1
-    stroke.Transparency = strokeTransp or 0.3
-    stroke.Parent = frame
-    return stroke
-end
-
-function Module:_trackConn(c)
-    if c then
-        table.insert(self._conns, c)
+local function _getSetting(path, fallback)
+    if _G.VX and type(_G.VX.getSetting) == "function" then
+        local v = _G.VX.getSetting(path)
+        if v ~= nil then return v end
     end
+    return fallback
+end
+
+local function _corner(parent, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 8)
+    c.Parent = parent
     return c
+end
+
+local function _stroke(parent, color, trans, thickness)
+    local s = Instance.new("UIStroke")
+    s.Color = color or C.border
+    s.Transparency = trans or 0.5
+    s.Thickness = thickness or 1
+    s.Parent = parent
+    return s
+end
+
+function Module:_trackConn(conn)
+    if conn then
+        table.insert(self._conns, conn)
+    end
+    return conn
 end
 
 function Module:_clearConns()
     for _, c in ipairs(self._conns) do
-        pcall(function()
-            if typeof(c) == "RBXScriptConnection" then
-                c:Disconnect()
-            elseif type(c) == "table" and c.Disconnect then
-                c:Disconnect()
-            end
-        end)
+        if typeof(c) == "RBXScriptConnection" then
+            c:Disconnect()
+        elseif type(c) == "table" and c.Disconnect then
+            c:Disconnect()
+        end
     end
     self._conns = {}
 end
 
 function Module:Construct()
-    self.gui = nil
-    self.dashboard = nil
-    self.telemetry = nil
-    self.diagnosticsPanel = nil
-    self.notifContainer = nil
-    self.videoMode = false
-    self.hiddenElements = {}
-    self.diagOpen = false
-    self._diagSession = 0
-    self._running = false
     self._conns = {}
-    self._rpmLeds = {}
-    self._shiftFlashUntil = 0
-    self._gearFlashUntil = 0
-    self._lastGear = nil
-    self._videoWatcher = nil
+    self._gui = nil
+    self._dash = nil
+    self._dashScale = nil
+    self._notifContainer = nil
+    self._telFrame = nil
+    self._diagFrame = nil
+    self._telLabels = {}
+    self._diagLabels = {}
+    self._hiddenGuis = {}
+    self._lastDiagUpdate = 0
+    self._lastSpinNotify = 0
+    self._videoMode = false
 end
 
 function Module:Init(deps)
-    self.core         = deps.Core
-    self.profiles     = deps.Profiles
-    self.powertrain   = deps.Powertrain
-    self.driveSystem  = deps.DriveSystem
-    self.chassis      = deps.Chassis
-    self.vehicleState = deps.VehicleState
+    self.core = deps.Core
+    self.profiles = deps.Profiles
+    self.powertrain = deps.Powertrain
+    self.drive = deps.DriveSystem
+    self.chassis = deps.Chassis
+    self.state = deps.VehicleState
     _G.VX.UI = self
 end
 
@@ -110,867 +105,673 @@ function Module:Start()
     self:_createGui()
 
     self:_trackConn(_G.VX.bus:on("vehicle.stateChanged", function(evt)
-        self:_onStateChange(evt)
-    end))
-    self:_trackConn(_G.VX.bus:on("settings.changed", function(evt)
-        self:_onSettingChange(evt)
-    end))
-    self:_trackConn(_G.VX.bus:on("vehicle.shift", function()
-        self._gearFlashUntil = os.clock() + 0.18
-    end))
-    self:_trackConn(_G.VX.bus:on("turbo.blowoff", function()
-        self._shiftFlashUntil = os.clock() + 0.12
-    end))
-
-    self:_trackConn(RunService.RenderStepped:Connect(function(dt)
-        if self._running then
-            pcall(function() self:_update(dt) end)
+        if not evt then return end
+        if evt.to == "Ready" then
+            local prof = self.profiles:current()
+            self:notify("VX Active", (prof and prof.name or "Engine") .. " Ready", C.accent, 2.5)
+        elseif evt.to == "Disabled" then
+            if self._dash then self._dash.Visible = false end
         end
     end))
-end
 
-function Module:Stop()
-    self._running = false
-    self.diagOpen = false
-    self._diagSession = self._diagSession + 1
-    if self.videoMode then
-        self:_exitVideoMode()
-        self.videoMode = false
-    end
-    if self._videoWatcher then
-        pcall(task.cancel, self._videoWatcher)
-        self._videoWatcher = nil
-    end
-    self:_clearConns()
-    if self.gui then
-        pcall(function() self.gui:Destroy() end)
-        self.gui = nil
-    end
+    self:_trackConn(_G.VX.bus:on("vehicle.shift", function()
+        if self._gearBox then
+            self._gearBox.BackgroundColor3 = C.accentDark
+            TweenService:Create(self._gearBox, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                BackgroundColor3 = C.panel,
+            }):Play()
+        end
+    end))
+
+    self:_trackConn(_G.VX.bus:on("vehicle.launchStart", function(evt)
+        local target = evt and evt.target or 4500
+        self:notify("Launch Control", string.format("Armed @ %d RPM", target), C.amber, 1.8)
+    end))
+
+    self:_trackConn(_G.VX.bus:on("vehicle.launchQuality", function(evt)
+        if evt and evt.quality then
+            local col = (evt.quality == "PERFECT") and C.green or ((evt.quality == "GOOD") and C.accent or C.amber)
+            self:notify("Launch", evt.quality .. " LAUNCH!", col, 2.2)
+        end
+    end))
+
+    self:_trackConn(_G.VX.bus:on("engine.coldStartBegin", function()
+        self:notify("Cold Start", "Warming up engine...", C.amber, 2.0)
+    end))
+
+    self:_trackConn(_G.VX.bus:on("profiles.changed", function(evt)
+        if evt and evt.profile then
+            self:notify("Engine Profile", evt.profile.name, C.accent, 2.0)
+        end
+    end))
+
+    self:_trackConn(_G.VX.bus:on("chassis.spinDetected", function()
+        local now = os.clock()
+        if now - self._lastSpinNotify >= 3.0 then
+            self._lastSpinNotify = now
+            if self._flagsLbl then
+                self._flagsLbl.TextColor3 = C.amber
+            end
+        end
+    end))
+
+    self:_trackConn(_G.VX.bus:on("settings.changed", function(evt)
+        if not evt then return end
+        if evt.path == "ui.scale" and self._dashScale then
+            self._dashScale.Scale = tonumber(evt.new) or 1.0
+        elseif evt.path == "ui.diagnostics" and self._diagFrame then
+            self._diagFrame.Visible = (evt.new == true) and not self._videoMode
+        elseif evt.path == "visuals.telemetry" and self._telFrame then
+            self._telFrame.Visible = (evt.new == true) and not self._videoMode
+        elseif evt.path == "ui.videoMode" then
+            if evt.new == true then
+                self:_enterVideoMode()
+            else
+                self:_exitVideoMode()
+            end
+        end
+    end))
+
+    self:_trackConn(UserInputService.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.KeyCode == Enum.KeyCode.F2 then
+            self:toggleTelemetry()
+        elseif input.KeyCode == Enum.KeyCode.F3 then
+            self:toggleDiagnostics()
+        elseif input.KeyCode == Enum.KeyCode.F4 then
+            self:toggleVideoMode()
+        end
+    end))
+
+    self:_trackConn(RunService.RenderStepped:Connect(function()
+        self:_update()
+    end))
 end
 
 function Module:_createGui()
-    local pg = Player:WaitForChild("PlayerGui")
-    local existing = pg:FindFirstChild("VX_UI")
+    local player = Players.LocalPlayer
+    local pg = player and player:WaitForChild("PlayerGui", 5)
+    if not pg then return end
+
+    local existing = pg:FindFirstChild("VX_HUD")
     if existing then existing:Destroy() end
 
-    local sg = Instance.new("ScreenGui")
-    sg.Name = "VX_UI"
-    sg.ResetOnSpawn = false
-    sg.DisplayOrder = 10
-    sg.IgnoreGuiInset = true
-    sg.Parent = pg
-    self.gui = sg
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "VX_HUD"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.DisplayOrder = 5
+    gui.Parent = pg
+    self._gui = gui
 
-    self:_createDashboard()
-    self:_createNotifs()
-end
+    self:_createDashboard(gui)
+    self:_createNotifications(gui)
+    self:_createTelemetry(gui)
+    self:_createDiagnostics(gui)
 
-function Module:_makeDraggable(frame)
-    local dragging = false
-    local startPos, startFramePos
-
-    frame.InputBegan:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1
-            or inp.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            startPos = inp.Position
-            startFramePos = frame.Position
-        end
-    end)
-
-    self:_trackConn(UIS.InputChanged:Connect(function(inp)
-        if not dragging then return end
-        if inp.UserInputType == Enum.UserInputType.MouseMovement
-            or inp.UserInputType == Enum.UserInputType.Touch then
-            local delta = inp.Position - startPos
-            frame.Position = UDim2.new(
-                startFramePos.X.Scale, startFramePos.X.Offset + delta.X,
-                startFramePos.Y.Scale, startFramePos.Y.Offset + delta.Y
-            )
-        end
-    end))
-
-    self:_trackConn(UIS.InputEnded:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1
-            or inp.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
-    end))
-end
-
--- ==================== DASHBOARD ====================
-function Module:_createDashboard()
-    local f = Instance.new("Frame")
-    f.Name = "VX_Dashboard"
-    f.Size = UDim2.new(0, 316, 0, 126)
-    f.Position = UDim2.new(1, -334, 1, -144)
-    f.BackgroundColor3 = THEME.bg
-    f.BackgroundTransparency = 0.14
-    f.BorderSizePixel = 0
-    f.Visible = false
-    f.Parent = self.gui
-    self._dashStroke = addGlassStyle(f, 10, THEME.border, 0.25)
-
-    -- Left crimson edge accent
-    local edge = Instance.new("Frame")
-    edge.Size = UDim2.new(0, 3, 1, -16)
-    edge.Position = UDim2.new(0, 0, 0, 8)
-    edge.BackgroundColor3 = THEME.accent
-    edge.BorderSizePixel = 0
-    edge.Parent = f
-    local ec = Instance.new("UICorner"); ec.CornerRadius = UDim.new(0, 2); ec.Parent = edge
-
-    -- Top 18-LED Shift Bar (leaves room on right for docked Gear button)
-    local ledHolder = Instance.new("Frame")
-    ledHolder.Size = UDim2.new(1, -48, 0, 8)
-    ledHolder.Position = UDim2.new(0, 12, 0, 10)
-    ledHolder.BackgroundTransparency = 1
-    ledHolder.Parent = f
-    self._rpmLeds = {}
-
-    local ledLayout = Instance.new("UIListLayout")
-    ledLayout.FillDirection = Enum.FillDirection.Horizontal
-    ledLayout.Padding = UDim.new(0, 3)
-    ledLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-    ledLayout.Parent = ledHolder
-
-    for i = 1, LED_COUNT do
-        local seg = Instance.new("Frame")
-        seg.Size = UDim2.new(0, 11, 0, 6)
-        seg.BackgroundColor3 = THEME.track
-        seg.BorderSizePixel = 0
-        seg.Parent = ledHolder
-        local sc = Instance.new("UICorner"); sc.CornerRadius = UDim.new(0, 2); sc.Parent = seg
-        self._rpmLeds[i] = seg
+    if _getSetting("ui.videoMode", false) then
+        self:_enterVideoMode()
     end
+end
 
-    -- Docked Tuning Panel Button (top-right inside cluster)
-    local gearBtn = Instance.new("TextButton")
-    gearBtn.Name = "VX_Toggle"
-    gearBtn.Size = UDim2.new(0, 24, 0, 22)
-    gearBtn.Position = UDim2.new(1, -32, 0, 6)
-    gearBtn.BackgroundColor3 = THEME.card
-    gearBtn.BackgroundTransparency = 0.1
-    gearBtn.Text = "⚙"
-    gearBtn.TextColor3 = THEME.textDim
-    gearBtn.Font = Enum.Font.GothamBold
-    gearBtn.TextSize = 14
-    gearBtn.AutoButtonColor = false
-    gearBtn.Parent = f
-    local gc = Instance.new("UICorner"); gc.CornerRadius = UDim.new(0, 6); gc.Parent = gearBtn
-    local gs = Instance.new("UIStroke"); gs.Color = THEME.border; gs.Thickness = 1; gs.Parent = gearBtn
+function Module:_createDashboard(gui)
+    -- MIDDLE BOTTOM DASHBOARD
+    local dash = Instance.new("Frame")
+    dash.Name = "Dashboard"
+    dash.Size = UDim2.new(0, 344, 0, 154)
+    dash.AnchorPoint = Vector2.new(0.5, 1)
+    dash.Position = UDim2.new(0.5, 0, 1, -18)
+    dash.BackgroundColor3 = C.bg
+    dash.BackgroundTransparency = 0.12
+    dash.BorderSizePixel = 0
+    dash.Visible = false
+    dash.Parent = gui
+    _corner(dash, 12)
+    _stroke(dash, C.accent, 0.5, 1.2)
+    self._dash = dash
 
-    gearBtn.MouseEnter:Connect(function()
-        TweenService:Create(gs, TweenInfo.new(0.15), { Color = THEME.accent }):Play()
-        gearBtn.TextColor3 = THEME.text
-    end)
-    gearBtn.MouseLeave:Connect(function()
-        TweenService:Create(gs, TweenInfo.new(0.15), { Color = THEME.border }):Play()
-        gearBtn.TextColor3 = THEME.textDim
-    end)
-    gearBtn.MouseButton1Click:Connect(function()
-        if _G.VX.Panel then _G.VX.Panel:toggle() end
-    end)
-    self.toggleBtn = gearBtn
+    local scale = Instance.new("UIScale")
+    scale.Scale = _getSetting("ui.scale", 1.0)
+    scale.Parent = dash
+    self._dashScale = scale
 
-    -- Hero Gear Card (Left)
-    local gearCard = Instance.new("Frame")
-    gearCard.Size = UDim2.new(0, 54, 0, 64)
-    gearCard.Position = UDim2.new(0, 12, 0, 26)
-    gearCard.BackgroundColor3 = THEME.card
-    gearCard.BackgroundTransparency = 0.15
-    gearCard.BorderSizePixel = 0
-    gearCard.Parent = f
-    local gcc = Instance.new("UICorner"); gcc.CornerRadius = UDim.new(0, 8); gcc.Parent = gearCard
-    local gcs = Instance.new("UIStroke"); gcs.Color = THEME.border; gcs.Thickness = 1; gcs.Parent = gearCard
-    self.gearStroke = gcs
+    -- Left: Speed + Units
+    local speedLbl = Instance.new("TextLabel")
+    speedLbl.Size = UDim2.new(0, 126, 0, 48)
+    speedLbl.Position = UDim2.new(0, 14, 0, 8)
+    speedLbl.BackgroundTransparency = 1
+    speedLbl.Font = Enum.Font.GothamBlack
+    speedLbl.TextSize = 42
+    speedLbl.TextXAlignment = Enum.TextXAlignment.Left
+    speedLbl.TextColor3 = C.text
+    speedLbl.Text = "0"
+    speedLbl.Parent = dash
+    self._speedLbl = speedLbl
+
+    local unitLbl = Instance.new("TextLabel")
+    unitLbl.Size = UDim2.new(0, 60, 0, 16)
+    unitLbl.Position = UDim2.new(0, 16, 0, 54)
+    unitLbl.BackgroundTransparency = 1
+    unitLbl.Font = Enum.Font.GothamBold
+    unitLbl.TextSize = 11
+    unitLbl.TextXAlignment = Enum.TextXAlignment.Left
+    unitLbl.TextColor3 = C.muted
+    unitLbl.Text = "KM/H"
+    unitLbl.Parent = dash
+    self._unitLbl = unitLbl
+
+    -- Center: Gear Badge
+    local gearBox = Instance.new("Frame")
+    gearBox.Size = UDim2.new(0, 54, 0, 54)
+    gearBox.Position = UDim2.new(0.5, -27, 0, 10)
+    gearBox.BackgroundColor3 = C.panel
+    gearBox.BorderSizePixel = 0
+    gearBox.Parent = dash
+    _corner(gearBox, 10)
+    _stroke(gearBox, C.accent, 0.45, 1.2)
+    self._gearBox = gearBox
 
     local gearLbl = Instance.new("TextLabel")
-    gearLbl.Size = UDim2.new(1, 0, 1, -12)
-    gearLbl.Position = UDim2.new(0, 0, 0, 2)
+    gearLbl.Size = UDim2.new(1, 0, 1, 0)
     gearLbl.BackgroundTransparency = 1
-    gearLbl.Text = "N"
-    gearLbl.TextColor3 = THEME.text
     gearLbl.Font = Enum.Font.GothamBlack
-    gearLbl.TextSize = 32
-    gearLbl.Parent = gearCard
-    self.gearLabel = gearLbl
+    gearLbl.TextSize = 28
+    gearLbl.TextColor3 = C.accent
+    gearLbl.Text = "N"
+    gearLbl.Parent = gearBox
+    self._gearLbl = gearLbl
 
-    local gearTag = Instance.new("TextLabel")
-    gearTag.Size = UDim2.new(1, 0, 0, 12)
-    gearTag.Position = UDim2.new(0, 0, 1, -14)
-    gearTag.BackgroundTransparency = 1
-    gearTag.Text = "GEAR"
-    gearTag.TextColor3 = THEME.textMuted
-    gearTag.Font = Enum.Font.GothamBold
-    gearTag.TextSize = 8
-    gearTag.Parent = gearCard
+    -- Right: Boost PSI + Boost Bar + RPM
+    local boostLbl = Instance.new("TextLabel")
+    boostLbl.Size = UDim2.new(0, 118, 0, 20)
+    boostLbl.Position = UDim2.new(1, -132, 0, 10)
+    boostLbl.BackgroundTransparency = 1
+    boostLbl.Font = Enum.Font.GothamBold
+    boostLbl.TextSize = 14
+    boostLbl.TextXAlignment = Enum.TextXAlignment.Right
+    boostLbl.TextColor3 = C.accent
+    boostLbl.Text = "0.0 PSI"
+    boostLbl.Parent = dash
+    self._boostLbl = boostLbl
 
-    -- Center Speed & RPM Readout
-    local speedLbl = Instance.new("TextLabel")
-    speedLbl.Size = UDim2.new(0, 84, 0, 36)
-    speedLbl.Position = UDim2.new(0, 76, 0, 24)
-    speedLbl.BackgroundTransparency = 1
-    speedLbl.Text = "0"
-    speedLbl.TextColor3 = THEME.text
-    speedLbl.Font = Enum.Font.GothamBlack
-    speedLbl.TextSize = 36
-    speedLbl.TextXAlignment = Enum.TextXAlignment.Left
-    speedLbl.Parent = f
-    self.speedLabel = speedLbl
-
-    local mphLbl = Instance.new("TextLabel")
-    mphLbl.Size = UDim2.new(0, 34, 0, 14)
-    mphLbl.Position = UDim2.new(0, 76, 0, 58)
-    mphLbl.BackgroundTransparency = 1
-    mphLbl.Text = "MPH"
-    mphLbl.TextColor3 = THEME.textMuted
-    mphLbl.Font = Enum.Font.GothamBold
-    mphLbl.TextSize = 10
-    mphLbl.TextXAlignment = Enum.TextXAlignment.Left
-    mphLbl.Parent = f
-
-    local rpmLbl = Instance.new("TextLabel")
-    rpmLbl.Size = UDim2.new(0, 110, 0, 18)
-    rpmLbl.Position = UDim2.new(1, -124, 0, 30)
-    rpmLbl.BackgroundTransparency = 1
-    rpmLbl.Text = "0 RPM"
-    rpmLbl.TextColor3 = THEME.textDim
-    rpmLbl.Font = Enum.Font.GothamBold
-    rpmLbl.TextSize = 13
-    rpmLbl.TextXAlignment = Enum.TextXAlignment.Right
-    rpmLbl.Parent = f
-    self.rpmLabel = rpmLbl
-
-    -- Boost Progress Bar + PSI
-    local boostTrack = Instance.new("Frame")
-    boostTrack.Size = UDim2.new(0, 140, 0, 6)
-    boostTrack.Position = UDim2.new(0, 76, 0, 78)
-    boostTrack.BackgroundColor3 = THEME.track
-    boostTrack.BorderSizePixel = 0
-    boostTrack.Parent = f
-    local btc = Instance.new("UICorner"); btc.CornerRadius = UDim.new(0, 3); btc.Parent = boostTrack
+    local boostBg = Instance.new("Frame")
+    boostBg.Size = UDim2.new(0, 104, 0, 5)
+    boostBg.Position = UDim2.new(1, -118, 0, 32)
+    boostBg.BackgroundColor3 = C.panel
+    boostBg.BorderSizePixel = 0
+    boostBg.Parent = dash
+    _corner(boostBg, 3)
 
     local boostFill = Instance.new("Frame")
     boostFill.Size = UDim2.new(0, 0, 1, 0)
-    boostFill.BackgroundColor3 = THEME.accent
+    boostFill.BackgroundColor3 = C.accent
     boostFill.BorderSizePixel = 0
-    boostFill.Parent = boostTrack
-    local bfc = Instance.new("UICorner"); bfc.CornerRadius = UDim.new(0, 3); bfc.Parent = boostFill
-    self.boostFill = boostFill
+    boostFill.Parent = boostBg
+    _corner(boostFill, 3)
+    self._boostFill = boostFill
 
-    local boostLbl = Instance.new("TextLabel")
-    boostLbl.Size = UDim2.new(0, 96, 0, 14)
-    boostLbl.Position = UDim2.new(0, 118, 0, 58)
-    boostLbl.BackgroundTransparency = 1
-    boostLbl.Text = "0.0 PSI"
-    boostLbl.TextColor3 = THEME.textMuted
-    boostLbl.Font = Enum.Font.GothamBold
-    boostLbl.TextSize = 10
-    boostLbl.TextXAlignment = Enum.TextXAlignment.Left
-    boostLbl.Parent = f
-    self.boostLabel = boostLbl
+    local rpmLbl = Instance.new("TextLabel")
+    rpmLbl.Size = UDim2.new(0, 118, 0, 16)
+    rpmLbl.Position = UDim2.new(1, -132, 0, 42)
+    rpmLbl.BackgroundTransparency = 1
+    rpmLbl.Font = Enum.Font.GothamSemibold
+    rpmLbl.TextSize = 12
+    rpmLbl.TextXAlignment = Enum.TextXAlignment.Right
+    rpmLbl.TextColor3 = C.muted
+    rpmLbl.Text = "0 RPM"
+    rpmLbl.Parent = dash
+    self._rpmLbl = rpmLbl
 
-    -- Right: 4-Corner Tire Temp Indicators + COLD badge
-    local tireBox = Instance.new("Frame")
-    tireBox.Size = UDim2.new(0, 42, 0, 38)
-    tireBox.Position = UDim2.new(1, -54, 0, 50)
-    tireBox.BackgroundColor3 = THEME.card
-    tireBox.BackgroundTransparency = 0.25
-    tireBox.BorderSizePixel = 0
-    tireBox.Parent = f
-    local tbc = Instance.new("UICorner"); tbc.CornerRadius = UDim.new(0, 6); tbc.Parent = tireBox
+    -- RPM Bar + Redline Marker
+    local rpmBg = Instance.new("Frame")
+    rpmBg.Size = UDim2.new(1, -28, 0, 12)
+    rpmBg.Position = UDim2.new(0, 14, 0, 76)
+    rpmBg.BackgroundColor3 = C.panel
+    rpmBg.BorderSizePixel = 0
+    rpmBg.Parent = dash
+    _corner(rpmBg, 6)
 
-    local function makeTireDot(x, y)
-        local d = Instance.new("Frame")
-        d.Size = UDim2.new(0, 10, 0, 12)
-        d.Position = UDim2.new(0, x, 0, y)
-        d.BackgroundColor3 = THEME.green
-        d.BorderSizePixel = 0
-        d.Parent = tireBox
-        local dc = Instance.new("UICorner"); dc.CornerRadius = UDim.new(0, 2); dc.Parent = d
-        return d
-    end
-    self.tireFL = makeTireDot(8, 5)
-    self.tireFR = makeTireDot(24, 5)
-    self.tireRL = makeTireDot(8, 21)
-    self.tireRR = makeTireDot(24, 21)
+    local rpmFill = Instance.new("Frame")
+    rpmFill.Size = UDim2.new(0, 0, 1, 0)
+    rpmFill.BackgroundColor3 = C.green
+    rpmFill.BorderSizePixel = 0
+    rpmFill.Parent = rpmBg
+    _corner(rpmFill, 6)
+    self._rpmFill = rpmFill
 
-    local coldPill = Instance.new("TextLabel")
-    coldPill.Size = UDim2.new(0, 40, 0, 15)
-    coldPill.Position = UDim2.new(1, -52, 1, -24)
-    coldPill.BackgroundColor3 = Color3.fromRGB(20, 45, 65)
-    coldPill.Text = "COLD"
-    coldPill.TextColor3 = THEME.ice
-    coldPill.Font = Enum.Font.GothamBold
-    coldPill.TextSize = 9
-    coldPill.Visible = false
-    coldPill.Parent = f
-    local cpc = Instance.new("UICorner"); cpc.CornerRadius = UDim.new(0, 4); cpc.Parent = coldPill
-    self.coldBadge = coldPill
+    local redMark = Instance.new("Frame")
+    redMark.Size = UDim2.new(0, 2, 1, 2)
+    redMark.Position = UDim2.new(0.88, 0, 0, -1)
+    redMark.BackgroundColor3 = C.red
+    redMark.BorderSizePixel = 0
+    redMark.ZIndex = 3
+    redMark.Parent = rpmBg
+    self._redMark = redMark
 
-    -- Bottom Status Pills (TCS, ABS, LC, CLT)
-    self.indicators = {}
-    local pillDefs = {
-        { key = "tcs",    label = "TCS", x = 12,  w = 46 },
-        { key = "abs",    label = "ABS", x = 63,  w = 46 },
-        { key = "launch", label = "LC",  x = 114, w = 52 },
-        { key = "clutch", label = "CLT", x = 171, w = 46 },
-    }
-    for _, def in ipairs(pillDefs) do
-        local pill = Instance.new("Frame")
-        pill.Size = UDim2.new(0, def.w, 0, 18)
-        pill.Position = UDim2.new(0, def.x, 1, -26)
-        pill.BackgroundColor3 = THEME.card
-        pill.BorderSizePixel = 0
-        pill.Parent = f
-        local pc = Instance.new("UICorner"); pc.CornerRadius = UDim.new(0, 4); pc.Parent = pill
+    -- Throttle & Brake Mini Bars
+    local thrBg = Instance.new("Frame")
+    thrBg.Size = UDim2.new(0.5, -18, 0, 5)
+    thrBg.Position = UDim2.new(0, 14, 0, 94)
+    thrBg.BackgroundColor3 = C.panel
+    thrBg.BorderSizePixel = 0
+    thrBg.Parent = dash
+    _corner(thrBg, 3)
 
-        local dot = Instance.new("Frame")
-        dot.Size = UDim2.new(0, 5, 0, 5)
-        dot.Position = UDim2.new(0, 6, 0.5, -2)
-        dot.BackgroundColor3 = THEME.textMuted
-        dot.BorderSizePixel = 0
-        dot.Parent = pill
-        local dc = Instance.new("UICorner"); dc.CornerRadius = UDim.new(1, 0); dc.Parent = dot
+    local thrFill = Instance.new("Frame")
+    thrFill.Size = UDim2.new(0, 0, 1, 0)
+    thrFill.BackgroundColor3 = C.green
+    thrFill.BorderSizePixel = 0
+    thrFill.Parent = thrBg
+    _corner(thrFill, 3)
+    self._thrFill = thrFill
 
-        local lbl = Instance.new("TextLabel")
-        lbl.Size = UDim2.new(1, -14, 1, 0)
-        lbl.Position = UDim2.new(0, 13, 0, 0)
-        lbl.BackgroundTransparency = 1
-        lbl.Text = def.label
-        lbl.TextColor3 = THEME.textMuted
-        lbl.Font = Enum.Font.GothamBold
-        lbl.TextSize = 9
-        lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.Parent = pill
+    local brkBg = Instance.new("Frame")
+    brkBg.Size = UDim2.new(0.5, -18, 0, 5)
+    brkBg.Position = UDim2.new(0.5, 4, 0, 94)
+    brkBg.BackgroundColor3 = C.panel
+    brkBg.BorderSizePixel = 0
+    brkBg.Parent = dash
+    _corner(brkBg, 3)
 
-        self.indicators[def.key] = { pill = pill, dot = dot, lbl = lbl }
-    end
+    local brkFill = Instance.new("Frame")
+    brkFill.Size = UDim2.new(0, 0, 1, 0)
+    brkFill.BackgroundColor3 = C.red
+    brkFill.BorderSizePixel = 0
+    brkFill.Parent = brkBg
+    _corner(brkFill, 3)
+    self._brkFill = brkFill
 
-    self.dashboard = f
-    self:_makeDraggable(f)
+    -- Meta & Active Flags
+    local metaLbl = Instance.new("TextLabel")
+    metaLbl.Size = UDim2.new(1, -28, 0, 18)
+    metaLbl.Position = UDim2.new(0, 14, 0, 106)
+    metaLbl.BackgroundTransparency = 1
+    metaLbl.Font = Enum.Font.GothamBold
+    metaLbl.TextSize = 11
+    metaLbl.TextXAlignment = Enum.TextXAlignment.Left
+    metaLbl.TextColor3 = C.muted
+    metaLbl.Text = "RWD  |  NORMAL  |  STG 1"
+    metaLbl.Parent = dash
+    self._metaLbl = metaLbl
+
+    local flagsLbl = Instance.new("TextLabel")
+    flagsLbl.Size = UDim2.new(1, -28, 0, 18)
+    flagsLbl.Position = UDim2.new(0, 14, 0, 126)
+    flagsLbl.BackgroundTransparency = 1
+    flagsLbl.Font = Enum.Font.GothamBold
+    flagsLbl.TextSize = 11
+    flagsLbl.TextXAlignment = Enum.TextXAlignment.Left
+    flagsLbl.TextColor3 = C.green
+    flagsLbl.Text = ""
+    flagsLbl.Parent = dash
+    self._flagsLbl = flagsLbl
+
+    local brakeTempLbl = Instance.new("TextLabel")
+    brakeTempLbl.Size = UDim2.new(0, 90, 0, 18)
+    brakeTempLbl.Position = UDim2.new(1, -104, 0, 126)
+    brakeTempLbl.BackgroundTransparency = 1
+    brakeTempLbl.Font = Enum.Font.GothamBold
+    brakeTempLbl.TextSize = 11
+    brakeTempLbl.TextXAlignment = Enum.TextXAlignment.Right
+    brakeTempLbl.TextColor3 = C.muted
+    brakeTempLbl.Text = "BRK 60C"
+    brakeTempLbl.Parent = dash
+    self._brakeTempLbl = brakeTempLbl
 end
 
--- ==================== NOTIFICATIONS ====================
-function Module:_createNotifs()
-    local c = Instance.new("Frame")
-    c.Name = "VX_Notifs"
-    c.Size = UDim2.new(0, 260, 0, 220)
-    c.Position = UDim2.new(0.5, -130, 1, -240)
-    c.BackgroundTransparency = 1
-    c.Parent = self.gui
-    self.notifContainer = c
+function Module:_createNotifications(gui)
+    local nc = Instance.new("Frame")
+    nc.Name = "Notifications"
+    nc.Size = UDim2.new(0, 290, 0, 180)
+    nc.Position = UDim2.new(0.5, -145, 0, 14)
+    nc.BackgroundTransparency = 1
+    nc.Parent = gui
+
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0, 6)
+    list.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    list.Parent = nc
+    self._notifContainer = nc
 end
 
-function Module:notify(msg, duration, kind)
-    if self.videoMode or not self.notifContainer then return end
-    duration = duration or 2.5
-    local barColor = THEME.accent
-    if kind == "success" then barColor = THEME.green
-    elseif kind == "warn" then barColor = THEME.amber end
+function Module:notify(title, msg, color, duration)
+    if not self._notifContainer or self._videoMode then return end
+    if not _getSetting("visuals.notifications", true) then return end
 
-    local n = Instance.new("Frame")
-    n.Size = UDim2.new(1, 0, 0, 32)
-    n.Position = UDim2.new(0, 24, 1, -32)
-    n.BackgroundColor3 = THEME.bg
-    n.BackgroundTransparency = 0.12
-    n.BorderSizePixel = 0
-    n.Parent = self.notifContainer
-    addGlassStyle(n, 7, THEME.border, 0.25)
+    local accent = color or C.accent
+    local toast = Instance.new("Frame")
+    toast.Size = UDim2.new(1, 0, 0, 44)
+    toast.BackgroundColor3 = C.bg
+    toast.BackgroundTransparency = 0.12
+    toast.BorderSizePixel = 0
+    toast.Parent = self._notifContainer
+    _corner(toast, 8)
+    _stroke(toast, accent, 0.35)
 
-    local stripe = Instance.new("Frame")
-    stripe.Size = UDim2.new(0, 3, 1, -10)
-    stripe.Position = UDim2.new(0, 0, 0, 5)
-    stripe.BackgroundColor3 = barColor
-    stripe.BorderSizePixel = 0
-    stripe.Parent = n
-    local sc = Instance.new("UICorner"); sc.CornerRadius = UDim.new(0, 2); sc.Parent = stripe
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(0, 4, 1, -10)
+    bar.Position = UDim2.new(0, 6, 0, 5)
+    bar.BackgroundColor3 = accent
+    bar.BorderSizePixel = 0
+    bar.Parent = toast
+    _corner(bar, 2)
 
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -16, 1, 0)
-    lbl.Position = UDim2.new(0, 10, 0, 0)
-    lbl.BackgroundTransparency = 1
-    lbl.Text = msg
-    lbl.TextColor3 = THEME.text
-    lbl.Font = Enum.Font.GothamBold
-    lbl.TextSize = 12
-    lbl.TextTruncate = Enum.TextTruncate.AtEnd
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.Parent = n
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Size = UDim2.new(1, -24, 0, 16)
+    titleLbl.Position = UDim2.new(0, 16, 0, 5)
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.Font = Enum.Font.GothamBold
+    titleLbl.TextSize = 11
+    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    titleLbl.TextColor3 = accent
+    titleLbl.Text = string.upper(tostring(title))
+    titleLbl.Parent = toast
 
-    for _, child in ipairs(self.notifContainer:GetChildren()) do
-        if child ~= n and child:IsA("Frame") then
-            TweenService:Create(child, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-                Position = child.Position - UDim2.new(0, 0, 0, 38)
-            }):Play()
+    local msgLbl = Instance.new("TextLabel")
+    msgLbl.Size = UDim2.new(1, -24, 0, 18)
+    msgLbl.Position = UDim2.new(0, 16, 0, 21)
+    msgLbl.BackgroundTransparency = 1
+    msgLbl.Font = Enum.Font.GothamSemibold
+    msgLbl.TextSize = 12
+    msgLbl.TextXAlignment = Enum.TextXAlignment.Left
+    msgLbl.TextColor3 = C.text
+    msgLbl.Text = tostring(msg)
+    msgLbl.Parent = toast
+
+    task.delay(duration or 2.5, function()
+        if toast and toast.Parent then
+            TweenService:Create(toast, TweenInfo.new(0.25), { BackgroundTransparency = 1 }):Play()
+            TweenService:Create(bar, TweenInfo.new(0.25), { BackgroundTransparency = 1 }):Play()
+            TweenService:Create(titleLbl, TweenInfo.new(0.25), { TextTransparency = 1 }):Play()
+            TweenService:Create(msgLbl, TweenInfo.new(0.25), { TextTransparency = 1 }):Play()
+            task.wait(0.26)
+            if toast and toast.Parent then toast:Destroy() end
         end
-    end
-
-    TweenService:Create(n, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-        Position = UDim2.new(0, 0, 1, -32)
-    }):Play()
-
-    task.delay(duration, function()
-        if not n.Parent then return end
-        local tw = TweenService:Create(n, TweenInfo.new(0.22), { BackgroundTransparency = 1 })
-        TweenService:Create(lbl, TweenInfo.new(0.22), { TextTransparency = 1 }):Play()
-        tw:Play()
-        tw.Completed:Connect(function()
-            if n.Parent then n:Destroy() end
-        end)
     end)
 end
 
--- ==================== VISUAL TELEMETRY (F2) ====================
-function Module:_createTelemetry()
-    if self.telemetry then return end
+function Module:_createTelemetry(gui)
     local f = Instance.new("Frame")
-    f.Name = "VX_Telemetry"
-    f.Size = UDim2.new(0, 296, 0, 214)
-    f.Position = UDim2.new(0, 18, 0, 18)
-    f.BackgroundColor3 = THEME.bg
-    f.BackgroundTransparency = 0.14
-    f.BorderSizePixel = 0
-    f.Visible = self.core.settings.physics.telemetryHud == true
-    f.Parent = self.gui
-    addGlassStyle(f, 10, THEME.border, 0.25)
+    f.Name = "Telemetry"
+    f.Size = UDim2.new(0, 260, 0, 264)
+    f.Position = UDim2.new(0, 16, 0, 16)
+    f.BackgroundColor3 = C.bg
+    f.BackgroundTransparency = 0.16
+    f.Visible = _getSetting("visuals.telemetry", false)
+    f.Parent = gui
+    _corner(f, 10)
+    _stroke(f, C.accent, 0.5)
+    self._telFrame = f
 
-    local hdr = Instance.new("TextLabel")
-    hdr.Size = UDim2.new(1, -20, 0, 22)
-    hdr.Position = UDim2.new(0, 12, 0, 8)
-    hdr.BackgroundTransparency = 1
-    hdr.Text = "GT3 // TELEMETRY"
-    hdr.TextColor3 = THEME.accent
-    hdr.Font = Enum.Font.GothamBlack
-    hdr.TextSize = 11
-    hdr.TextXAlignment = Enum.TextXAlignment.Left
-    hdr.Parent = f
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -16, 0, 24)
+    title.Position = UDim2.new(0, 10, 0, 6)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBlack
+    title.TextSize = 12
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextColor3 = C.accent
+    title.Text = "VISUAL TELEMETRY (F2)"
+    title.Parent = f
 
-    -- Throttle & Brake Bars
-    local function makeMiniBar(label, y, color)
-        local tag = Instance.new("TextLabel")
-        tag.Size = UDim2.new(0, 28, 0, 12)
-        tag.Position = UDim2.new(0, 12, 0, y)
-        tag.BackgroundTransparency = 1
-        tag.Text = label
-        tag.TextColor3 = THEME.textDim
-        tag.Font = Enum.Font.GothamBold
-        tag.TextSize = 9
-        tag.TextXAlignment = Enum.TextXAlignment.Left
-        tag.Parent = f
-
-        local trk = Instance.new("Frame")
-        trk.Size = UDim2.new(0, 150, 0, 8)
-        trk.Position = UDim2.new(0, 42, 0, y + 2)
-        trk.BackgroundColor3 = THEME.track
-        trk.BorderSizePixel = 0
-        trk.Parent = f
-        local c1 = Instance.new("UICorner"); c1.CornerRadius = UDim.new(0, 3); c1.Parent = trk
-
-        local fill = Instance.new("Frame")
-        fill.Size = UDim2.new(0, 0, 1, 0)
-        fill.BackgroundColor3 = color
-        fill.BorderSizePixel = 0
-        fill.Parent = trk
-        local c2 = Instance.new("UICorner"); c2.CornerRadius = UDim.new(0, 3); c2.Parent = fill
-        return fill
-    end
-
-    self.teleThrottle = makeMiniBar("THR", 34, THEME.green)
-    self.teleBrake    = makeMiniBar("BRK", 50, THEME.accent)
-
-    -- Centered Steering Bar
-    local stTag = Instance.new("TextLabel")
-    stTag.Size = UDim2.new(0, 28, 0, 12)
-    stTag.Position = UDim2.new(0, 12, 0, 66)
-    stTag.BackgroundTransparency = 1
-    stTag.Text = "STR"
-    stTag.TextColor3 = THEME.textDim
-    stTag.Font = Enum.Font.GothamBold
-    stTag.TextSize = 9
-    stTag.TextXAlignment = Enum.TextXAlignment.Left
-    stTag.Parent = f
-
-    local stTrack = Instance.new("Frame")
-    stTrack.Size = UDim2.new(0, 150, 0, 8)
-    stTrack.Position = UDim2.new(0, 42, 0, 68)
-    stTrack.BackgroundColor3 = THEME.track
-    stTrack.BorderSizePixel = 0
-    stTrack.Parent = f
-    local stc = Instance.new("UICorner"); stc.CornerRadius = UDim.new(0, 3); stc.Parent = stTrack
-
-    local stTick = Instance.new("Frame")
-    stTick.Size = UDim2.new(0, 2, 1, 2)
-    stTick.Position = UDim2.new(0.5, -1, 0, -1)
-    stTick.BackgroundColor3 = THEME.textDim
-    stTick.BorderSizePixel = 0
-    stTick.Parent = stTrack
-
-    local stFill = Instance.new("Frame")
-    stFill.Size = UDim2.new(0, 0, 1, 0)
-    stFill.Position = UDim2.new(0.5, 0, 0, 0)
-    stFill.BackgroundColor3 = THEME.ice
-    stFill.BorderSizePixel = 0
-    stFill.Parent = stTrack
-    self.teleSteer = stFill
-
-    -- 4-Corner Weight Transfer Mini-Card
-    local wtBox = Instance.new("Frame")
-    wtBox.Size = UDim2.new(0, 84, 0, 46)
-    wtBox.Position = UDim2.new(1, -96, 0, 32)
-    wtBox.BackgroundColor3 = THEME.card
-    wtBox.BorderSizePixel = 0
-    wtBox.Parent = f
-    local wtc = Instance.new("UICorner"); wtc.CornerRadius = UDim.new(0, 6); wtc.Parent = wtBox
-
-    self.teleWT = Instance.new("TextLabel")
-    self.teleWT.Size = UDim2.new(1, -6, 1, -4)
-    self.teleWT.Position = UDim2.new(0, 3, 0, 2)
-    self.teleWT.BackgroundTransparency = 1
-    self.teleWT.Text = "LOAD\n1.0 | 1.0\n1.0 | 1.0"
-    self.teleWT.TextColor3 = THEME.text
-    self.teleWT.Font = Enum.Font.Code
-    self.teleWT.TextSize = 10
-    self.teleWT.Parent = wtBox
-
-    local txt = Instance.new("TextLabel")
-    txt.Size = UDim2.new(1, -24, 1, -92)
-    txt.Position = UDim2.new(0, 12, 0, 86)
-    txt.BackgroundTransparency = 1
-    txt.Text = ""
-    txt.TextColor3 = THEME.textDim
-    txt.Font = Enum.Font.Code
-    txt.TextSize = 11
-    txt.TextXAlignment = Enum.TextXAlignment.Left
-    txt.TextYAlignment = Enum.TextYAlignment.Top
-    txt.Parent = f
-
-    self.teleText = txt
-    self.telemetry = f
-    self:_makeDraggable(f)
-end
-
--- ==================== DIAGNOSTICS (F3) ====================
-function Module:toggleDiagnostics()
-    if not self.diagnosticsPanel then
-        local f = Instance.new("Frame")
-        f.Name = "VX_Diagnostics"
-        f.Size = UDim2.new(0, 390, 0, 410)
-        f.Position = UDim2.new(1, -408, 0, 18)
-        f.BackgroundColor3 = THEME.bg
-        f.BackgroundTransparency = 0.08
-        f.BorderSizePixel = 0
-        f.Visible = false
-        f.Parent = self.gui
-        addGlassStyle(f, 10, THEME.border, 0.25)
-
-        local hdr = Instance.new("TextLabel")
-        hdr.Size = UDim2.new(1, -20, 0, 28)
-        hdr.Position = UDim2.new(0, 12, 0, 8)
-        hdr.BackgroundTransparency = 1
-        hdr.Text = "VX // DIAGNOSTICS  (F3)"
-        hdr.TextColor3 = THEME.accent
-        hdr.Font = Enum.Font.GothamBlack
-        hdr.TextSize = 13
-        hdr.TextXAlignment = Enum.TextXAlignment.Left
-        hdr.Parent = f
-
-        local scroll = Instance.new("ScrollingFrame")
-        scroll.Size = UDim2.new(1, -16, 1, -46)
-        scroll.Position = UDim2.new(0, 8, 0, 38)
-        scroll.BackgroundTransparency = 1
-        scroll.ScrollBarThickness = 4
-        scroll.ScrollBarImageColor3 = THEME.accent
-        scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-        scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-        scroll.Parent = f
-        local layout = Instance.new("UIListLayout")
-        layout.Padding = UDim.new(0, 3)
-        layout.Parent = scroll
-
-        self.diagScroll = scroll
-        self.diagnosticsPanel = f
-        self:_makeDraggable(f)
-    end
-
-    self.diagOpen = not self.diagOpen
-    self.diagnosticsPanel.Visible = self.diagOpen
-    self._diagSession = self._diagSession + 1
-    if self.diagOpen then
-        self:_refreshDiagnostics(self._diagSession)
-    end
-end
-
-function Module:_refreshDiagnostics(session)
-    if not self.diagOpen or session ~= self._diagSession or not self.diagScroll then return end
-    for _, c in ipairs(self.diagScroll:GetChildren()) do
-        if c:IsA("TextLabel") then c:Destroy() end
-    end
-    local all = _G.VX.diagnostics and _G.VX.diagnostics.getAll() or {}
-    local keys = {}
-    for k in pairs(all) do table.insert(keys, k) end
-    table.sort(keys)
-    for _, k in ipairs(keys) do
-        local entry = all[k]
+    local keys = { "State", "Speed", "RPM", "Gear", "Boost", "Inputs", "Slip", "Slope", "Friction", "Tires", "Brakes" }
+    for i, k in ipairs(keys) do
         local lbl = Instance.new("TextLabel")
-        lbl.Size = UDim2.new(1, -8, 0, 18)
+        lbl.Size = UDim2.new(1, -20, 0, 18)
+        lbl.Position = UDim2.new(0, 10, 0, 32 + (i - 1) * 20)
         lbl.BackgroundTransparency = 1
-        lbl.Text = string.format("%-24s %s %s",
-            entry.schema.label or k,
-            tostring(entry.value),
-            entry.schema.unit or "")
-        lbl.TextColor3 = entry.value ~= nil and THEME.text or THEME.textMuted
         lbl.Font = Enum.Font.Code
         lbl.TextSize = 11
         lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.Parent = self.diagScroll
+        lbl.TextColor3 = C.text
+        lbl.Text = k .. ": --"
+        lbl.Parent = f
+        self._telLabels[k] = lbl
     end
-    task.delay(1.0, function()
-        self:_refreshDiagnostics(session)
-    end)
 end
 
--- ==================== VIDEO MODE ====================
+function Module:toggleTelemetry()
+    local nextVal = not _getSetting("visuals.telemetry", false)
+    if _G.VX.setSetting then
+        _G.VX.setSetting("visuals.telemetry", nextVal)
+    elseif self._telFrame then
+        self._telFrame.Visible = nextVal and not self._videoMode
+    end
+end
+
+function Module:_createDiagnostics(gui)
+    local f = Instance.new("Frame")
+    f.Name = "Diagnostics"
+    f.Size = UDim2.new(0, 350, 0, 400)
+    f.Position = UDim2.new(1, -366, 0, 16)
+    f.BackgroundColor3 = C.bg
+    f.BackgroundTransparency = 0.14
+    f.Visible = _getSetting("ui.diagnostics", false)
+    f.Parent = gui
+    _corner(f, 10)
+    _stroke(f, C.accent, 0.45)
+    self._diagFrame = f
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -16, 0, 24)
+    title.Position = UDim2.new(0, 10, 0, 6)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBlack
+    title.TextSize = 12
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextColor3 = C.accent
+    title.Text = "VX DIAGNOSTICS (F3)"
+    title.Parent = f
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1, -14, 1, -38)
+    scroll.Position = UDim2.new(0, 7, 0, 32)
+    scroll.BackgroundTransparency = 1
+    scroll.ScrollBarThickness = 4
+    scroll.ScrollBarImageColor3 = C.accent
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.Parent = f
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 2)
+    layout.Parent = scroll
+    self._diagScroll = scroll
+end
+
+function Module:toggleDiagnostics()
+    local nextVal = not _getSetting("ui.diagnostics", false)
+    if _G.VX.setSetting then
+        _G.VX.setSetting("ui.diagnostics", nextVal)
+    elseif self._diagFrame then
+        self._diagFrame.Visible = nextVal and not self._videoMode
+    end
+end
+
+function Module:_refreshDiagnostics()
+    if not self._diagFrame or not self._diagFrame.Visible then return end
+    local now = os.clock()
+    if now - self._lastDiagUpdate < 0.25 then return end
+    self._lastDiagUpdate = now
+
+    local all = _G.VX.diagnostics and _G.VX.diagnostics.getAll() or {}
+    local keys = {}
+    for k in pairs(all) do
+        table.insert(keys, k)
+    end
+    table.sort(keys)
+
+    for _, k in ipairs(keys) do
+        local entry = all[k]
+        local lbl = self._diagLabels[k]
+        if not lbl then
+            lbl = Instance.new("TextLabel")
+            lbl.Size = UDim2.new(1, -8, 0, 18)
+            lbl.BackgroundTransparency = 1
+            lbl.Font = Enum.Font.Code
+            lbl.TextSize = 11
+            lbl.TextXAlignment = Enum.TextXAlignment.Left
+            lbl.TextColor3 = C.text
+            lbl.Parent = self._diagScroll
+            self._diagLabels[k] = lbl
+        end
+        local status = entry.status
+        lbl.TextColor3 = (status == "error") and C.red or ((status == "warn") and C.amber or C.text)
+        lbl.Text = string.format("%-22s %s %s", entry.schema.label or k, tostring(entry.value), entry.schema.unit or "")
+    end
+end
+
 function Module:toggleVideoMode()
-    self.videoMode = not self.videoMode
-    _G.VX.setSetting("videoMode", self.videoMode)
-    if self.videoMode then
+    local nextVal = not _getSetting("ui.videoMode", false)
+    if _G.VX.setSetting then
+        _G.VX.setSetting("ui.videoMode", nextVal)
+    elseif nextVal then
         self:_enterVideoMode()
     else
         self:_exitVideoMode()
-        self:notify("Video Mode: OFF", 1.5)
     end
 end
 
 function Module:_enterVideoMode()
-    self.hiddenElements = {}
-    local pg = Player:FindFirstChild("PlayerGui")
+    if self._videoMode then return end
+    self._videoMode = true
+    self._hiddenGuis = {}
+
+    if self._dash then self._dash.Visible = false end
+    if self._notifContainer then self._notifContainer.Visible = false end
+    if self._telFrame then self._telFrame.Visible = false end
+    if self._diagFrame then self._diagFrame.Visible = false end
+
+    local player = Players.LocalPlayer
+    local pg = player and player:FindFirstChild("PlayerGui")
     if pg then
-        for _, d in ipairs(pg:GetDescendants()) do
-            if d:IsA("GuiObject") and d.Visible and not d:IsDescendantOf(self.gui) then
-                self.hiddenElements[d] = true
-                d.Visible = false
+        for _, child in ipairs(pg:GetChildren()) do
+            if child:IsA("ScreenGui") and child ~= self._gui and child.Name ~= "VX_Panel" then
+                self._hiddenGuis[child] = child.Enabled
+                child.Enabled = false
             end
         end
     end
-    if self.dashboard then self.dashboard.Visible = false end
-    if self.telemetry then self.telemetry.Visible = false end
-    if self.diagnosticsPanel then self.diagnosticsPanel.Visible = false end
-    if self.notifContainer then self.notifContainer.Visible = false end
 
-    if self._videoWatcher then pcall(task.cancel, self._videoWatcher) end
-    self._videoWatcher = task.spawn(function()
-        while self.videoMode do
-            task.wait(1)
-            if not self.videoMode then break end
-            local pg2 = Player:FindFirstChild("PlayerGui")
-            if pg2 then
-                for _, d in ipairs(pg2:GetDescendants()) do
-                    if d:IsA("GuiObject") and d.Visible and not d:IsDescendantOf(self.gui) then
-                        self.hiddenElements[d] = true
-                        d.Visible = false
-                    end
-                end
-            end
-        end
-    end)
+    if _G.VX.Panel and type(_G.VX.Panel.setHidden) == "function" then
+        _G.VX.Panel:setHidden(true)
+    end
 end
 
 function Module:_exitVideoMode()
-    if self._videoWatcher then
-        pcall(task.cancel, self._videoWatcher)
-        self._videoWatcher = nil
-    end
-    for obj in pairs(self.hiddenElements) do
-        pcall(function() if obj and obj.Parent then obj.Visible = true end end)
-    end
-    self.hiddenElements = {}
-    if self.dashboard and self.vehicleState:isReady() then
-        self.dashboard.Visible = true
-    end
-    if self.telemetry and self.core.settings.physics.telemetryHud then
-        self.telemetry.Visible = true
-    end
-    if self.diagnosticsPanel and self.diagOpen then
-        self.diagnosticsPanel.Visible = true
-    end
-    if self.notifContainer then self.notifContainer.Visible = true end
-end
+    if not self._videoMode then return end
+    self._videoMode = false
 
--- ==================== STATE & UPDATE ====================
-function Module:_onStateChange(evt)
-    if evt.to == "Ready" then
-        self._running = true
-        if not self.telemetry and self.core.settings.physics.telemetryHud then
-            self:_createTelemetry()
+    for gui, wasEnabled in pairs(self._hiddenGuis) do
+        if gui and gui.Parent then
+            gui.Enabled = wasEnabled
         end
-        if not self.videoMode and self.dashboard then
-            self.dashboard.Visible = true
-        end
-        if self.telemetry and self.core.settings.physics.telemetryHud and not self.videoMode then
-            self.telemetry.Visible = true
-        end
-    elseif evt.to == "Exiting" or evt.to == "Disabled" then
-        self._running = false
-        if self.dashboard then self.dashboard.Visible = false end
-        if self.telemetry then self.telemetry.Visible = false end
-        if self.videoMode then self:toggleVideoMode() end
+    end
+    self._hiddenGuis = {}
+
+    if self._notifContainer then self._notifContainer.Visible = true end
+    if self._telFrame then self._telFrame.Visible = _getSetting("visuals.telemetry", false) end
+    if self._diagFrame then self._diagFrame.Visible = _getSetting("ui.diagnostics", false) end
+
+    if _G.VX.Panel and type(_G.VX.Panel.setHidden) == "function" then
+        _G.VX.Panel:setHidden(false)
     end
 end
 
-function Module:_onSettingChange(evt)
-    if evt.path == "physics.telemetryHud" then
-        if not self.telemetry then self:_createTelemetry() end
-        self.telemetry.Visible = (evt.new == true) and self._running and not self.videoMode
-    elseif evt.path == "videoMode" and evt.new ~= self.videoMode then
-        self.videoMode = evt.new
-        if self.videoMode then self:_enterVideoMode() else self:_exitVideoMode() end
+function Module:_update()
+    if not self._dash then return end
+    local st = self.state:getState()
+    local active = (st ~= "Disabled" and st ~= "Exiting") and (_getSetting("enabled", true) ~= false) and not self._videoMode
+    self._dash.Visible = active
+
+    if self._diagFrame and self._diagFrame.Visible then
+        self:_refreshDiagnostics()
+    end
+    if not active then return end
+
+    local auth = _G.VX.Modules and _G.VX.Modules.Authority
+    local root = auth and auth:getRoot()
+    local rawSpeed = (root and root.PrimaryPart) and root.PrimaryPart.AssemblyLinearVelocity.Magnitude or 0
+    local units = _getSetting("ui.units", "KMH")
+    local speedVal = (units == "MPH") and (rawSpeed * 0.389) or (rawSpeed * 0.626)
+
+    self._speedLbl.Text = tostring(math.floor(speedVal + 0.5))
+    self._unitLbl.Text = (units == "MPH") and "MPH" or "KM/H"
+
+    local gear = self.powertrain.gear or 0
+    self._gearLbl.Text = (gear == -1) and "R" or ((gear == 0) and "N" or tostring(gear))
+
+    local prof = self.profiles:current()
+    local maxRpm = (prof and prof.maxRPM) or 9000
+    local redline = (prof and prof.redline) or 7800
+    local rpm = self.powertrain.rpm or 0
+    local pct = math.clamp(rpm / maxRpm, 0, 1)
+    local redPct = math.clamp(redline / maxRpm, 0.5, 0.98)
+
+    self._rpmLbl.Text = string.format("%d RPM", math.floor(rpm))
+    self._rpmFill.Size = UDim2.new(pct, 0, 1, 0)
+    self._rpmFill.BackgroundColor3 = (rpm >= redline) and C.red or ((rpm >= redline * 0.86) and C.amber or C.green)
+    self._redMark.Position = UDim2.new(redPct, 0, 0, -1)
+
+    local psi = self.drive.boostPSI or 0
+    local stg = _getSetting("turboStage", 1)
+    local stageCfg = self.core and self.core._config and self.core._config.turboStages and self.core._config.turboStages[stg]
+    local maxPsi = (stageCfg and stageCfg.psi) or 21
+    self._boostLbl.Text = string.format("%.1f PSI", psi)
+    self._boostFill.Size = UDim2.new(math.clamp(psi / maxPsi, 0, 1), 0, 1, 0)
+
+    self._thrFill.Size = UDim2.new(math.clamp(self.powertrain.throttle or 0, 0, 1), 0, 1, 0)
+    self._brkFill.Size = UDim2.new(math.clamp(self.powertrain.brake or 0, 0, 1), 0, 1, 0)
+
+    local dt = _getSetting("drivetrain", "RWD")
+    local dm = string.upper(_getSetting("physics.driveMode", "Normal"))
+    self._metaLbl.Text = string.format("%s  |  %s  |  STG %d  |  %s", dt, dm, stg, prof and prof.name or "Default")
+
+    local flags = {}
+    if self.drive.tcsActive then table.insert(flags, "TCS") end
+    if self.drive.absActive then table.insert(flags, "ABS") end
+    if self.powertrain.isRevLimiting then table.insert(flags, "REV") end
+    if self.powertrain.twostepActive then table.insert(flags, "2-STEP") end
+    if self.powertrain.launchState == "Armed" or self.powertrain.launchState == "Ready" then
+        table.insert(flags, "LC:" .. string.upper(self.powertrain.launchState))
+    end
+    if self.chassis.isSpinning then table.insert(flags, "SLIP") end
+    self._flagsLbl.Text = table.concat(flags, " • ")
+    self._flagsLbl.TextColor3 = self.chassis.isSpinning and C.amber or C.green
+
+    local bTemp = self.drive.brakeTemp or 60
+    self._brakeTempLbl.Text = string.format("BRK %.0fC", bTemp)
+    self._brakeTempLbl.TextColor3 = (bTemp >= 550) and C.red or ((bTemp >= 350) and C.amber or C.muted)
+
+    if self._telFrame and self._telFrame.Visible then
+        local tt = self.chassis.tireTemp or {}
+        self._telLabels.State.Text = string.format("State:    %s", st)
+        self._telLabels.Speed.Text = string.format("Speed:    %.1f %s", speedVal, units)
+        self._telLabels.RPM.Text = string.format("RPM:      %d / %d", math.floor(rpm), maxRpm)
+        self._telLabels.Gear.Text = string.format("Gear:     %s", self._gearLbl.Text)
+        self._telLabels.Boost.Text = string.format("Boost:    %.1f / %d PSI", psi, maxPsi)
+        self._telLabels.Inputs.Text = string.format("T/B/S:    %.0f%% / %.0f%% / %.2f", (self.powertrain.throttle or 0) * 100, (self.powertrain.brake or 0) * 100, self.powertrain.steer or 0)
+        self._telLabels.Slip.Text = string.format("Slip:     %.2f (%s)", self.chassis.slipRatio or 0, self.chassis.isSpinning and "SPIN" or "GRIP")
+        self._telLabels.Slope.Text = string.format("Slope:    %.1f deg", self.chassis.slopeAngle or 0)
+        self._telLabels.Friction.Text = string.format("Friction: F:%.2f R:%.2f", self.chassis.frontFriction or 0, self.chassis.rearFriction or 0)
+        self._telLabels.Tires.Text = string.format("Tires:    F:%.0fC R:%.0fC", tt.front or 40, tt.rear or 40)
+        self._telLabels.Brakes.Text = string.format("Brakes:   %.0f C", bTemp)
     end
 end
 
-local function tireColor(temp)
-    if temp < 45 then return THEME.ice
-    elseif temp <= 90 then return THEME.green
-    elseif temp <= 115 then return THEME.amber
-    else return THEME.accent end
+function Module:heartbeat()
+    return self._gui ~= nil and self._gui.Parent ~= nil
 end
 
-local function setPill(ind, active, color)
-    if not ind then return end
-    ind.dot.BackgroundColor3 = active and color or THEME.textMuted
-    ind.lbl.TextColor3 = active and THEME.text or THEME.textMuted
-    ind.pill.BackgroundColor3 = active and Color3.fromRGB(34, 24, 28) or THEME.card
-end
-
-function Module:_update(_dt)
-    if self.videoMode or not self.dashboard then return end
-    local root = _G.VX.Authority and _G.VX.Authority:getRoot()
-    local speed = root and math.floor(Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z).Magnitude * 0.626) or 0
-    local rpm = self.powertrain:getRPM()
-    local redline = math.max(self.powertrain:getEffectiveRedline(), 1000)
-    local gear = self.powertrain:getGear()
-    local prof = self.profiles:getActive()
-    local maxRPM = math.max(prof.maxRPM, redline)
-    local now = os.clock()
-
-    self.speedLabel.Text = tostring(speed)
-    self.rpmLabel.Text = fmtInt(rpm) .. " RPM"
-
-    -- Gear card
-    local gearStr = gear == -1 and "R" or (gear == 0 and "N" or tostring(gear))
-    self.gearLabel.Text = gearStr
-    if gear == -1 then
-        self.gearLabel.TextColor3 = THEME.accent
-        self.gearStroke.Color = THEME.accent
-    elseif now < self._gearFlashUntil then
-        self.gearLabel.TextColor3 = THEME.amber
-        self.gearStroke.Color = THEME.amber
-    else
-        self.gearLabel.TextColor3 = THEME.text
-        self.gearStroke.Color = THEME.border
+function Module:Stop()
+    self:_exitVideoMode()
+    self:_clearConns()
+    if self._gui then
+        self._gui:Destroy()
+        self._gui = nil
     end
-
-    -- 18-LED Shift Light Bar
-    local pct = math.clamp(rpm / maxRPM, 0, 1)
-    local litCount = math.floor(pct * LED_COUNT + 0.5)
-    local flashing = (rpm >= redline * 0.93) and (math.floor(now * 16) % 2 == 0)
-    for i = 1, LED_COUNT do
-        local seg = self._rpmLeds[i]
-        if flashing then
-            seg.BackgroundColor3 = (i % 2 == 0) and THEME.accent or THEME.text
-        elseif i <= litCount then
-            if i >= 16 then
-                seg.BackgroundColor3 = THEME.accent
-            elseif i >= 12 then
-                seg.BackgroundColor3 = THEME.amber
-            else
-                seg.BackgroundColor3 = THEME.text
-            end
-        else
-            seg.BackgroundColor3 = THEME.track
-        end
-    end
-
-    -- Boost bar + PSI
-    local boost = self.powertrain:getBoostPSI()
-    local maxBoost = math.max(prof.maxBoostPSI or 18, 1)
-    local boostRatio = math.clamp(boost / maxBoost, 0, 1)
-    self.boostFill.Size = UDim2.new(boostRatio, 0, 1, 0)
-    if self.powertrain:isBoostActive() or now < self._shiftFlashUntil then
-        self.boostFill.BackgroundColor3 = boostRatio > 0.85 and THEME.accent or THEME.amber
-        self.boostLabel.Text = string.format("%.1f PSI", boost)
-        self.boostLabel.TextColor3 = THEME.text
-    elseif boost > 0.2 then
-        self.boostFill.BackgroundColor3 = THEME.textDim
-        self.boostLabel.Text = string.format("%.1f PSI", boost)
-        self.boostLabel.TextColor3 = THEME.textDim
-    else
-        self.boostFill.BackgroundColor3 = THEME.track
-        self.boostLabel.Text = prof.turboStage > 0 and "0.0 PSI" or "NA"
-        self.boostLabel.TextColor3 = THEME.textMuted
-    end
-
-    -- 4-Corner Tire Temp Dots + Cold Start badge
-    local temps = self.chassis:getTireTemps()
-    local fc = tireColor(temps.front or 55)
-    local rc = tireColor(temps.rear or 55)
-    self.tireFL.BackgroundColor3 = fc
-    self.tireFR.BackgroundColor3 = fc
-    self.tireRL.BackgroundColor3 = rc
-    self.tireRR.BackgroundColor3 = rc
-    self.coldBadge.Visible = self.powertrain:isColdStart()
-
-    -- Status pills
-    setPill(self.indicators.tcs, self.driveSystem:isTCSActive(), THEME.amber)
-    setPill(self.indicators.abs, self.driveSystem:isABSActive(), THEME.amber)
-    local lState = self.powertrain:getLaunchState()
-    if lState == "holding" then
-        local chg = self.powertrain:getLaunchCharge() or 0
-        self.indicators.launch.lbl.Text = chg >= 0.95 and "RDY" or "LC"
-        setPill(self.indicators.launch, true, THEME.amber)
-    elseif lState == "launched" then
-        self.indicators.launch.lbl.Text = "BST"
-        setPill(self.indicators.launch, true, THEME.green)
-    else
-        self.indicators.launch.lbl.Text = "LC"
-        setPill(self.indicators.launch, false, THEME.textMuted)
-    end
-    local clutch = _G.VX.Input and _G.VX.Input:isClutchEngaged() or false
-    setPill(self.indicators.clutch, clutch, THEME.ice)
-
-    -- Visual Telemetry Card (F2)
-    if self.telemetry and self.telemetry.Visible then
-        local rawT = _G.VX.Input and _G.VX.Input:getRawThrottle() or 0
-        local rawS = _G.VX.Input and _G.VX.Input:getRawSteer() or 0
-        self.teleThrottle.Size = UDim2.new(math.clamp(math.max(0, rawT), 0, 1), 0, 1, 0)
-        self.teleBrake.Size    = UDim2.new(math.clamp(math.max(0, -rawT), 0, 1), 0, 1, 0)
-
-        local steerNorm = math.clamp(rawS, -1, 1) * 0.5
-        if steerNorm >= 0 then
-            self.teleSteer.Position = UDim2.new(0.5, 0, 0, 0)
-            self.teleSteer.Size = UDim2.new(steerNorm, 0, 1, 0)
-        else
-            self.teleSteer.Position = UDim2.new(0.5 + steerNorm, 0, 0, 0)
-            self.teleSteer.Size = UDim2.new(-steerNorm, 0, 1, 0)
-        end
-
-        local wt = self.chassis:getWeightTransfer()
-        local fL = (wt.frontMul or 1) * (wt.leftMul or 1)
-        local fR = (wt.frontMul or 1) * (wt.rightMul or 1)
-        local rL = (wt.rearMul or 1) * (wt.leftMul or 1)
-        local rR = (wt.rearMul or 1) * (wt.rightMul or 1)
-        self.teleWT.Text = string.format("LOAD\n%.2f|%.2f\n%.2f|%.2f", fL, fR, rL, rR)
-
-        self.teleText.Text = string.format(
-            "SPD %3d MPH | GEAR %2s | %d RPM\nBST %4.1f PSI | %s\nGRIP F:%.2f R:%.2f\nTEMP F:%.0fC  R:%.0fC\nSTATE %s",
-            speed, gearStr, math.floor(rpm),
-            boost, self.powertrain:isColdStart() and "COLD" or "WARM",
-            self.chassis:getFrontGrip(), self.chassis:getRearGrip(),
-            temps.front or 0, temps.rear or 0,
-            self.vehicleState:getVehicleState()
-        )
-    end
+    _G.VX.UI = nil
 end
 
 return Module
