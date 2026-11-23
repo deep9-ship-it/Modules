@@ -1,0 +1,204 @@
+--[[
+    VX_VehicleState v3.0.1
+    Formal state machine — uses _vehicleState (not _state) so it doesn't
+    collide with the framework's lifecycle state methods.
+
+    Exposes:
+      getVehicleState()   → current state string
+      transition(new)     → change state (validated)
+      isDriving() / isLaunching() / isShifting() / isReady()
+]]
+
+local VX = _G.VX
+if not VX or not VX.Framework then error("VX_VehicleState requires VX_Kernel") end
+
+local Players = game:GetService("Players")
+local Player = Players.LocalPlayer
+
+local Module = VX.Framework.Module.new({
+    Name = "VehicleState",
+    Dependencies = { "Core", "Authority" },
+    Version = "3.0.1",
+})
+
+-- ==================== TRANSITION TABLE ====================
+local TRANSITIONS = {
+    Disabled   = { "Entered" },
+    Entered    = { "TakingOver", "Exiting" },
+    TakingOver = { "Ready", "Exiting", "Disabled" },
+    Ready      = { "Idle", "Exiting" },
+    Idle       = { "Driving", "Launching", "Exiting" },
+    Driving    = { "Idle", "Shifting", "Launching", "Exiting" },
+    Shifting   = { "Driving", "Exiting" },
+    Launching  = { "Driving", "Exiting" },
+    Exiting    = { "Disabled" },
+}
+
+-- ==================== LIFECYCLE ====================
+function Module:Construct()
+    self._vehicleState = "Disabled"
+    self._lastVehicleState = nil
+    self._seatCheckThread = nil
+end
+
+function Module:Init(deps)
+    self.core = deps.Core
+    self.authority = deps.Authority
+end
+
+function Module:Start()
+    _G.VX.VehicleState = self
+
+    _G.VX.bus:on("authority.taken", function(evt)
+        if self._vehicleState == "TakingOver" then
+            self:transition("Ready")
+        end
+    end)
+
+    _G.VX.bus:on("authority.lost", function(evt)
+        if self._vehicleState ~= "Disabled" and self._vehicleState ~= "Exiting" then
+            self:transition("Exiting")
+        end
+    end)
+
+    _G.VX.bus:on("vehicle.shift", function(evt)
+        if self._vehicleState == "Driving" then
+            self:transition("Shifting")
+            task.delay(0.3, function()
+                if self._vehicleState == "Shifting" then
+                    self:transition("Driving")
+                end
+            end)
+        end
+    end)
+
+    _G.VX.bus:on("vehicle.launchStart", function(evt)
+        if self._vehicleState == "Driving" or self._vehicleState == "Idle" then
+            self:transition("Launching")
+        end
+    end)
+
+    _G.VX.bus:on("vehicle.launchRelease", function(evt)
+        if self._vehicleState == "Launching" then
+            self:transition("Driving")
+        end
+    end)
+
+    self:_watchSeat()
+end
+
+function Module:Stop()
+    if self._seatCheckThread then
+        pcall(function() task.cancel(self._seatCheckThread) end)
+        self._seatCheckThread = nil
+    end
+    if _G.VX.VehicleState == self then _G.VX.VehicleState = nil end
+end
+
+function Module:heartbeat()
+    return true
+end
+
+-- ==================== PUBLIC STATE API ====================
+function Module:getVehicleState()
+    return self._vehicleState
+end
+
+function Module:transition(new)
+    if new == self._vehicleState then return false end
+
+    local allowed = TRANSITIONS[self._vehicleState]
+    local ok = false
+    if allowed then
+        for _, a in ipairs(allowed) do
+            if a == new then ok = true; break end
+        end
+    end
+
+    if not ok then
+        warn("[VX] Invalid vehicle transition: " .. self._vehicleState .. " -> " .. new)
+        return false
+    end
+
+    local old = self._vehicleState
+    self._vehicleState = new
+    self._lastVehicleState = old
+
+    _G.VX.bus:emit("vehicle.stateChanged", { from = old, to = new })
+    print("[VX] Vehicle state: " .. old .. " -> " .. new)
+
+    if new == "TakingOver" then
+        task.spawn(function()
+            local success = self.authority:takeControl()
+            if not success then
+                self:transition("Exiting")
+            end
+        end)
+    elseif new == "Ready" then
+        task.delay(0.2, function()
+            if self._vehicleState == "Ready" then
+                self:transition("Idle")
+            end
+        end)
+    elseif new == "Exiting" then
+        task.spawn(function()
+            self.authority:releaseControl()
+            self:transition("Disabled")
+        end)
+    end
+
+    return true
+end
+
+function Module:isDriving()
+    return self._vehicleState == "Driving" or self._vehicleState == "Shifting"
+end
+
+function Module:isLaunching()
+    return self._vehicleState == "Launching"
+end
+
+function Module:isShifting()
+    return self._vehicleState == "Shifting"
+end
+
+function Module:isReady()
+    local s = self._vehicleState
+    return s == "Ready" or s == "Idle" or s == "Driving"
+        or s == "Shifting" or s == "Launching"
+end
+
+-- ==================== SEAT WATCH ====================
+function Module:_watchSeat()
+    if self._seatCheckThread then
+        pcall(function() task.cancel(self._seatCheckThread) end)
+    end
+    self._seatCheckThread = task.spawn(function()
+        while true do
+            task.wait(0.15)
+            local char = Player.Character
+            if not char then
+                if self._vehicleState ~= "Disabled" and self._vehicleState ~= "Exiting" then
+                    self:transition("Exiting")
+                end
+            else
+                local hum = char:FindFirstChildOfClass("Humanoid")
+                local sitting = hum and hum.Sit
+                local seat = hum and hum.SeatPart
+
+                if sitting and seat and seat:IsA("VehicleSeat") then
+                    if self._vehicleState == "Disabled" then
+                        self:transition("Entered")
+                        self:transition("TakingOver")
+                    end
+                else
+                    if self._vehicleState ~= "Disabled" and self._vehicleState ~= "Exiting" then
+                        self:transition("Exiting")
+                    end
+                end
+            end
+        end
+    end)
+end
+
+return Module
