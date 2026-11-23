@@ -1,0 +1,453 @@
+--[[
+    VX_DriveSystem v3.2.0
+- Unit conversion: topSpeed / STUDS_TO_MPH / wheelRadius * throttle
+- Turbo stages 1/2/3 -> seat.Turbo "21"/"42"/"78" (with optional custom multiplier)
+- Fixed reverse motor sign (negative angular velocity for reverse throttle < -0.05)
+- Guarded tractionControlSensitivity and reset _lastThrottleHigh on _start()
+]]
+
+local VX = _G.VX
+if not VX or not VX.Framework then error("VX_DriveSystem requires VX_Kernel") end
+
+local Module = VX.Framework.Module.new({
+    Name = "DriveSystem",
+    Dependencies = { "Core", "Profiles", "Authority", "Powertrain", "VehicleState" },
+    Version = "3.2.0",
+})
+
+local TICK_NORMAL = 60
+local TICK_LOW    = 30
+local STUDS_TO_MPH = 0.626
+local DEFAULT_TURN_SPEED = 8
+local DEFAULT_MAX_STEER  = 35
+local DEFAULT_TC_SENSITIVITY = 0.25
+
+function Module:Construct()
+    self.stage = 1
+    self.boostPressure = 0.0
+    self.targetBoost = 0.0
+    self.lastBlowoffTime = 0
+    self._smoothedSteer = 0
+    self.lastLaunchQuality = "miss"
+    self.brakeTemp = 0.0
+    self._loopThread = nil
+    self._running = false
+    self._totalTorque = 0
+    self._totalBrake = 0
+    self._blowoffCount = 0
+    self._absActivations = 0
+    self._burstsFired = 0
+    self._lastThrottleHigh = false
+end
+
+function Module:Init(deps)
+    self.core = deps.Core
+    self.profiles = deps.Profiles
+    self.authority = deps.Authority
+    self.powertrain = deps.Powertrain
+    self.state = deps.VehicleState
+end
+
+function Module:Start()
+    _G.VX.DriveSystem = self
+    self.stage = math.clamp(self.core.settings.turboStage or 1, 1, 3)
+    self:_registerSettings()
+
+    _G.VX.bus:on("settings.changed", function(evt)
+        if evt.path == "turboStage" then
+            self.stage = math.clamp(evt.new or 1, 1, 3)
+            self:_syncSeatTurbo()
+        elseif evt.path == "turboCustomMultiplier" then
+            self:_syncSeatTurbo()
+        end
+    end)
+
+    _G.VX.bus:on("vehicle.launchRelease", function(evt) self:_handleLaunchRelease(evt) end)
+
+    _G.VX.bus:on("vehicle.stateChanged", function(evt)
+        if evt.to == "Ready" or evt.to == "Idle" then
+            self:_syncSeatTurbo()
+            self:_start()
+        elseif evt.to == "Exiting" or evt.to == "Disabled" then
+            self:_stop()
+        end
+    end)
+
+    self:_registerDiagnostics()
+end
+
+function Module:Stop()
+    self:_stop()
+    if _G.VX.DriveSystem == self then _G.VX.DriveSystem = nil end
+end
+
+function Module:heartbeat()
+    if not self._running then return true end
+    return self.authority:getHandle() ~= nil
+end
+
+function Module:_registerSettings()
+    local R = _G.VX.registry
+    local S = _G.VX.settings
+    if S.drivetrain == nil then S.drivetrain = "AWD" end
+    pcall(function()
+        R:set("settings", "drivetrain", {
+            type = "enum", default = "AWD",
+            options = { "FWD", "RWD", "AWD" },
+            category = "Dynamics", label = "Drivetrain",
+        }, "DriveSystem")
+    end)
+end
+
+function Module:_registerDiagnostics()
+    local D = _G.VX.diagnostics
+    pcall(function()
+        D.register("drive.boost", {
+            fn = function() return { value = string.format("%.1f", self.boostPressure), unit = "psi", status = "normal" } end,
+            category = "DriveSystem",
+        }, "DriveSystem")
+        D.register("drive.steer", {
+            fn = function() return { value = string.format("%.1f", self._smoothedSteer * 100), unit = "%", status = "normal" } end,
+            category = "DriveSystem",
+        }, "DriveSystem")
+    end)
+end
+
+function Module:_syncSeatTurbo()
+    local handle = self.authority:getHandle()
+    if not handle or not handle.seat then return end
+    local cfg = self.core.config.turboStages and self.core.config.turboStages[self.stage]
+    if not cfg then return end
+    local mult = self.core.settings.turboCustomMultiplier or 1.0
+    local effective = tonumber(cfg.seatValue) * mult
+    pcall(function()
+        local tv = handle.seat:FindFirstChild("Turbo")
+        if not tv then
+            tv = Instance.new("StringValue")
+            tv.Name = "Turbo"
+            tv.Parent = handle.seat
+        end
+        tv.Value = tostring(effective)
+    end)
+end
+
+function Module:_start()
+    if self._running then return end
+    self._running = true
+    self.boostPressure = 0
+    self.targetBoost = 0
+    self.brakeTemp = 0
+    self._smoothedSteer = 0
+    self._lastThrottleHigh = false
+
+    self._loopThread = task.spawn(function()
+        local perf = self.core.settings._effectivePerformance
+        local tickRate = (perf == "low") and TICK_LOW or TICK_NORMAL
+        local interval = 1 / tickRate
+        local last = os.clock()
+        while self._running do
+            local now = os.clock()
+            local dt = now - last
+            last = now
+            if dt <= 0 or dt > 0.1 then dt = interval end
+            pcall(function() self:_update(dt) end)
+            local sleep = interval - (os.clock() - now)
+            if sleep > 0 then task.wait(sleep) end
+        end
+    end)
+    print("[VX] DriveSystem started — drivetrain: " .. tostring(self.core.settings.drivetrain))
+end
+
+function Module:_stop()
+    if not self._running then return end
+    self._running = false
+    if self._loopThread then pcall(function() task.cancel(self._loopThread) end); self._loopThread = nil end
+    local handle = self.authority:getHandle()
+    if handle then
+        for _, w in ipairs(handle.wheels or {}) do
+            pcall(function()
+                if w.cylinder then
+                    w.cylinder.AngularActuatorType = Enum.ActuatorType.None
+                    w.cylinder.AngularVelocity = 0
+                    w.cylinder.MotorMaxTorque = 0
+                end
+                if w.isFront and w.attach then
+                    w.attach.Orientation = Vector3.new(0, 0, -90)
+                end
+            end)
+        end
+    end
+    print("[VX] DriveSystem stopped")
+end
+
+function Module:_update(dt)
+    local handle = self.authority:getHandle()
+    if not handle then return end
+    local stateName = self.state:getVehicleState()
+    local isActive = stateName == "Idle" or stateName == "Driving"
+                   or stateName == "Shifting" or stateName == "Launching"
+    if not isActive then
+        for _, w in ipairs(handle.wheels or {}) do
+            pcall(function() if w.cylinder then w.cylinder.AngularActuatorType = Enum.ActuatorType.None end end)
+        end
+        return
+    end
+    self:_updateTurbo(dt)
+    self:_updateBrakeTemp(dt)
+    self:_updateSteering(dt)
+    self:_applyMotors(dt)
+end
+
+function Module:_updateSteering(dt)
+    local handle = self.authority:getHandle()
+    if not handle then return end
+    local steerInput = 0
+    if _G.VX.Input then steerInput = _G.VX.Input:getRawSteer() end
+    local turnSpeed = (self.core.settings.physics and self.core.settings.physics.turnSpeed) or DEFAULT_TURN_SPEED
+    local maxAngle  = (self.core.settings.physics and self.core.settings.physics.maxSteerAngle) or DEFAULT_MAX_STEER
+    local rate = dt * turnSpeed
+    self._smoothedSteer = self._smoothedSteer + (steerInput - self._smoothedSteer) * math.min(rate, 1)
+    local targetAngle = -self._smoothedSteer * maxAngle
+    if self.core.settings.physics and self.core.settings.physics.steeringDecay then
+        local speed = self:_getSpeed()
+        local decayFactor = 1 - math.min(speed / 200, 1) * 0.5
+        targetAngle = targetAngle * decayFactor
+    end
+    for _, w in ipairs(handle.wheels or {}) do
+        if w.isFront and w.attach then
+            local invert = false
+            pcall(function() invert = w.model and w.model:GetAttribute("Invert") == true end)
+            local angle = invert and -targetAngle or targetAngle
+            pcall(function() w.attach.Orientation = Vector3.new(0, angle, -90) end)
+        end
+    end
+end
+
+function Module:_updateTurbo(dt)
+    local settings = self.core.settings
+    local prof = self.profiles:current()
+    local stages = self.core.config.turboStages or {}
+    local cfg = stages[self.stage] or stages[1]
+    if not cfg then return end
+
+    local customMult = settings.turboCustomMultiplier or 1.0
+    local maxBoostPSI = (cfg.targetBoostPSI or 0) * customMult
+
+    local rpm = self.powertrain:getRPM()
+    local throttle = self.powertrain:getSmoothedThrottle()
+    local launchState = self.powertrain:getLaunchState()
+
+    local spoolRPM = prof.turboSpoolRPM or 3500
+    local rpmFactor = math.clamp((rpm - spoolRPM) / math.max(prof.redlineRPM - spoolRPM, 1), 0, 1)
+
+    self.targetBoost = rpmFactor * math.max(0, throttle) * maxBoostPSI
+    if launchState == "holding" then
+        self.targetBoost = math.max(self.targetBoost, maxBoostPSI * 0.9)
+    end
+
+    local spoolRate = cfg.spoolRate or 0.3
+    local rate = (self.targetBoost > self.boostPressure)
+        and (1.0 / math.max(spoolRate, 0.1))
+        or (1.0 / 0.4)
+    self.boostPressure = self.boostPressure + (self.targetBoost - self.boostPressure) * math.min(rate * dt * 4, 1)
+    self.boostPressure = math.clamp(self.boostPressure, 0, maxBoostPSI)
+
+    local blowoffThreshold = cfg.blowoffThreshold or 5
+    local nowHigh = throttle > 0.6
+    local nowLifted = throttle < 0.3
+    if self._lastThrottleHigh and nowLifted and self.boostPressure > blowoffThreshold then
+        local now = os.clock()
+        if now - self.lastBlowoffTime > 0.25 then
+            self.lastBlowoffTime = now
+            self._blowoffCount = self._blowoffCount + 1
+            _G.VX.bus:emit("turbo.blowoff", {
+                boost = self.boostPressure,
+                intensity = self.boostPressure / math.max(maxBoostPSI, 0.01),
+            })
+        end
+    end
+    self._lastThrottleHigh = nowHigh
+end
+
+function Module:_updateBrakeTemp(dt)
+    local throttle = self.powertrain:getSmoothedThrottle()
+    local braking = math.max(0, -throttle)
+    local heatIn = braking * 0.15 * dt
+    local coolRate = 0.08 * dt
+    local speed = self:_getSpeed()
+    local airflowCool = 1 + (speed / 100) * 0.2
+    self.brakeTemp = self.brakeTemp + heatIn - coolRate * airflowCool
+    self.brakeTemp = math.clamp(self.brakeTemp, 0, 1)
+    if not (self.core.settings.physics and self.core.settings.physics.brakeFadeEnabled) then
+        self.brakeTemp = math.max(0, self.brakeTemp - 0.15 * dt)
+    end
+end
+
+function Module:_applyMotors(dt)
+    local handle = self.authority:getHandle()
+    if not handle then return end
+
+    local settings = self.core.settings
+    local physics = settings.physics or {}
+    local prof = self.profiles:current()
+    local gear = self.powertrain:getGear()
+    local throttle = self.powertrain:getSmoothedThrottle()
+    local rpm = self.powertrain:getRPM()
+    local shiftState = self.powertrain:getShiftState()
+    local launchState = self.powertrain:getLaunchState()
+
+    local twostepActive = false
+    if self.powertrain and self.powertrain.isTwostepActive then
+        twostepActive = self.powertrain:isTwostepActive()
+    end
+
+    self._totalTorque = 0
+    self._totalBrake = 0
+
+    if (shiftState == "open" and settings.realisticShifting) or launchState == "holding" or twostepActive then
+        for _, w in ipairs(handle.wheels or {}) do
+            pcall(function()
+                if w.cylinder then
+                    w.cylinder.AngularActuatorType = Enum.ActuatorType.None
+                    w.cylinder.AngularVelocity = 0
+                    w.cylinder.MotorMaxTorque = 0
+                end
+            end)
+        end
+        return
+    end
+
+    local wheelRadius = 1.55
+    if handle.wheels and handle.wheels[1] and handle.wheels[1].physical then
+        wheelRadius = math.max(handle.wheels[1].physical.Size.Y / 2, 0.1)
+    end
+
+    -- Target wheel angular velocity in rad/s: topSpeed (MPH) -> studs/s -> rad/s * throttle
+    local topSpeed = settings.topSpeed or 175
+    local targetWheelRad = (topSpeed / STUDS_TO_MPH / wheelRadius) * throttle
+
+    local torqueCurve = 1.0
+    if physics.torqueCurve and self.profiles.getTorqueAtRPM then
+        torqueCurve = self.profiles:getTorqueAtRPM(prof, rpm)
+    end
+    local loadFactor = self.powertrain:getSlopeLoadFactor()
+    local boostMult = 1 + (self.boostPressure / 100)
+    local baseTorque = 19140
+    local gearTorqueMult = (prof.gearRatios and prof.gearRatios[gear]) or 1
+    local finalBaseTorque = baseTorque * gearTorqueMult * torqueCurve * loadFactor * boostMult
+
+    local brakePower = settings.brakingPower or 1
+    local fadeMult = 1
+    if physics.brakeFadeEnabled then fadeMult = 1 - self.brakeTemp * 0.3 end
+
+    local drivetrain = settings.drivetrain or "AWD"
+    local speedMPH = self:_getSpeed()
+
+    for _, w in ipairs(handle.wheels or {}) do
+        local isFront = w.isFront
+        local isDriven = false
+        if drivetrain == "AWD" then isDriven = true
+        elseif drivetrain == "FWD" then isDriven = isFront
+        elseif drivetrain == "RWD" then isDriven = not isFront end
+
+        local mode = "coast"
+        local angular = 0
+        local torque = 0
+
+        if gear == -1 then
+            if throttle < -0.05 and isDriven then
+                mode = "reverse"
+                angular = targetWheelRad * 0.3
+                torque = finalBaseTorque * 0.6
+            end
+        else
+            if throttle > 0.05 and isDriven then
+                mode = "drive"
+                angular = targetWheelRad
+                torque = finalBaseTorque
+                if physics.tractionControl then
+                    local slip = self:_estimateWheelSlip(w, speedMPH)
+                    local thr = physics.tractionControlSensitivity or DEFAULT_TC_SENSITIVITY
+                    if slip > thr then
+                        local f = 1 - math.clamp(slip - thr, 0, 0.6)
+                        torque = torque * f
+                        angular = angular * (0.5 + 0.5 * f)
+                    end
+                end
+            elseif throttle < -0.05 then
+                mode = "brake"
+                angular = 0
+                torque = baseTorque * 1.5 * brakePower * math.abs(throttle) * fadeMult
+                if physics.absEnabled then
+                    local slip = self:_estimateWheelSlip(w, speedMPH)
+                    if slip > 0.3 then
+                        local pulse = 0.4 + math.sin(os.clock() * 20) * 0.3
+                        torque = torque * pulse
+                        self._absActivations = self._absActivations + 1
+                    end
+                end
+            end
+        end
+
+        if w.cylinder then
+            pcall(function()
+                if mode == "coast" then
+                    w.cylinder.AngularActuatorType = Enum.ActuatorType.None
+                else
+                    w.cylinder.AngularActuatorType = Enum.ActuatorType.Motor
+                    w.cylinder.AngularVelocity = angular
+                    w.cylinder.MotorMaxTorque = torque
+                end
+            end)
+        end
+
+        if mode == "drive" then self._totalTorque = self._totalTorque + torque
+        elseif mode == "brake" then self._totalBrake = self._totalBrake + torque end
+    end
+end
+
+function Module:_estimateWheelSlip(wheel, speedMPH)
+    if not wheel.cylinder then return 0 end
+    local angular = math.abs(wheel.cylinder.AngularVelocity or 0)
+    local radius = wheel.physical and math.max(wheel.physical.Size.Y / 2, 0.1) or 1.55
+    local wheelSurface = angular * radius
+    local v = speedMPH / STUDS_TO_MPH
+    return math.clamp(math.abs(wheelSurface - v) / math.max(v, 1), 0, 3)
+end
+
+function Module:_getSpeed()
+    local handle = self.authority:getHandle()
+    if not handle or not handle.root or not handle.root.PrimaryPart then return 0 end
+    local v = handle.root.PrimaryPart.AssemblyLinearVelocity
+    return Vector3.new(v.X, 0, v.Z).Magnitude * STUDS_TO_MPH
+end
+
+function Module:_handleLaunchRelease(evt)
+    self.lastLaunchQuality = evt.quality or "miss"
+    _G.VX.bus:emit("vehicle.launchQuality", { quality = self.lastLaunchQuality })
+    if evt.quality == "perfect" or evt.quality == "good" then
+        local countMin = (evt.quality == "perfect") and 20 or 12
+        local countMax = (evt.quality == "perfect") and 30 or 18
+        local count = math.random(countMin, countMax)
+        task.spawn(function()
+            for i = 1, count do
+                _G.VX.bus:emit("vehicle.backfire", { source = "launch", count = 1 })
+                if _G.VX.Remote then pcall(function() _G.VX.Remote:fireBoostPulse(0.05) end) end
+                task.wait(math.random(15, 35) / 1000)
+            end
+        end)
+        self._burstsFired = self._burstsFired + 1
+    end
+end
+
+function Module:getBoost() return self.boostPressure end
+function Module:getTurboStage() return self.stage end
+function Module:getLaunchQuality() return self.lastLaunchQuality end
+function Module:getSteerAngle() return self._smoothedSteer * ((self.core.settings.physics and self.core.settings.physics.maxSteerAngle) or DEFAULT_MAX_STEER) end
+function Module:setTurboStage(n)
+    n = math.clamp(n or 1, 1, 3)
+    self.stage = n
+    _G.VX.setSetting("turboStage", n)
+end
+
+return Module
