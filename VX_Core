@@ -1,0 +1,425 @@
+--[[
+    VX_Core v3.1.0
+    Settings removed: brakeBias*, driftStrength
+    Settings added: frontGrip, rearGrip, brakeSpeed, shiftingJolt,
+                    realisticShifting, shiftDelay, vehicleShaking,
+                    launchControlEnabled, turboCustomMultiplier
+    Turbo: 3 stages (1/2/3) → seat.Turbo = "21"/"42"/"78"
+]]
+
+local VX = _G.VX
+if not VX or not VX.Framework then error("VX_Core requires VX_Kernel") end
+
+local Module = VX.Framework.Module.new({
+    Name = "Core",
+    Dependencies = {},
+    Version = "3.1.0",
+})
+
+function Module:Construct()
+    self._moduleVersion = "20.1.0"
+    self.settings = self:_defaultSettings()
+    self.config   = self:_defaultConfig()
+    self:_migrateLegacy()
+end
+
+function Module:_defaultSettings()
+    return {
+        _version = "20.1.0",
+        _schemaVersion = 4,
+
+        masterVolume = 1.0,
+        topSpeed = 100,
+        brakingPower = 0.75,
+        brakeSpeed = 5.0,
+
+        frontGrip = 1.0,
+        rearGrip = 0.9,
+        drivetrain = "AWD",
+
+        steeringSensitivity = 1.0,
+        highSpeedSteerReduction = false,
+        reductionFactor = 0.5,
+
+        engineProfile = 1,
+        turboStage = 1,
+        turboCustomMultiplier = 1.0,
+        pitchOffset = 0,
+        engineBoost = 1.0,
+        realisticTurboEnabled = false,
+
+        turboSpoolEnabled = true,
+        turboFlutterEnabled = true,
+        turboBlowoffEnabled = true,
+        backfireEnabled = true,
+
+        fovDynamicsEnabled = true,
+        physicsTiltLevel = "Off",
+
+        throttleUltra = false,
+        videoMode = false,
+
+        launchControlEnabled = false,
+        realisticShifting = false,
+        shiftDelay = false,
+        shiftingJolt = false,
+        vehicleShaking = false,
+
+        weightTransferMode = "Normal",
+        weightTransferIntensity = 0.30,
+
+        lightPattern = "Off",
+        lightSpeed = 1,
+        hazardEnabled = true,
+        headlightsEnabled = true,
+
+        ghostModeEnabled = false,
+
+        performanceMode = "auto",
+        _effectivePerformance = "normal",
+
+        physics = {
+            torqueCurve = true,
+            engineBraking = true,
+            engineBrakingStrength = 0.10,
+            engineLoad = true,
+            engineLoadSensitivity = 0.20,
+            aeroDrag = true,
+            aeroDownforce = true,
+            downforceCoefficient = 0.30,
+            weightTransfer = true,
+            clutchSimulation = false,
+            clutchDuration = 0.25,
+            coldStart = false,
+            coldStartDuration = 30,
+            idleHunting = false,
+            engineBog = false,
+            fuelCutLimiter = true,
+            tractionControl = false,
+            tractionControlSensitivity = 0.25,
+            launchWindow = false,
+            telemetryHud = false,
+            virtualClutch = false,
+            antiLagEnabled = false,
+            absEnabled = false,
+            brakeFadeEnabled = false,
+            tireTempEnabled = false,
+            turnSpeed = 8,
+            maxSteerAngle = 35,
+            steeringDecay = false,
+        },
+    }
+end
+
+function Module:_defaultConfig()
+    return {
+        rpmRiseRates = {0.15, 0.12, 0.09, 0.06, 0.04, 0.025, 0.015},
+        rpmFallRate = 0.08,
+        upshiftRpmDrop = 0.25,
+        downshiftSlip = 0.08,
+        shiftCooldown = 0.10,
+        lowRpmDownshift = 2800,
+        stallThreshold = 1050,
+        overRevBuffer = 400,
+        shiftFlickerCooldown = 1.0,
+
+        torqueCurvePeak = 1.30,
+        torqueCurveFloor = 0.70,
+        engineBrakeMinRpm = 1500,
+        engineBrakeMaxCoef = 0.30,
+
+        wtFrontLoss = 0.50,
+        wtRearGain = 0.40,
+        wtLateralCoef = 0.30,
+        wtVerticalCoef = 0.15,
+
+        downforceRefSpeed = 200,
+        downforceRearFactor = 0.80,
+        downforceClampMin = 0.7,
+        downforceClampMax = 2.0,
+
+        attrWriteThreshold = 0.01,
+        physicsWriteInterval = 0.10,
+
+        soundFastRate = 40,
+        soundSlowRate = 15,
+        downshiftPitchBoost = 15,
+        downshiftBoostDuration = 0.30,
+
+        fuelCutOnTime = 0.08,
+        fuelCutOffTime = 0.08,
+
+        coldStartIdleBonus = 500,
+        coldStartRedlineDrop = 2000,
+
+        idleHuntAmplitude = 20,
+        idleHuntFrequency = 3,
+
+        bogMagnitude = 200,
+        bogDuration = 0.12,
+        bogRpmThreshold = 2500,
+
+        slipRecovery = 0.6,
+        dragSoftCeiling = 0.85,
+
+        launch = {
+            rpmTarget = 6500,
+            rpmBuildRate = 8.0,
+            minSpeed = 5,
+            maxTime = 3.0,
+            releaseDuration = 0.4,
+            joltMagnitude = 0.12,
+            joltDecay = 10.0,
+            burstMin = 15,
+            burstMax = 25,
+            burstDuration = 0.4,
+            windowPerfectMin = 0.90,
+            windowPerfectMax = 1.05,
+            windowGoodMin = 0.70,
+            windowGoodMax = 1.15,
+            perfectBonusMult = 1.20,
+            goodBonusMult = 1.10,
+            perfectBonusDuration = 0.5,
+            goodBonusDuration = 0.3,
+        },
+
+        twostep = {
+            bounceFreqHz = 30,
+            bounceAmplitude = 1500,
+            backfireInterval = 0.08,
+            minSpeed = 5,
+        },
+
+        turboStages = {
+            [1] = { seatValue = "21", targetBoostPSI = 21, spoolRate = 1.2, blowoffThreshold = 6.3 },
+            [2] = { seatValue = "42", targetBoostPSI = 42, spoolRate = 1.5, blowoffThreshold = 12.6 },
+            [3] = { seatValue = "78", targetBoostPSI = 78, spoolRate = 2.0, blowoffThreshold = 23.4 },
+        },
+
+        tiltLevels = {
+            Off = { cogRise = 0.00, maxZ = 0.00, maxX = 0.00 },
+            Low = { cogRise = 0.10, maxZ = 0.15, maxX = 0.10 },
+            Medium = { cogRise = 0.25, maxZ = 0.30, maxX = 0.20 },
+            High = { cogRise = 0.40, maxZ = 0.45, maxX = 0.30 },
+            Extreme = { cogRise = 0.60, maxZ = 0.60, maxX = 0.40 },
+        },
+
+        cameraFx = {
+            fovIdle = 70,
+            fovMax = 95,
+            fovSpeedThreshold = 150,
+            fovSmoothness = 8,
+            vibRpmMin = 1000,
+            vibRpmMax = 8500,
+            vibMaxOffset = 0.06,
+            vibFreqMultiplier = 0.15,
+            shiftUp = { pitch = -0.04, yaw = 0.00, roll = 0.010, mag = 0.06, dur = 0.12, decay = 8.0 },
+            shiftDown = { pitch = 0.05, yaw = 0.00, roll = -0.015, mag = 0.09, dur = 0.18, decay = 6.0 },
+            shiftEmergency = { pitch = 0.08, yaw = 0.02, roll = -0.025, mag = 0.12, dur = 0.25, decay = 4.0 },
+        },
+    }
+end
+
+function Module:_migrateLegacy()
+    local existing = _G.VX and _G.VX.settings
+    if type(existing) == "table" then
+        self:_deepMerge(self.settings, existing)
+        -- Drop deprecated keys
+        self.settings.brakeBiasEnabled = nil
+        self.settings.brakeBias = nil
+        self.settings.brakeBiasIntensity = nil
+        self.settings.driftStrength = nil
+        print("[VX] Preserved existing settings, dropped deprecated keys")
+        return
+    end
+    local old = _G.DeepSec90 and _G.DeepSec90.userSettings
+    if not old then return end
+    for k, v in pairs(old) do
+        if k ~= "brakeBiasEnabled" and k ~= "brakeBias"
+           and k ~= "brakeBiasIntensity" and k ~= "driftStrength"
+           and self.settings[k] ~= nil then
+            self.settings[k] = v
+        end
+    end
+    if type(old.physics) == "table" then
+        for k, v in pairs(old.physics) do
+            if self.settings.physics[k] ~= nil then
+                self.settings.physics[k] = v
+            end
+        end
+    end
+    print("[VX] Migrated legacy DeepSec90 settings")
+end
+
+function Module:_deepMerge(target, source)
+    for k, v in pairs(source) do
+        if type(v) == "table" and type(target[k]) == "table" then
+            self:_deepMerge(target[k], v)
+        elseif target[k] ~= nil then
+            target[k] = v
+        end
+    end
+end
+
+function Module:Init(deps)
+    _G.VX.settings = self.settings
+    _G.VX.config   = self.config
+
+    _G.VX.getSetting = function(path)
+        local parts = {}
+        for p in path:gmatch("[^%.]+") do table.insert(parts, p) end
+        local cur = self.settings
+        for _, p in ipairs(parts) do
+            if type(cur) ~= "table" then return nil end
+            cur = cur[p]
+        end
+        return cur
+    end
+
+    _G.VX.setSetting = function(path, value)
+        local parts = {}
+        for p in path:gmatch("[^%.]+") do table.insert(parts, p) end
+        if #parts == 0 then return end
+        local cur = self.settings
+        for i = 1, #parts - 1 do
+            if type(cur[parts[i]]) ~= "table" then return end
+            cur = cur[parts[i]]
+        end
+        local old = cur[parts[#parts]]
+        cur[parts[#parts]] = value
+        _G.VX.bus:emit("settings.changed", { path = path, old = old, new = value })
+    end
+
+    _G.VX.resetSetting = function(path)
+        local defaults = self:_defaultSettings()
+        local parts = {}
+        for p in path:gmatch("[^%.]+") do table.insert(parts, p) end
+        local cur = defaults
+        for _, p in ipairs(parts) do cur = cur[p] end
+        _G.VX.setSetting(path, cur)
+    end
+
+    self:_registerCoreSchema()
+end
+
+function Module:_registerCoreSchema()
+    local R = _G.VX.registry
+    local function reg(key, schema)
+        schema.owner = "Core"
+        pcall(function() R:set("settings", key, schema, "Core") end)
+    end
+
+    reg("masterVolume",             { type="number_range",   default=1.0, min=0, max=1, step=0.05, category="Audio",     label="Master Volume" })
+    reg("topSpeed",                 { type="number_stepped", default=100, min=10, max=500, step=10,   category="Controls",  label="Top Speed" })
+    reg("brakingPower",             { type="number_range",   default=0.75, min=0.2, max=1.5, step=0.05, category="Dynamics", label="Braking Power" })
+    reg("brakeSpeed",               { type="number_range",   default=5.0, min=0.5, max=10.0, step=0.5, category="Dynamics", label="Brake Speed" })
+    reg("frontGrip",                { type="number_range",   default=1.0, min=0.1, max=2.5, step=0.05, category="Dynamics", label="Front Grip" })
+    reg("rearGrip",                 { type="number_range",   default=0.9, min=0.1, max=2.5, step=0.05, category="Dynamics", label="Rear Grip" })
+    reg("steeringSensitivity",      { type="number_range",   default=1.0, min=0.5, max=2.0, step=0.1, category="Controls",  label="Steering Sensitivity" })
+    reg("highSpeedSteerReduction",  { type="boolean",        default=false, category="Controls",    label="High-Speed Steering Reduction" })
+    reg("reductionFactor",          { type="number_range",   default=0.5, min=0.1, max=1.0, step=0.1, category="Controls",  label="Reduction Factor", requires={"highSpeedSteerReduction"} })
+    reg("engineProfile",            { type="number_stepped", default=1, min=1, max=10, step=1,        category="Engine",    label="Engine Profile" })
+    reg("turboStage",               { type="number_stepped", default=1, min=1, max=3, step=1,         category="Dynamics",  label="Turbo Stage" })
+    reg("turboCustomMultiplier",    { type="number_range",   default=1.0, min=0.5, max=2.0, step=0.1, category="Dynamics", label="Turbo Multiplier" })
+    reg("pitchOffset",              { type="number_range",   default=0, min=-0.3, max=0.3, step=0.05, category="Audio",     label="Pitch Offset" })
+    reg("engineBoost",              { type="number_range",   default=1.0, min=0.5, max=2.0, step=0.1, category="Audio",     label="Engine Boost" })
+    reg("realisticTurboEnabled",    { type="boolean",        default=false, category="Controls",    label="Realistic Turbo" })
+    reg("turboSpoolEnabled",        { type="boolean",        default=true,  category="Engine",      label="Turbo Spool Sound" })
+    reg("turboFlutterEnabled",      { type="boolean",        default=true,  category="Engine",      label="Turbo Flutter Sound" })
+    reg("turboBlowoffEnabled",      { type="boolean",        default=true,  category="Engine",      label="Turbo Blow-Off Sound" })
+    reg("backfireEnabled",          { type="boolean",        default=true,  category="Engine",      label="Backfire Enabled" })
+    reg("fovDynamicsEnabled",       { type="boolean",        default=true,  category="Controls",    label="FOV Dynamics" })
+    reg("physicsTiltLevel",         { type="enum",           default="Off", options={"Off","Low","Medium","High","Extreme"}, category="Physics", label="Body Tilt Level" })
+    reg("throttleUltra",            { type="boolean",        default=false, category="Dynamics",    label="Throttle Ultra" })
+    reg("videoMode",                { type="boolean",        default=false, category="Controls",    label="Video Mode" })
+    reg("launchControlEnabled",     { type="boolean",        default=false, category="Controls",    label="Launch Control" })
+    reg("realisticShifting",        { type="boolean",        default=false, category="Controls",    label="Realistic Shifting" })
+    reg("shiftDelay",               { type="boolean",        default=false, category="Controls",    label="Shift Delay" })
+    reg("shiftingJolt",             { type="boolean",        default=false, category="Controls",    label="Shifting Jolt" })
+    reg("vehicleShaking",           { type="boolean",        default=false, category="Controls",    label="Vehicle Shaking" })
+    reg("weightTransferMode",       { type="enum",           default="Normal", options={"Off","Normal","Drift"}, category="Dynamics", label="Weight Transfer Mode" })
+    reg("weightTransferIntensity",  { type="number_range",   default=0.30, min=0.05, max=0.6, step=0.05, category="Dynamics", label="WT Intensity" })
+    reg("lightPattern",             { type="enum",           default="Off", options={"Off","Strobe","Double Strobe","Triple Strobe","Pulse","Slow Pulse","Heartbeat","Police","Fast Police","Random"}, category="Lights", label="Light Pattern" })
+    reg("lightSpeed",               { type="number_stepped", default=1, min=1, max=10, step=1,        category="Lights",    label="Light Speed" })
+    reg("hazardEnabled",            { type="boolean",        default=true,  category="Lights",      label="Hazards in Light Show" })
+    reg("headlightsEnabled",        { type="boolean",        default=true,  category="Lights",      label="Headlights in Light Show" })
+    reg("ghostModeEnabled",         { type="boolean",        default=false, category="Controls",    label="Ghost Mode" })
+    reg("performanceMode",          { type="enum",           default="auto", options={"auto","low","normal","high"}, category="Controls", label="Performance Mode" })
+
+    local physicsBool = {
+        "torqueCurve","engineBraking","engineLoad","aeroDrag","aeroDownforce",
+        "weightTransfer","clutchSimulation","coldStart","idleHunting","engineBog",
+        "fuelCutLimiter","tractionControl","launchWindow","telemetryHud","virtualClutch",
+        "antiLagEnabled","absEnabled","brakeFadeEnabled","tireTempEnabled","steeringDecay",
+    }
+    for _, k in ipairs(physicsBool) do
+        reg("physics." .. k, { type="boolean", default=self.settings.physics[k], category="Physics", label=k })
+    end
+
+    local physicsNum = {
+        {"engineBrakingStrength",       0.05, 0.30, 0.01},
+        {"engineLoadSensitivity",       0.00, 1.00, 0.05},
+        {"downforceCoefficient",        0.05, 1.00, 0.05},
+        {"clutchDuration",              0.10, 0.50, 0.05},
+        {"coldStartDuration",           0.00, 120,  5},
+        {"tractionControlSensitivity",  0.10, 0.60, 0.05},
+        {"turnSpeed",                   4,    20,   1},
+        {"maxSteerAngle",               20,   50,   5},
+    }
+    for _, cfg in ipairs(physicsNum) do
+        reg("physics." .. cfg[1], {
+            type="number_range",
+            default=self.settings.physics[cfg[1]],
+            min=cfg[2], max=cfg[3], step=cfg[4],
+            category="Physics", label=cfg[1],
+        })
+    end
+end
+
+function Module:Start()
+    _G.VX.clamp      = function(v, mn, mx) return math.max(mn, math.min(mx, v)) end
+    _G.VX.lerp       = function(a, b, t) return a + (b - a) * t end
+    _G.VX.smoothstep = function(t) return t * t * (3 - 2 * t) end
+
+    _G.VX.logBuffer = {}
+    _G.VX.log = function(msg, level)
+        level = level or "info"
+        if level == "error" or level == "warn" then warn("[VX] " .. msg)
+        else print("[VX] " .. msg) end
+        table.insert(_G.VX.logBuffer, { msg = msg, level = level, t = tick() })
+        while #_G.VX.logBuffer > 200 do table.remove(_G.VX.logBuffer, 1) end
+    end
+
+    local uis = game:GetService("UserInputService")
+    if self.settings.performanceMode == "auto" then
+        self.settings._effectivePerformance = (uis.TouchEnabled and not uis.KeyboardEnabled) and "low" or "normal"
+    else
+        self.settings._effectivePerformance = self.settings.performanceMode
+    end
+    print("[VX] Performance: " .. self.settings._effectivePerformance)
+
+    local events = {
+        "vehicle.entered","vehicle.exited","vehicle.stateChanged",
+        "vehicle.shift","vehicle.backfire","vehicle.launchStart","vehicle.launchRelease",
+        "vehicle.twostepStart","vehicle.twostepEnd",
+        "engine.revLimit","engine.coldStartEnd",
+        "input.throttle","input.brake","input.steer","input.clutch",
+        "settings.changed",
+        "authority.lost","authority.verified",
+        "turbo.blowoff","turbo.spool",
+    }
+    for _, name in ipairs(events) do _G.VX.bus:on(name, function() end) end
+    print("[VX] " .. #events .. " event names registered")
+end
+
+function Module:Stop()
+    _G.VX.clamp      = nil
+    _G.VX.lerp       = nil
+    _G.VX.smoothstep = nil
+    _G.VX.log        = nil
+    _G.VX.logBuffer  = nil
+end
+
+function Module:heartbeat() return true end
+
+return Module
