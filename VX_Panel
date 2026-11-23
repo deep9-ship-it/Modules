@@ -1,591 +1,824 @@
 --[[
-    VX_Panel v3.1.0
-    - Added: frontGrip, rearGrip, brakeSpeed, turboCustomMultiplier
-    - Added: shift toggles (realisticShifting, shiftDelay, shiftingJolt, vehicleShaking, launchControlEnabled)
-    - Removed: brakeBias*, driftStrength
-    - Turbo: 1/2/3 buttons
-    - Drivetrain: FWD/RWD/AWD buttons
+    VX_Panel v3.2.0 — GT3 Carbon Edition
+    Sliding Tuning Drawer + 2-Col Profile Grid + Pill Switches + Thumbed Sliders + Guarded Footer
 ]]
 
-local VX = _G.VX
-if not VX or not VX.Framework then error("VX_Panel requires VX_Kernel") end
-
+local Players      = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
-local Players = game:GetService("Players")
-local Player = Players.LocalPlayer
+local UIS          = game:GetService("UserInputService")
+local Player       = Players.LocalPlayer
 
-local Module = VX.Framework.Module.new({
+local F = _G.VX.Framework
+local Module = F.Module.new({
     Name = "Panel",
+    Version = "3.2.0",
     Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "UI" },
-    Version = "3.1.0",
 })
 
-function Module:Construct()
-    self.panel = nil
-    self.tabBar = nil
-    self.tabContents = {}
-    self.tabButtons = {}
-    self.activeTab = "Dynamics"
-    self.isPanelOpen = false
-    self.tweenIn = nil
-    self.tweenOut = nil
-    self.slideInSound = nil
-    self.slideOutSound = nil
-    self.rowRefs = {}
+local THEME = {
+    bg         = Color3.fromRGB(13, 13, 15),    -- #0D0D0F Carbon Glass
+    bgBottom   = Color3.fromRGB(8, 8, 10),
+    card       = Color3.fromRGB(22, 22, 27),    -- Setting row card
+    cardHover  = Color3.fromRGB(29, 29, 36),
+    track      = Color3.fromRGB(40, 40, 50),
+    border     = Color3.fromRGB(52, 52, 64),
+    accent     = Color3.fromRGB(225, 29, 72),   -- #E11D48 GT3 Crimson
+    accentDark = Color3.fromRGB(140, 22, 48),
+    amber      = Color3.fromRGB(245, 158, 11),
+    green      = Color3.fromRGB(16, 185, 129),
+    text       = Color3.fromRGB(248, 250, 252),
+    textDim    = Color3.fromRGB(148, 163, 184),
+    textMuted  = Color3.fromRGB(100, 116, 139),
+}
+
+local SLIDE_IN_ID  = "rbxassetid://9114488953"
+local SLIDE_OUT_ID = "rbxassetid://9114488653"
+local TABS         = { "Dynamics", "Engine", "Audio", "System" }
+
+function Module:_trackConn(c)
+    if c then table.insert(self._conns, c) end
+    return c
 end
 
-function Module:Init(deps)
-    self.core = deps.Core
-    self.profiles = deps.Profiles
-    self.powertrain = deps.Powertrain
-    self.drive = deps.DriveSystem
-    self.chassis = deps.Chassis
-end
-
-function Module:Start()
-    _G.VX.Panel = self
-    self:_createSounds()
-    self:_createPanel()
-    _G.VX.bus:on("settings.changed", function(evt) self:_onSettingChange(evt) end)
-    print("[VX] Panel ready")
-end
-
-function Module:Stop()
-    if self.panel then pcall(function() self.panel:Destroy() end); self.panel = nil end
-    if _G.VX.Panel == self then _G.VX.Panel = nil end
-end
-
-function Module:heartbeat() return true end
-
-local function corner(obj, r)
-    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 8); c.Parent = obj; return c
-end
-local function stroke(obj, col, thick)
-    local s = Instance.new("UIStroke"); s.Color = col or Color3.fromRGB(100,200,255); s.Thickness = thick or 2; s.Transparency = 0.3; s.Parent = obj; return s
-end
-
-function Module:_createSounds()
-    local function make(id)
-        local s = Instance.new("Sound")
-        s.SoundId = "rbxassetid://" .. id
-        s.Volume = 0.8
-        s.Parent = Player:WaitForChild("PlayerGui")
-        return s
-    end
-    pcall(function()
-        self.slideInSound = make("139821129588664")
-        self.slideOutSound = make("77985512666301")
-    end)
-end
-
-function Module:_createPanel()
-    local p = Instance.new("Frame")
-    p.Name = "VXSettingsPanel"
-    p.Size = UDim2.new(0.35, 0, 0.65, 0)
-    p.Position = UDim2.new(-0.35, 0, 0.17, 0)
-    p.BackgroundColor3 = Color3.fromRGB(8,8,12)
-    p.BackgroundTransparency = 0.1
-    p.BorderSizePixel = 0
-    p.ZIndex = 30
-    p.Visible = false
-    corner(p, 12)
-    stroke(p, Color3.fromRGB(100,200,255), 2)
-    p.Parent = _G.VX.UI.gui
-
-    local tabBar = Instance.new("Frame")
-    tabBar.Size = UDim2.new(1,0,0.10,0)
-    tabBar.BackgroundTransparency = 1
-    tabBar.ZIndex = 31
-    tabBar.Parent = p
-
-    local tabs = {"Dynamics","Physics","Audio","Engine","Controls","Lights"}
-    local tabWidth = 1 / #tabs
-    for i, name in ipairs(tabs) do
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(tabWidth, 0, 1, 0)
-        btn.Position = UDim2.new(tabWidth * (i-1), 0, 0, 0)
-        btn.Text = name
-        btn.TextColor3 = Color3.fromRGB(255,255,255)
-        btn.BackgroundColor3 = Color3.fromRGB(20,20,25)
-        btn.BackgroundTransparency = 0.3
-        btn.TextScaled = true
-        btn.Font = Enum.Font.GothamBold
-        btn.AutoButtonColor = false
-        btn.ZIndex = 32
-        corner(btn, 6)
-        btn.Parent = tabBar
-        self.tabButtons[name] = btn
-        btn.MouseButton1Click:Connect(function() self:_switchTab(name) end)
-    end
-
-    local content = Instance.new("Frame")
-    content.Size = UDim2.new(1,-12,0.90,-8)
-    content.Position = UDim2.new(0,6,0.10,4)
-    content.BackgroundTransparency = 1
-    content.ZIndex = 31
-    content.Parent = p
-
-    for _, name in ipairs(tabs) do
-        local scroll = Instance.new("ScrollingFrame")
-        scroll.Size = UDim2.new(1,0,1,0)
-        scroll.BackgroundTransparency = 1
-        scroll.BorderSizePixel = 0
-        scroll.ScrollBarThickness = 6
-        scroll.ScrollBarImageColor3 = Color3.fromRGB(100,200,255)
-        scroll.CanvasSize = UDim2.new(0,0,0,0)
-        scroll.Visible = false
-        scroll.ZIndex = 32
-        scroll.Parent = content
-        self.tabContents[name] = scroll
-    end
-
-    local close = Instance.new("TextButton")
-    close.Size = UDim2.new(0,28,0,28)
-    close.Position = UDim2.new(1,-32,0,6)
-    close.Text = "✕"
-    close.TextColor3 = Color3.fromRGB(255,100,100)
-    close.BackgroundColor3 = Color3.fromRGB(40,20,20)
-    close.TextScaled = true
-    close.Font = Enum.Font.GothamBold
-    close.AutoButtonColor = false
-    close.ZIndex = 33
-    corner(close, 14)
-    close.Parent = p
-    close.MouseButton1Click:Connect(function() self:close() end)
-
-    self.panel = p
-    self._switchTab("Dynamics")
-end
-
-function Module:_switchTab(name)
-    self.activeTab = name
-    for tabName, btn in pairs(self.tabButtons) do
-        btn.BackgroundColor3 = (tabName == name) and Color3.fromRGB(60,160,255) or Color3.fromRGB(20,20,25)
-    end
-    for tabName, scroll in pairs(self.tabContents) do
-        scroll.Visible = (tabName == name)
-    end
-    self:_buildTab(name)
-end
-
-function Module:_buildTab(name)
-    local scroll = self.tabContents[name]
-    if not scroll then return end
-    for _, child in ipairs(scroll:GetChildren()) do
-        if child:IsA("Frame") or child:IsA("TextLabel") or child:IsA("TextButton") then child:Destroy() end
-    end
-    self.rowRefs = {}
-    local y = 6
-    if name == "Dynamics" then y = self:_buildDynamics(scroll, y)
-    elseif name == "Physics" then y = self:_buildPhysics(scroll, y)
-    elseif name == "Audio" then y = self:_buildAudio(scroll, y)
-    elseif name == "Engine" then y = self:_buildEngine(scroll, y)
-    elseif name == "Controls" then y = self:_buildControls(scroll, y)
-    elseif name == "Lights" then y = self:_buildLights(scroll, y) end
-    scroll.CanvasSize = UDim2.new(0,0,0,y+10)
-end
-
-function Module:_buildDynamics(parent, y)
-    local hdr = self:_makeHeader(parent, "Driving Dynamics", y); y = y + 26
-
-    y = self:_addSettingRow(parent, y, "frontGrip", "Front Grip")
-    y = self:_addSettingRow(parent, y, "rearGrip", "Rear Grip")
-    y = self:_addSettingRow(parent, y, "drivetrain", "Drivetrain")
-    y = self:_addSettingRow(parent, y, "brakingPower", "Braking Power")
-    y = self:_addSettingRow(parent, y, "brakeSpeed", "Brake Speed")
-    y = self:_addSettingRow(parent, y, "turboStage", "Turbo Stage")
-    y = self:_addSettingRow(parent, y, "turboCustomMultiplier", "Turbo Multiplier")
-    y = self:_addSettingRow(parent, y, "throttleUltra", "Throttle Ultra")
-    y = self:_addSettingRow(parent, y, "weightTransferMode", "Weight Transfer Mode")
-    y = self:_addSettingRow(parent, y, "weightTransferIntensity", "WT Intensity")
-    y = self:_addSettingRow(parent, y, "steeringSensitivity", "Steering Sensitivity")
-
-    return y
-end
-
-function Module:_buildPhysics(parent, y)
-    local hdr = self:_makeHeader(parent, "Physics Simulation", y); y = y + 26
-
-    y = self:_addSettingRow(parent, y, "physicsTiltLevel", "Body Tilt Level")
-
-    local keys = {
-        "torqueCurve","engineBraking","engineBrakingStrength",
-        "engineLoad","engineLoadSensitivity",
-        "aeroDrag","aeroDownforce","downforceCoefficient",
-        "weightTransfer","clutchSimulation","clutchDuration",
-        "coldStart","coldStartDuration","idleHunting","engineBog",
-        "fuelCutLimiter","tractionControl","tractionControlSensitivity",
-        "launchWindow","telemetryHud","virtualClutch",
-        "antiLagEnabled","absEnabled","brakeFadeEnabled","tireTempEnabled",
-        "turnSpeed","maxSteerAngle","steeringDecay",
-    }
-    for _, key in ipairs(keys) do
-        y = self:_addSettingRow(parent, y, "physics." .. key, self:_prettyName(key))
-    end
-    return y
-end
-
-function Module:_buildAudio(parent, y)
-    local hdr = self:_makeHeader(parent, "Audio", y); y = y + 26
-    y = self:_addSettingRow(parent, y, "masterVolume", "Master Volume")
-    y = self:_addSettingRow(parent, y, "engineBoost", "Engine Boost")
-    y = self:_addSettingRow(parent, y, "pitchOffset", "Pitch Offset")
-    return y
-end
-
-function Module:_buildEngine(parent, y)
-    local hdr = self:_makeHeader(parent, "Engine Profile", y); y = y + 26
-    local profiles = self.profiles:getAll()
-    local currentIdx = self.profiles:getCurrentIndex()
-    for i, prof in ipairs(profiles) do
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1,-16,0,30)
-        btn.Position = UDim2.new(0,8,0,y)
-        btn.Text = prof.name
-        btn.TextColor3 = Color3.fromRGB(255,255,255)
-        btn.BackgroundColor3 = (i == currentIdx) and Color3.fromRGB(60,160,255) or Color3.fromRGB(30,30,40)
-        btn.TextSize = 12
-        btn.Font = Enum.Font.GothamBold
-        btn.AutoButtonColor = false
-        btn.ZIndex = 32
-        corner(btn, 6)
-        btn.Parent = parent
-        local idx = i
-        btn.MouseButton1Click:Connect(function()
-            local speed = self:_getSpeed()
-            if speed > 5 then
-                _G.VX.UI:notify("Can't change while moving", 1.5)
-                return
-            end
-            self.profiles:setCurrent(idx)
-            for _, child in ipairs(parent:GetChildren()) do
-                if child:IsA("TextButton") then
-                    local pIdx
-                    for k, p in ipairs(profiles) do
-                        if p.name == child.Text then pIdx = k; break end
-                    end
-                    if pIdx then
-                        child.BackgroundColor3 = (pIdx == idx) and Color3.fromRGB(60,160,255) or Color3.fromRGB(30,30,40)
-                    end
-                end
+function Module:_clearConns()
+    for _, c in ipairs(self._conns) do
+        pcall(function()
+            if typeof(c) == "RBXScriptConnection" then
+                c:Disconnect()
+            elseif type(c) == "table" and c.Disconnect then
+                c:Disconnect()
             end
         end)
-        y = y + 34
     end
-    y = y + 10
-    y = self:_addSettingRow(parent, y, "turboSpoolEnabled", "Turbo Spool Sound")
-    y = self:_addSettingRow(parent, y, "turboFlutterEnabled", "Turbo Flutter Sound")
-    y = self:_addSettingRow(parent, y, "turboBlowoffEnabled", "Turbo Blow-Off Sound")
-    y = self:_addSettingRow(parent, y, "backfireEnabled", "Backfire")
-    return y
+    self._conns = {}
 end
 
-function Module:_buildControls(parent, y)
-    local hdr = self:_makeHeader(parent, "Controls", y); y = y + 26
-
-    y = self:_addSettingRow(parent, y, "topSpeed", "Top Speed")
-    y = self:_addSettingRow(parent, y, "launchControlEnabled", "Launch Control")
-    y = self:_addSettingRow(parent, y, "realisticShifting", "Realistic Shifting")
-    y = self:_addSettingRow(parent, y, "shiftDelay", "Shift Delay")
-    y = self:_addSettingRow(parent, y, "shiftingJolt", "Shifting Jolt")
-    y = self:_addSettingRow(parent, y, "vehicleShaking", "Vehicle Shaking")
-    y = self:_addSettingRow(parent, y, "ghostModeEnabled", "Ghost Mode")
-    y = self:_addSettingRow(parent, y, "fovDynamicsEnabled", "FOV Dynamics")
-    y = self:_addSettingRow(parent, y, "highSpeedSteerReduction", "High Speed Steer Reduction")
-    y = self:_addSettingRow(parent, y, "reductionFactor", "Reduction Factor")
-    y = self:_addSettingRow(parent, y, "realisticTurboEnabled", "Realistic Turbo")
-    y = self:_addSettingRow(parent, y, "videoMode", "Video Mode")
-    return y
-end
-
-function Module:_buildLights(parent, y)
-    local hdr = self:_makeHeader(parent, "Lights", y); y = y + 26
-    y = self:_addSettingRow(parent, y, "lightPattern", "Light Pattern")
-    y = self:_addSettingRow(parent, y, "lightSpeed", "Pattern Speed")
-    y = self:_addSettingRow(parent, y, "hazardEnabled", "Hazards in Show")
-    y = self:_addSettingRow(parent, y, "headlightsEnabled", "Headlights in Show")
-    return y
-end
-
-function Module:_makeHeader(parent, text, y)
-    local hdr = Instance.new("TextLabel")
-    hdr.Size = UDim2.new(1,-16,0,22)
-    hdr.Position = UDim2.new(0,8,0,y)
-    hdr.Text = text
-    hdr.TextColor3 = Color3.fromRGB(100,200,255)
-    hdr.BackgroundTransparency = 1
-    hdr.TextXAlignment = Enum.TextXAlignment.Left
-    hdr.TextSize = 13
-    hdr.Font = Enum.Font.GothamBold
-    hdr.ZIndex = 32
-    hdr.Parent = parent
-    return hdr
-end
-
-function Module:_addSettingRow(parent, y, path, label)
-    local schema = _G.VX.registry:get("settings", path)
-    if not schema then
-        local row = Instance.new("TextLabel")
-        row.Size = UDim2.new(1,-16,0,26)
-        row.Position = UDim2.new(0,8,0,y)
-        row.Text = label .. " [not registered]"
-        row.TextColor3 = Color3.fromRGB(120,120,120)
-        row.BackgroundTransparency = 1
-        row.TextXAlignment = Enum.TextXAlignment.Left
-        row.TextSize = 12
-        row.Font = Enum.Font.Gotham
-        row.ZIndex = 32
-        row.Parent = parent
-        return y + 30
-    end
-
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1,-16,0,28)
-    row.Position = UDim2.new(0,8,0,y)
-    row.BackgroundTransparency = 1
-    row.ZIndex = 32
-    row.Parent = parent
-
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(0.55,0,1,0)
-    lbl.Position = UDim2.new(0,4,0,0)
-    lbl.Text = label
-    lbl.TextColor3 = Color3.fromRGB(220,220,220)
-    lbl.BackgroundTransparency = 1
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.TextSize = 12
-    lbl.Font = Enum.Font.Gotham
-    lbl.ZIndex = 33
-    lbl.Parent = row
-
-    local schemaType = schema.type
-    local currentValue = _G.VX.getSetting(path)
-
-    if schemaType == "boolean" then
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(0.25,0,0.9,0)
-        btn.Position = UDim2.new(0.72,0,0.05,0)
-        btn.Text = currentValue and "ON" or "OFF"
-        btn.TextColor3 = Color3.fromRGB(255,255,255)
-        btn.BackgroundColor3 = currentValue and Color3.fromRGB(60,160,255) or Color3.fromRGB(80,80,80)
-        btn.TextSize = 12
-        btn.Font = Enum.Font.GothamBold
-        btn.AutoButtonColor = false
-        btn.ZIndex = 33
-        corner(btn, 6)
-        btn.Parent = row
-        btn.MouseButton1Click:Connect(function()
-            local newVal = not _G.VX.getSetting(path)
-            _G.VX.setSetting(path, newVal)
-            btn.Text = newVal and "ON" or "OFF"
-            btn.BackgroundColor3 = newVal and Color3.fromRGB(60,160,255) or Color3.fromRGB(80,80,80)
-        end)
-    elseif schemaType == "number_stepped" or schemaType == "number_range" then
-        local valLabel = Instance.new("TextLabel")
-        valLabel.Size = UDim2.new(0.18,0,1,0)
-        valLabel.Position = UDim2.new(0.56,0,0,0)
-        valLabel.Text = self:_formatNumber(path, currentValue, schema)
-        valLabel.TextColor3 = Color3.fromRGB(255,255,255)
-        valLabel.BackgroundTransparency = 1
-        valLabel.TextSize = 12
-        valLabel.Font = Enum.Font.GothamBold
-        valLabel.ZIndex = 33
-        valLabel.Parent = row
-
-        local function makeBtn(text, posX, onClick)
-            local btn = Instance.new("TextButton")
-            btn.Size = UDim2.new(0.10,0,0.9,0)
-            btn.Position = UDim2.new(posX,0,0.05,0)
-            btn.Text = text
-            btn.TextColor3 = Color3.fromRGB(255,255,255)
-            btn.BackgroundColor3 = Color3.fromRGB(40,40,48)
-            btn.TextSize = 14
-            btn.Font = Enum.Font.GothamBold
-            btn.AutoButtonColor = false
-            btn.ZIndex = 33
-            corner(btn, 6)
-            btn.Parent = row
-            btn.MouseButton1Click:Connect(onClick)
-        end
-
-        makeBtn("–", 0.76, function()
-            local v = _G.VX.getSetting(path) - (schema.step or 1)
-            v = math.max(schema.min or -9999, v)
-            _G.VX.setSetting(path, v)
-            valLabel.Text = self:_formatNumber(path, v, schema)
-        end)
-        makeBtn("+", 0.88, function()
-            local v = _G.VX.getSetting(path) + (schema.step or 1)
-            v = math.min(schema.max or 9999, v)
-            _G.VX.setSetting(path, v)
-            valLabel.Text = self:_formatNumber(path, v, schema)
-        end)
-    elseif schemaType == "enum" then
-        -- Drivetrain special case
-        if path == "drivetrain" then
-            local options = { "FWD", "RWD", "AWD" }
-            local btnWidth = 0.10
-            for i, opt in ipairs(options) do
-                local btn = Instance.new("TextButton")
-                btn.Size = UDim2.new(btnWidth,0,0.9,0)
-                btn.Position = UDim2.new(0.58 + (i-1) * (btnWidth + 0.005), 0, 0.05, 0)
-                btn.Text = opt
-                btn.TextColor3 = Color3.fromRGB(255,255,255)
-                btn.BackgroundColor3 = (currentValue == opt) and Color3.fromRGB(60,160,255) or Color3.fromRGB(40,40,48)
-                btn.TextSize = 10
-                btn.Font = Enum.Font.GothamBold
-                btn.AutoButtonColor = false
-                btn.ZIndex = 33
-                corner(btn, 6)
-                btn.Parent = row
-                btn.MouseButton1Click:Connect(function()
-                    _G.VX.setSetting(path, opt)
-                    for _, c in ipairs(row:GetChildren()) do
-                        if c:IsA("TextButton") then
-                            c.BackgroundColor3 = (c.Text == opt) and Color3.fromRGB(60,160,255) or Color3.fromRGB(40,40,48)
-                        end
-                    end
-                end)
-            end
-        elseif path == "turboStage" then
-            local options = { "1", "2", "3" }
-            local btnWidth = 0.10
-            for i, opt in ipairs(options) do
-                local btn = Instance.new("TextButton")
-                btn.Size = UDim2.new(btnWidth,0,0.9,0)
-                btn.Position = UDim2.new(0.58 + (i-1) * (btnWidth + 0.005), 0, 0.05, 0)
-                btn.Text = opt
-                btn.TextColor3 = Color3.fromRGB(255,255,255)
-                btn.BackgroundColor3 = (currentValue == i) and Color3.fromRGB(60,160,255) or Color3.fromRGB(40,40,48)
-                btn.TextSize = 11
-                btn.Font = Enum.Font.GothamBold
-                btn.AutoButtonColor = false
-                btn.ZIndex = 33
-                corner(btn, 6)
-                btn.Parent = row
-                local idx = i
-                btn.MouseButton1Click:Connect(function()
-                    _G.VX.setSetting(path, idx)
-                    for k, c in ipairs(row:GetChildren()) do
-                        if c:IsA("TextButton") then
-                            local thisIdx = tonumber(c.Text)
-                            if thisIdx then
-                                c.BackgroundColor3 = (thisIdx == idx) and Color3.fromRGB(60,160,255) or Color3.fromRGB(40,40,48)
-                            end
-                        end
-                    end
-                end)
-            end
-        elseif path == "weightTransferMode" then
-            local options = { "Off", "Normal", "Drift" }
-            local btnWidth = 0.14
-            for i, opt in ipairs(options) do
-                local btn = Instance.new("TextButton")
-                btn.Size = UDim2.new(btnWidth,0,0.9,0)
-                btn.Position = UDim2.new(0.58 + (i-1) * (btnWidth + 0.01), 0, 0.05, 0)
-                btn.Text = opt
-                btn.TextColor3 = Color3.fromRGB(255,255,255)
-                btn.BackgroundColor3 = (currentValue == opt) and Color3.fromRGB(60,160,255) or Color3.fromRGB(40,40,48)
-                btn.TextSize = 11
-                btn.Font = Enum.Font.GothamBold
-                btn.AutoButtonColor = false
-                btn.ZIndex = 33
-                corner(btn, 6)
-                btn.Parent = row
-                btn.MouseButton1Click:Connect(function()
-                    _G.VX.setSetting(path, opt)
-                    for _, c in ipairs(row:GetChildren()) do
-                        if c:IsA("TextButton") then
-                            c.BackgroundColor3 = (c.Text == opt) and Color3.fromRGB(60,160,255) or Color3.fromRGB(40,40,48)
-                        end
-                    end
-                end)
-            end
-        else
-            local btn = Instance.new("TextButton")
-            btn.Size = UDim2.new(0.40,0,0.9,0)
-            btn.Position = UDim2.new(0.57,0,0.05,0)
-            btn.Text = tostring(currentValue)
-            btn.TextColor3 = Color3.fromRGB(255,255,255)
-            btn.BackgroundColor3 = Color3.fromRGB(40,40,48)
-            btn.TextSize = 11
-            btn.Font = Enum.Font.GothamBold
-            btn.AutoButtonColor = false
-            btn.ZIndex = 33
-            corner(btn, 6)
-            btn.Parent = row
-            btn.MouseButton1Click:Connect(function()
-                local options = schema.options or {}
-                if #options == 0 then return end
-                local cur = _G.VX.getSetting(path)
-                local curIdx = 1
-                for i, o in ipairs(options) do if o == cur then curIdx = i; break end end
-                local nextIdx = (curIdx % #options) + 1
-                _G.VX.setSetting(path, options[nextIdx])
-                btn.Text = tostring(options[nextIdx])
-            end)
-        end
-    end
-
-    self.rowRefs[path] = { row = row, valueLabel = row:FindFirstChildWhichIsA("TextLabel"), schema = schema }
-    return y + 30
-end
-
-function Module:_formatNumber(path, value, schema)
-    if path == "masterVolume" or path == "engineBoost" then return string.format("%d%%", math.floor(value * 100))
-    elseif path == "pitchOffset" then return string.format("%+d%%", math.floor(value * 100))
-    elseif path == "topSpeed" then return tostring(value)
-    elseif path == "frontGrip" or path == "rearGrip" then return string.format("%.2f", value)
-    elseif path == "brakeSpeed" or path == "brakingPower" then return string.format("%.1f", value)
-    elseif path == "turboCustomMultiplier" then return string.format("%.1fx", value)
-    elseif schema.unit then return string.format("%.2f%s", value, schema.unit)
-    else return string.format("%.2f", value) end
-end
-
-function Module:_prettyName(key)
-    local s = key:gsub("(%u)", " %1")
-    s = s:gsub("^%s+", "")
-    return s
-end
-
-function Module:open()
-    if self.isPanelOpen or not self.panel then return end
-    self.isPanelOpen = true
-    self.panel.Visible = true
-    self:_buildTab(self.activeTab)
-    if self.slideInSound then pcall(function() self.slideInSound:Play() end) end
-    if self.tweenOut then pcall(function() self.tweenOut:Cancel() end) end
-    self.tweenIn = TweenService:Create(self.panel, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Position = UDim2.new(0, 0, 0.17, 0) })
-    self.tweenIn:Play()
-end
-
-function Module:close()
-    if not self.isPanelOpen or not self.panel then return end
-    self.isPanelOpen = false
-    if self.slideOutSound then pcall(function() self.slideOutSound:Play() end) end
-    if self.tweenIn then pcall(function() self.tweenIn:Cancel() end) end
-    self.tweenOut = TweenService:Create(self.panel, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = UDim2.new(-0.35, 0, 0.17, 0) })
-    self.tweenOut.Completed:Connect(function() if not self.isPanelOpen then self.panel.Visible = false end end)
-    self.tweenOut:Play()
-end
-
-function Module:isOpen() return self.isPanelOpen end
-
-function Module:_onSettingChange(evt)
-    if not evt or not self.isPanelOpen then return end
-    local cached = self.rowRefs[evt.path]
-    if cached and cached.valueLabel then
-        if cached.schema.type == "number_stepped" or cached.schema.type == "number_range" then
-            cached.valueLabel.Text = self:_formatNumber(evt.path, evt.new, cached.schema)
-        end
+function Module:_notify(msg, dur, kind)
+    local ui = self.ui or _G.VX.UI
+    if ui and ui.notify then
+        ui:notify(msg, dur, kind)
     end
 end
 
 function Module:_getSpeed()
-    local handle = _G.VX.Authority and _G.VX.Authority:getHandle()
-    if not handle or not handle.root or not handle.root.PrimaryPart then return 0 end
-    local v = handle.root.PrimaryPart.AssemblyLinearVelocity
+    local root = _G.VX.Authority and _G.VX.Authority:getRoot()
+    if not root then return 0 end
+    local v = root.AssemblyLinearVelocity
     return Vector3.new(v.X, 0, v.Z).Magnitude * 0.626
+end
+
+function Module:Construct()
+    self.gui = nil
+    self.panel = nil
+    self.scroll = nil
+    self.activeTab = "Dynamics"
+    self.tabButtons = {}
+    self.tabUnderline = nil
+    self.rowRefs = {}
+    self.profileChips = {}
+    self.turboBtns = {}
+    self.activeProfileLbl = nil
+    self.openState = false
+    self._conns = {}
+    self._layoutOrder = 0
+    self._resetConfirmUntil = 0
+end
+
+function Module:Init(deps)
+    self.core        = deps.Core
+    self.profiles    = deps.Profiles
+    self.powertrain  = deps.Powertrain
+    self.driveSystem = deps.DriveSystem
+    self.chassis     = deps.Chassis
+    self.ui          = deps.UI
+    _G.VX.Panel = self
+end
+
+function Module:Start()
+    self:_createPanel()
+    self:_trackConn(_G.VX.bus:on("settings.changed", function(evt)
+        self:_onSettingChange(evt)
+    end))
+end
+
+function Module:Stop()
+    self:_clearConns()
+    if self.slideInSound then pcall(function() self.slideInSound:Destroy() end); self.slideInSound = nil end
+    if self.slideOutSound then pcall(function() self.slideOutSound:Destroy() end); self.slideOutSound = nil end
+    if self.gui then pcall(function() self.gui:Destroy() end); self.gui = nil end
+    self.panel = nil
+end
+
+function Module:_nextOrder()
+    self._layoutOrder = self._layoutOrder + 1
+    return self._layoutOrder
+end
+
+function Module:_createPanel()
+    local pg = Player:WaitForChild("PlayerGui")
+    local existing = pg:FindFirstChild("VX_Panel")
+    if existing then existing:Destroy() end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "VX_Panel"
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 15
+    sg.IgnoreGuiInset = true
+    sg.Parent = pg
+    self.gui = sg
+
+    local s1 = Instance.new("Sound"); s1.SoundId = SLIDE_IN_ID; s1.Volume = 0.25; s1.Parent = sg
+    local s2 = Instance.new("Sound"); s2.SoundId = SLIDE_OUT_ID; s2.Volume = 0.25; s2.Parent = sg
+    self.slideInSound = s1
+    self.slideOutSound = s2
+
+    local p = Instance.new("Frame")
+    p.Name = "VX_TuningPanel"
+    p.Size = UDim2.new(0, 348, 1, -24)
+    p.Position = UDim2.new(1, 20, 0, 12)
+    p.BackgroundColor3 = THEME.bg
+    p.BackgroundTransparency = 0.05
+    p.BorderSizePixel = 0
+    p.Parent = sg
+
+    local pc = Instance.new("UICorner"); pc.CornerRadius = UDim.new(0, 12); pc.Parent = p
+    local pgrad = Instance.new("UIGradient")
+    pgrad.Rotation = 90
+    pgrad.Color = ColorSequence.new(THEME.bg, THEME.bgBottom)
+    pgrad.Parent = p
+    local ps = Instance.new("UIStroke"); ps.Color = THEME.border; ps.Thickness = 1; ps.Parent = p
+
+    -- Header (50px)
+    local hdr = Instance.new("Frame")
+    hdr.Size = UDim2.new(1, 0, 0, 50)
+    hdr.BackgroundTransparency = 1
+    hdr.Parent = p
+
+    local hdrAccent = Instance.new("Frame")
+    hdrAccent.Size = UDim2.new(0, 3, 0, 22)
+    hdrAccent.Position = UDim2.new(0, 14, 0, 14)
+    hdrAccent.BackgroundColor3 = THEME.accent
+    hdrAccent.BorderSizePixel = 0
+    hdrAccent.Parent = hdr
+    local hac = Instance.new("UICorner"); hac.CornerRadius = UDim.new(0, 2); hac.Parent = hdrAccent
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -90, 0, 22)
+    title.Position = UDim2.new(0, 24, 0, 8)
+    title.BackgroundTransparency = 1
+    title.Text = "VX // GT3 TUNING"
+    title.TextColor3 = THEME.text
+    title.Font = Enum.Font.GothamBlack
+    title.TextSize = 15
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = hdr
+
+    local sub = Instance.new("TextLabel")
+    sub.Size = UDim2.new(1, -90, 0, 14)
+    sub.Position = UDim2.new(0, 24, 0, 29)
+    sub.BackgroundTransparency = 1
+    sub.Text = "v3.2.0  ·  CARBON EDITION"
+    sub.TextColor3 = THEME.textMuted
+    sub.Font = Enum.Font.GothamBold
+    sub.TextSize = 9
+    sub.TextXAlignment = Enum.TextXAlignment.Left
+    sub.Parent = hdr
+
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.new(0, 28, 0, 28)
+    close.Position = UDim2.new(1, -40, 0, 11)
+    close.BackgroundColor3 = THEME.card
+    close.Text = "✕"
+    close.TextColor3 = THEME.textDim
+    close.Font = Enum.Font.GothamBold
+    close.TextSize = 13
+    close.AutoButtonColor = false
+    close.Parent = hdr
+    local cc = Instance.new("UICorner"); cc.CornerRadius = UDim.new(0, 7); cc.Parent = close
+    local cs = Instance.new("UIStroke"); cs.Color = THEME.border; cs.Thickness = 1; cs.Parent = close
+    close.MouseEnter:Connect(function()
+        close.BackgroundColor3 = THEME.accent
+        close.TextColor3 = THEME.text
+    end)
+    close.MouseLeave:Connect(function()
+        close.BackgroundColor3 = THEME.card
+        close.TextColor3 = THEME.textDim
+    end)
+    close.MouseButton1Click:Connect(function() self:close() end)
+
+    -- Tab Bar (36px) with animated crimson underline
+    local tabBar = Instance.new("Frame")
+    tabBar.Size = UDim2.new(1, -24, 0, 34)
+    tabBar.Position = UDim2.new(0, 12, 0, 52)
+    tabBar.BackgroundColor3 = THEME.card
+    tabBar.BorderSizePixel = 0
+    tabBar.Parent = p
+    local tbc = Instance.new("UICorner"); tbc.CornerRadius = UDim.new(0, 8); tbc.Parent = tabBar
+
+    local tabW = 1 / #TABS
+    for i, name in ipairs(TABS) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(tabW, 0, 1, -2)
+        btn.Position = UDim2.new((i - 1) * tabW, 0, 0, 0)
+        btn.BackgroundTransparency = 1
+        btn.Text = name
+        btn.TextColor3 = THEME.textDim
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 11
+        btn.AutoButtonColor = false
+        btn.Parent = tabBar
+        btn.MouseButton1Click:Connect(function()
+            self:_switchTab(name)
+        end)
+        self.tabButtons[name] = { btn = btn, idx = i }
+    end
+
+    local underline = Instance.new("Frame")
+    underline.Size = UDim2.new(tabW, -12, 0, 2)
+    underline.Position = UDim2.new(0, 6, 1, -2)
+    underline.BackgroundColor3 = THEME.accent
+    underline.BorderSizePixel = 0
+    underline.Parent = tabBar
+    local uc = Instance.new("UICorner"); uc.CornerRadius = UDim.new(0, 1); uc.Parent = underline
+    self.tabUnderline = underline
+
+    -- Scroll Content Area (leaves 56px at bottom for Pinned Footer)
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1, -18, 1, -150)
+    scroll.Position = UDim2.new(0, 9, 0, 94)
+    scroll.BackgroundTransparency = 1
+    scroll.ScrollBarThickness = 4
+    scroll.ScrollBarImageColor3 = THEME.accent
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.Parent = p
+
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 6)
+    layout.Parent = scroll
+
+    local sp = Instance.new("UIPadding")
+    sp.PaddingLeft = UDim.new(0, 3)
+    sp.PaddingRight = UDim.new(0, 7)
+    sp.PaddingBottom = UDim.new(0, 10)
+    sp.Parent = scroll
+
+    self.scroll = scroll
+    self.panel = p
+
+    self:_createFooter(p)
+    self:_switchTab("Dynamics") -- Fixed colon call!
+end
+
+-- ==================== PINNED FOOTER BAR ====================
+function Module:_createFooter(parent)
+    local footer = Instance.new("Frame")
+    footer.Size = UDim2.new(1, -24, 0, 42)
+    footer.Position = UDim2.new(0, 12, 1, -50)
+    footer.BackgroundColor3 = THEME.card
+    footer.BorderSizePixel = 0
+    footer.Parent = parent
+    local fc = Instance.new("UICorner"); fc.CornerRadius = UDim.new(0, 8); fc.Parent = footer
+    local fs = Instance.new("UIStroke"); fs.Color = THEME.border; fs.Thickness = 1; fs.Parent = footer
+
+    local function makeBtn(text, xScale, wScale, bg, fn)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(wScale, -6, 0, 28)
+        b.Position = UDim2.new(xScale, 3, 0.5, -14)
+        b.BackgroundColor3 = bg
+        b.Text = text
+        b.TextColor3 = THEME.text
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 11
+        b.AutoButtonColor = false
+        b.Parent = footer
+        local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0, 6); bc.Parent = b
+        b.MouseButton1Click:Connect(function() fn(b) end)
+        return b
+    end
+
+    makeBtn("Save", 0, 0.31, Color3.fromRGB(36, 40, 50), function()
+        self.profiles:savePreset("Custom1")
+        self:_notify("Preset 'Custom1' saved", 2, "success")
+    end)
+
+    makeBtn("Load", 0.31, 0.31, Color3.fromRGB(36, 40, 50), function()
+        local ok = self.profiles:loadPreset("Custom1")
+        if ok then
+            self:_notify("Preset 'Custom1' loaded", 2, "success")
+            self:_switchTab(self.activeTab)
+        else
+            self:_notify("No saved preset found", 2, "warn")
+        end
+    end)
+
+    local resetBtn
+    resetBtn = makeBtn("Reset All", 0.62, 0.38, THEME.accentDark, function()
+        local now = os.clock()
+        if now > self._resetConfirmUntil then
+            self._resetConfirmUntil = now + 2.5
+            resetBtn.Text = "Confirm?"
+            resetBtn.BackgroundColor3 = THEME.accent
+            task.delay(2.6, function()
+                if resetBtn.Parent and os.clock() > self._resetConfirmUntil then
+                    resetBtn.Text = "Reset All"
+                    resetBtn.BackgroundColor3 = THEME.accentDark
+                end
+            end)
+            return
+        end
+        self._resetConfirmUntil = 0
+        resetBtn.Text = "Reset All"
+        resetBtn.BackgroundColor3 = THEME.accentDark
+        _G.VX.resetAll()
+        self:_switchTab(self.activeTab)
+        self:_notify("All settings reset", 2, "warn")
+    end)
+end
+
+-- ==================== OPEN / CLOSE ====================
+function Module:open()
+    self.openState = true
+    if self.slideInSound then pcall(function() self.slideInSound:Play() end) end
+    TweenService:Create(self.panel, TweenInfo.new(0.24, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Position = UDim2.new(1, -360, 0, 12),
+    }):Play()
+end
+
+function Module:close()
+    self.openState = false
+    if self.slideOutSound then pcall(function() self.slideOutSound:Play() end) end
+    TweenService:Create(self.panel, TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
+        Position = UDim2.new(1, 20, 0, 12),
+    }):Play()
+end
+
+function Module:toggle()
+    if self.openState then self:close() else self:open() end
+end
+
+function Module:isOpen() return self.openState end
+
+-- ==================== TAB SWITCHING ====================
+function Module:_switchTab(name)
+    self.activeTab = name
+    self._layoutOrder = 0
+    local info = self.tabButtons[name]
+    if info and self.tabUnderline then
+        local tabW = 1 / #TABS
+        TweenService:Create(self.tabUnderline, TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+            Position = UDim2.new((info.idx - 1) * tabW, 6, 1, -2),
+        }):Play()
+    end
+
+    for k, entry in pairs(self.tabButtons) do
+        entry.btn.TextColor3 = (k == name) and THEME.text or THEME.textMuted
+    end
+
+    for _, c in ipairs(self.scroll:GetChildren()) do
+        if c:IsA("GuiObject") then c:Destroy() end
+    end
+    self.rowRefs = {}
+    self.profileChips = {}
+    self.turboBtns = {}
+    self.activeProfileLbl = nil
+
+    if name == "Dynamics" then self:_buildDynamics()
+    elseif name == "Engine" then self:_buildEngine()
+    elseif name == "Audio" then self:_buildAudio()
+    elseif name == "System" then self:_buildSystem() end
+end
+
+function Module:_addSection(title)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 0, 18)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = string.upper(title)
+    lbl.TextColor3 = THEME.textMuted
+    lbl.Font = Enum.Font.GothamBlack
+    lbl.TextSize = 10
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.LayoutOrder = self:_nextOrder()
+    lbl.Parent = self.scroll
+end
+
+function Module:_buildDynamics()
+    self:_addSection("Grip & Tires")
+    self:_addSettingRow("physics.frontGrip")
+    self:_addSettingRow("physics.rearGrip")
+    self:_addSettingRow("physics.tireTempEnabled")
+
+    self:_addSection("Aero & Suspension")
+    self:_addSettingRow("physics.weightTransfer")
+    self:_addSettingRow("physics.aeroDrag")
+    self:_addSettingRow("physics.downforce")
+    self:_addSettingRow("physics.suspensionTilt")
+    self:_addSettingRow("physics.physicsTiltLevel")
+
+    self:_addSection("Driving Aids & Controls")
+    self:_addSettingRow("physics.tcsEnabled")
+    self:_addSettingRow("physics.absEnabled")
+    self:_addSettingRow("physics.engineBraking")
+    self:_addSettingRow("physics.steeringSensitivity")
+    self:_addSettingRow("physics.brakingPower")
+end
+
+function Module:_buildEngine()
+    local all = self.profiles:getAll()
+    local activeProf = self.profiles:getActive()
+    local activeIdx = self.profiles:getActiveIndex()
+
+    -- Active Profile Hero Banner
+    local banner = Instance.new("Frame")
+    banner.Size = UDim2.new(1, 0, 0, 44)
+    banner.BackgroundColor3 = THEME.card
+    banner.BorderSizePixel = 0
+    banner.LayoutOrder = self:_nextOrder()
+    banner.Parent = self.scroll
+    local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0, 8); bc.Parent = banner
+    local bs = Instance.new("UIStroke"); bs.Color = THEME.accent; bs.Thickness = 1; bs.Transparency = 0.4; bs.Parent = banner
+
+    local bLbl = Instance.new("TextLabel")
+    bLbl.Size = UDim2.new(1, -20, 1, 0)
+    bLbl.Position = UDim2.new(0, 12, 0, 0)
+    bLbl.BackgroundTransparency = 1
+    bLbl.Text = string.format("%s  ·  %d RPM", activeProf.name, activeProf.maxRPM)
+    bLbl.TextColor3 = THEME.text
+    bLbl.Font = Enum.Font.GothamBold
+    bLbl.TextSize = 12
+    bLbl.TextXAlignment = Enum.TextXAlignment.Left
+    bLbl.Parent = banner
+    self.activeProfileLbl = bLbl
+
+    self:_addSection("Engine Swap (Stop Vehicle)")
+
+    -- Compact 2-Column Grid for Engine Profiles
+    local gridWrap = Instance.new("Frame")
+    gridWrap.Size = UDim2.new(1, 0, 0, math.ceil(#all / 2) * 34)
+    gridWrap.BackgroundTransparency = 1
+    gridWrap.LayoutOrder = self:_nextOrder()
+    gridWrap.Parent = self.scroll
+
+    local grid = Instance.new("UIGridLayout")
+    grid.CellSize = UDim2.new(0.5, -3, 0, 28)
+    grid.CellPadding = UDim2.new(0, 6, 0, 6)
+    grid.SortOrder = Enum.SortOrder.LayoutOrder
+    grid.Parent = gridWrap
+
+    for i, prof in ipairs(all) do
+        local isAct = (i == activeIdx)
+        local btn = Instance.new("TextButton")
+        btn.BackgroundColor3 = isAct and THEME.accent or THEME.card
+        btn.Text = prof.name
+        btn.TextColor3 = isAct and THEME.text or THEME.textDim
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 11
+        btn.TextTruncate = Enum.TextTruncate.AtEnd
+        btn.AutoButtonColor = false
+        btn.LayoutOrder = i
+        btn.Parent = gridWrap
+        local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = btn
+
+        btn.MouseButton1Click:Connect(function()
+            if self:_getSpeed() > 5 then
+                self:_notify("Stop vehicle before swapping engine", 2, "warn")
+                return
+            end
+            _G.VX.setSetting("engineProfile", i)
+            self:_notify("Engine: " .. prof.name, 2, "success")
+        end)
+        self.profileChips[i] = btn
+    end
+
+    self:_addSection("Forced Induction")
+
+    -- Turbo Stage Segmented Row
+    local tRow = Instance.new("Frame")
+    tRow.Size = UDim2.new(1, 0, 0, 56)
+    tRow.BackgroundColor3 = THEME.card
+    tRow.BorderSizePixel = 0
+    tRow.LayoutOrder = self:_nextOrder()
+    tRow.Parent = self.scroll
+    local tc = Instance.new("UICorner"); tc.CornerRadius = UDim.new(0, 8); tc.Parent = tRow
+
+    local tLbl = Instance.new("TextLabel")
+    tLbl.Size = UDim2.new(1, -16, 0, 20)
+    tLbl.Position = UDim2.new(0, 10, 0, 4)
+    tLbl.BackgroundTransparency = 1
+    tLbl.Text = "Turbo Stage"
+    tLbl.TextColor3 = THEME.text
+    tLbl.Font = Enum.Font.GothamBold
+    tLbl.TextSize = 12
+    tLbl.TextXAlignment = Enum.TextXAlignment.Left
+    tLbl.Parent = tRow
+
+    local curStage = self.core.settings.turboStage
+    for i, stageName in ipairs({ "None", "Single", "Twin" }) do
+        local st = i - 1
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(0.33, -8, 0, 24)
+        b.Position = UDim2.new((i - 1) * 0.33, 10, 0, 26)
+        b.BackgroundColor3 = curStage == st and THEME.accent or THEME.track
+        b.Text = stageName
+        b.TextColor3 = curStage == st and THEME.text or THEME.textDim
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 11
+        b.AutoButtonColor = false
+        b.Parent = tRow
+        local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0, 5); bc.Parent = b
+        b.MouseButton1Click:Connect(function()
+            _G.VX.setSetting("turboStage", st)
+        end)
+        self.turboBtns[st] = b
+    end
+
+    self:_addSettingRow("turboFlutterEnabled")
+    self:_addSettingRow("backfireEnabled")
+
+    self:_addSection("Launch & Thermal")
+    self:_addSettingRow("launchControlEnabled")
+    self:_addSettingRow("launchTargetRPM")
+    self:_addSettingRow("coldStartEnabled")
+
+    local csBtn = Instance.new("TextButton")
+    csBtn.Size = UDim2.new(1, 0, 0, 34)
+    csBtn.BackgroundColor3 = Color3.fromRGB(165, 92, 24)
+    csBtn.Text = "Trigger Cold Start Now"
+    csBtn.TextColor3 = THEME.text
+    csBtn.Font = Enum.Font.GothamBold
+    csBtn.TextSize = 12
+    csBtn.AutoButtonColor = false
+    csBtn.LayoutOrder = self:_nextOrder()
+    csBtn.Parent = self.scroll
+    local csc = Instance.new("UICorner"); csc.CornerRadius = UDim.new(0, 7); csc.Parent = csBtn
+    csBtn.MouseButton1Click:Connect(function()
+        self.powertrain:triggerColdStart()
+        self:_notify("Cold start triggered", 2)
+    end)
+end
+
+function Module:_buildAudio()
+    self:_addSection("Mixer Levels")
+    self:_addSettingRow("masterVolume")
+    self:_addSettingRow("exhaustVolume")
+    self:_addSettingRow("turboVolume")
+    self:_addSettingRow("backfireVolume")
+    self:_addSettingRow("shiftVolume")
+end
+
+function Module:_buildSystem()
+    self:_addSection("Performance & HUD")
+    self:_addSettingRow("performanceMode")
+    self:_addSettingRow("physics.telemetryHud")
+    self:_addSettingRow("videoMode")
+end
+
+-- ==================== ROW BUILDERS ====================
+function Module:_addSettingRow(path)
+    local schema = _G.VX.registry:get("settings", path)
+    if not schema then return end
+    local cur = _G.VX.getSetting(path)
+
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, (schema.type == "boolean") and 40 or (schema.type == "enum" and 58 or 50))
+    row.BackgroundColor3 = THEME.card
+    row.BorderSizePixel = 0
+    row.LayoutOrder = self:_nextOrder()
+    row.Parent = self.scroll
+    local rc = Instance.new("UICorner"); rc.CornerRadius = UDim.new(0, 8); rc.Parent = row
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(0.62, 0, 0, 20)
+    lbl.Position = UDim2.new(0, 10, 0, (schema.type == "boolean") and 10 or 5)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = schema.label or path
+    lbl.TextColor3 = THEME.text
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = row
+
+    local ref = { row = row, schema = schema }
+
+    if schema.type == "boolean" then
+        local track = Instance.new("TextButton")
+        track.Size = UDim2.new(0, 42, 0, 22)
+        track.Position = UDim2.new(1, -52, 0.5, -11)
+        track.BackgroundColor3 = cur and THEME.green or THEME.track
+        track.Text = ""
+        track.AutoButtonColor = false
+        track.Parent = row
+        local tc = Instance.new("UICorner"); tc.CornerRadius = UDim.new(1, 0); tc.Parent = track
+
+        local knob = Instance.new("Frame")
+        knob.Size = UDim2.new(0, 16, 0, 16)
+        knob.Position = cur and UDim2.new(1, -19, 0.5, -8) or UDim2.new(0, 3, 0.5, -8)
+        knob.BackgroundColor3 = THEME.text
+        knob.BorderSizePixel = 0
+        knob.Parent = track
+        local kc = Instance.new("UICorner"); kc.CornerRadius = UDim.new(1, 0); kc.Parent = knob
+
+        track.MouseButton1Click:Connect(function()
+            local nextVal = not _G.VX.getSetting(path)
+            _G.VX.setSetting(path, nextVal)
+        end)
+        ref.toggleTrack = track
+        ref.toggleKnob = knob
+
+    elseif schema.type == "number_stepped" then
+        local valLbl = Instance.new("TextLabel")
+        valLbl.Size = UDim2.new(0, 74, 0, 18)
+        valLbl.Position = UDim2.new(1, -142, 0, 16)
+        valLbl.BackgroundTransparency = 1
+        valLbl.Text = self:_formatNumber(path, cur, schema)
+        valLbl.TextColor3 = THEME.text
+        valLbl.Font = Enum.Font.GothamBold
+        valLbl.TextSize = 11
+        valLbl.Parent = row
+        ref.valueLabel = valLbl -- Fixed: points to valLbl, not title lbl!
+
+        local function makeStep(txt, x, delta)
+            local b = Instance.new("TextButton")
+            b.Size = UDim2.new(0, 26, 0, 26)
+            b.Position = UDim2.new(1, x, 0, 12)
+            b.BackgroundColor3 = THEME.track
+            b.Text = txt
+            b.TextColor3 = THEME.text
+            b.Font = Enum.Font.GothamBold
+            b.TextSize = 14
+            b.AutoButtonColor = false
+            b.Parent = row
+            local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = b
+            b.MouseButton1Click:Connect(function()
+                local v = (_G.VX.getSetting(path) or schema.default) + delta
+                v = math.clamp(v, schema.min, schema.max)
+                _G.VX.setSetting(path, v)
+            end)
+        end
+        makeStep("-", -64, -(schema.step or 0.1))
+        makeStep("+", -34, (schema.step or 0.1))
+
+    elseif schema.type == "number_range" then
+        local valLbl = Instance.new("TextLabel")
+        valLbl.Size = UDim2.new(0, 64, 0, 18)
+        valLbl.Position = UDim2.new(1, -74, 0, 5)
+        valLbl.BackgroundTransparency = 1
+        valLbl.Text = self:_formatNumber(path, cur, schema)
+        valLbl.TextColor3 = THEME.text
+        valLbl.Font = Enum.Font.GothamBold
+        valLbl.TextSize = 11
+        valLbl.TextXAlignment = Enum.TextXAlignment.Right
+        valLbl.Parent = row
+        ref.valueLabel = valLbl
+
+        local track = Instance.new("Frame")
+        track.Size = UDim2.new(1, -24, 0, 6)
+        track.Position = UDim2.new(0, 12, 0, 32)
+        track.BackgroundColor3 = THEME.track
+        track.BorderSizePixel = 0
+        track.Parent = row
+        local tc = Instance.new("UICorner"); tc.CornerRadius = UDim.new(0, 3); tc.Parent = track
+
+        local pct = math.clamp((cur - schema.min) / math.max(schema.max - schema.min, 0.001), 0, 1)
+        local fill = Instance.new("Frame")
+        fill.Size = UDim2.new(pct, 0, 1, 0)
+        fill.BackgroundColor3 = THEME.accent
+        fill.BorderSizePixel = 0
+        fill.Parent = track
+        local fc = Instance.new("UICorner"); fc.CornerRadius = UDim.new(0, 3); fc.Parent = fill
+
+        local thumb = Instance.new("Frame")
+        thumb.Size = UDim2.new(0, 14, 0, 14)
+        thumb.Position = UDim2.new(pct, -7, 0.5, -7)
+        thumb.BackgroundColor3 = THEME.text
+        thumb.BorderSizePixel = 0
+        thumb.Parent = track
+        local thc = Instance.new("UICorner"); thc.CornerRadius = UDim.new(1, 0); thc.Parent = thumb
+
+        ref.sliderFill = fill
+        ref.sliderThumb = thumb
+
+        local hit = Instance.new("TextButton")
+        hit.Size = UDim2.new(1, 8, 0, 24)
+        hit.Position = UDim2.new(0, -4, 0.5, -12)
+        hit.BackgroundTransparency = 1
+        hit.Text = ""
+        hit.Parent = track
+
+        local sliding = false
+        local function applyX(x)
+            local p = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+            local v = schema.min + p * (schema.max - schema.min)
+            if schema.step then v = math.floor(v / schema.step + 0.5) * schema.step end
+            v = math.clamp(v, schema.min, schema.max)
+            _G.VX.setSetting(path, v)
+        end
+
+        hit.InputBegan:Connect(function(inp)
+            if inp.UserInputType == Enum.UserInputType.MouseButton1
+                or inp.UserInputType == Enum.UserInputType.Touch then
+                sliding = true
+                applyX(inp.Position.X)
+            end
+        end)
+        self:_trackConn(UIS.InputChanged:Connect(function(inp)
+            if sliding and (inp.UserInputType == Enum.UserInputType.MouseMovement
+                or inp.UserInputType == Enum.UserInputType.Touch) then
+                applyX(inp.Position.X)
+            end
+        end))
+        self:_trackConn(UIS.InputEnded:Connect(function(inp)
+            if inp.UserInputType == Enum.UserInputType.MouseButton1
+                or inp.UserInputType == Enum.UserInputType.Touch then
+                sliding = false
+            end
+        end))
+
+    elseif schema.type == "enum" then
+        local opts = schema.options or {}
+        local w = 1 / math.max(#opts, 1)
+        ref.enumBtns = {}
+        for i, opt in ipairs(opts) do
+            local b = Instance.new("TextButton")
+            b.Size = UDim2.new(w, -6, 0, 24)
+            b.Position = UDim2.new((i - 1) * w, 8, 0, 28)
+            b.BackgroundColor3 = (cur == opt) and THEME.accent or THEME.track
+            b.Text = opt
+            b.TextColor3 = (cur == opt) and THEME.text or THEME.textDim
+            b.Font = Enum.Font.GothamBold
+            b.TextSize = 10
+            b.AutoButtonColor = false
+            b.Parent = row
+            local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 5); c.Parent = b
+            b.MouseButton1Click:Connect(function()
+                _G.VX.setSetting(path, opt)
+            end)
+            ref.enumBtns[opt] = b
+        end
+    end
+
+    self.rowRefs[path] = ref
+end
+
+function Module:_formatNumber(_path, val, schema)
+    val = tonumber(val) or 0
+    if schema.unit == "%" then return string.format("%d%%", math.floor(val * 100 + 0.5))
+    elseif schema.unit == "RPM" then return string.format("%d RPM", math.floor(val + 0.5))
+    elseif schema.unit == "x" then return string.format("%.2fx", val)
+    else return string.format("%.2f", val) end
+end
+
+function Module:_onSettingChange(evt)
+    if evt.path == "engineProfile" then
+        local all = self.profiles:getAll()
+        local prof = all[evt.new]
+        if self.activeProfileLbl and prof then
+            self.activeProfileLbl.Text = string.format("%s  ·  %d RPM", prof.name, prof.maxRPM)
+        end
+        for idx, btn in pairs(self.profileChips) do
+            local act = (idx == evt.new)
+            btn.BackgroundColor3 = act and THEME.accent or THEME.card
+            btn.TextColor3 = act and THEME.text or THEME.textDim
+        end
+    elseif evt.path == "turboStage" then
+        for st, btn in pairs(self.turboBtns) do
+            local act = (st == evt.new)
+            btn.BackgroundColor3 = act and THEME.accent or THEME.track
+            btn.TextColor3 = act and THEME.text or THEME.textDim
+        end
+    end
+
+    local cached = self.rowRefs[evt.path]
+    if not cached then return end
+    local schema = cached.schema
+
+    if cached.valueLabel then
+        cached.valueLabel.Text = self:_formatNumber(evt.path, evt.new, schema)
+    end
+    if cached.sliderFill and schema.max and schema.min then
+        local pct = math.clamp((evt.new - schema.min) / math.max(schema.max - schema.min, 0.001), 0, 1)
+        cached.sliderFill.Size = UDim2.new(pct, 0, 1, 0)
+        if cached.sliderThumb then
+            cached.sliderThumb.Position = UDim2.new(pct, -7, 0.5, -7)
+        end
+    end
+    if cached.toggleTrack and cached.toggleKnob then
+        local on = (evt.new == true)
+        TweenService:Create(cached.toggleTrack, TweenInfo.new(0.14), {
+            BackgroundColor3 = on and THEME.green or THEME.track
+        }):Play()
+        TweenService:Create(cached.toggleKnob, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Position = on and UDim2.new(1, -19, 0.5, -8) or UDim2.new(0, 3, 0.5, -8)
+        }):Play()
+    end
+    if cached.enumBtns then
+        for opt, btn in pairs(cached.enumBtns) do
+            local act = (opt == evt.new)
+            btn.BackgroundColor3 = act and THEME.accent or THEME.track
+            btn.TextColor3 = act and THEME.text or THEME.textDim
+        end
+    end
 end
 
 return Module
