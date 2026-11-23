@@ -1,0 +1,373 @@
+--[[
+    VX_Chassis v3.1.0
+    - frontGrip/rearGrip read directly from settings (not from wheel cache)
+    - brakeBias removed
+    - Weight transfer, downforce, tire temp unchanged
+]]
+
+local VX = _G.VX
+if not VX or not VX.Framework then error("VX_Chassis requires VX_Kernel") end
+
+local Module = VX.Framework.Module.new({
+    Name = "Chassis",
+    Dependencies = { "Core", "Profiles", "Authority", "Powertrain", "DriveSystem" },
+    Version = "3.1.0",
+})
+
+local GRIP_WRITE_INTERVAL = 0.10
+local IMPULSE_INTERVAL = 0.0167
+
+function Module:Construct()
+    self.combinedFrontGrip = 1.0
+    self.combinedRearGrip = 1.0
+    self.slopeAngle = 0
+    self.slopeUpY = 1
+    self.slipRatio = 0
+    self.wtFront = 1.0
+    self.wtRear = 1.0
+    self.wtLeft = 1.0
+    self.wtRight = 1.0
+    self.downforceFront = 1.0
+    self.downforceRear = 1.0
+    self.tireTemp = { frontLeft=0.2, frontRight=0.2, backLeft=0.2, backRight=0.2 }
+    self.spinActive = false
+    self.lastSpinEmit = 0
+    self._gripWriteTimer = 0
+    self._impulseTimer = 0
+    self._loopThread = nil
+    self._running = false
+end
+
+function Module:Init(deps)
+    self.core = deps.Core
+    self.profiles = deps.Profiles
+    self.authority = deps.Authority
+    self.powertrain = deps.Powertrain
+    self.drive = deps.DriveSystem
+end
+
+function Module:Start()
+    _G.VX.Chassis = self
+    _G.VX.bus:on("vehicle.stateChanged", function(evt)
+        if evt.to == "Ready" or evt.to == "Idle" then self:_start()
+        elseif evt.to == "Exiting" or evt.to == "Disabled" then self:_stop() end
+    end)
+    self:_registerDiagnostics()
+end
+
+function Module:Stop()
+    self:_stop()
+    if _G.VX.Chassis == self then _G.VX.Chassis = nil end
+end
+
+function Module:heartbeat()
+    if not self._running then return true end
+    return self.authority:getHandle() ~= nil
+end
+
+function Module:_registerDiagnostics()
+    local D = _G.VX.diagnostics
+    pcall(function()
+        D.register("chassis.slipRatio", {
+            fn = function() return { value = string.format("%.2f", self.slipRatio), unit = "", status = self.slipRatio > 0.3 and "warning" or "normal" } end,
+            category = "Chassis",
+        }, "Chassis")
+        D.register("chassis.slopeAngle", {
+            fn = function() return { value = string.format("%.1f", self.slopeAngle), unit = "deg", status = "normal" } end,
+            category = "Chassis",
+        }, "Chassis")
+        D.register("chassis.gripFront", {
+            fn = function() return { value = string.format("%.2f", self.combinedFrontGrip), unit = "", status = "normal" } end,
+            category = "Chassis",
+        }, "Chassis")
+        D.register("chassis.gripRear", {
+            fn = function() return { value = string.format("%.2f", self.combinedRearGrip), unit = "", status = "normal" } end,
+            category = "Chassis",
+        }, "Chassis")
+        D.register("chassis.spin", {
+            fn = function() return { value = self.spinActive and "ON" or "off", unit = "", status = self.spinActive and "warning" or "normal" } end,
+            category = "Chassis",
+        }, "Chassis")
+    end)
+end
+
+function Module:_start()
+    if self._running then return end
+    self._running = true
+    local startTemp = self.core.settings.physics.tireTempEnabled and 0.2 or 0.5
+    for k in pairs(self.tireTemp) do self.tireTemp[k] = startTemp end
+
+    self._loopThread = task.spawn(function()
+        local lastTick = os.clock()
+        while self._running do
+            local now = os.clock()
+            local dt = now - lastTick
+            lastTick = now
+            if dt <= 0 or dt > 0.1 then dt = 1/60 end
+            pcall(function() self:_update(dt) end)
+            task.wait(1/60)
+        end
+    end)
+    print("[VX] Chassis started")
+end
+
+function Module:_stop()
+    if not self._running then return end
+    self._running = false
+    if self._loopThread then pcall(function() task.cancel(self._loopThread) end); self._loopThread = nil end
+
+    local handle = self.authority:getHandle()
+    if handle and handle.originalFriction then
+        for _, w in ipairs(handle.wheels or {}) do
+            local orig = handle.originalFriction[w.name]
+            if orig and w.physical and w.physical.Parent then
+                pcall(function()
+                    local props = w.physical.CustomPhysicalProperties
+                    local d = props and props.Density or 0.7
+                    local e = props and props.Elasticity or 0.5
+                    local fw = props and props.FrictionWeight or 2
+                    local ew = props and props.ElasticityWeight or 1
+                    w.physical.CustomPhysicalProperties = PhysicalProperties.new(d, orig, e, fw, ew)
+                end)
+            end
+        end
+    end
+    print("[VX] Chassis stopped")
+end
+
+function Module:_update(dt)
+    local handle = self.authority:getHandle()
+    if not handle or not handle.root or not handle.root.PrimaryPart then return end
+
+    local vs = _G.VX.Modules.VehicleState
+    local stateName = vs and vs:getVehicleState() or "Disabled"
+    local isActive = (stateName == "Idle" or stateName == "Driving" or stateName == "Shifting" or stateName == "Launching")
+    if not isActive then return end
+
+    self:_updateSlope(handle)
+    self:_updateSlip(handle)
+    self:_updateSpin(handle, dt)
+    self:_updateTireTemp(dt)
+
+    self._impulseTimer = self._impulseTimer + dt
+    if self._impulseTimer >= IMPULSE_INTERVAL then
+        self._impulseTimer = 0
+        self:_applyAeroImpulse(handle, dt)
+        self:_applyEngineBraking(handle, dt)
+    end
+
+    self._gripWriteTimer = self._gripWriteTimer + dt
+    if self._gripWriteTimer >= GRIP_WRITE_INTERVAL then
+        self._gripWriteTimer = 0
+        self:_computeGripModifiers()
+        self:_applyGripWrites(handle)
+    end
+end
+
+function Module:_updateSlope(handle)
+    local upY = handle.root.PrimaryPart.CFrame.UpVector.Y
+    self.slopeUpY = upY
+    self.slopeAngle = math.deg(math.acos(math.clamp(upY, -1, 1)))
+end
+
+function Module:_updateSlip(handle)
+    local maxSlip = 0
+    local speed = self:_getSpeedStuds(handle)
+    for _, w in ipairs(handle.wheels) do
+        if w.cylinder and w.physical then
+            local angular = math.abs(w.cylinder.AngularVelocity or 0)
+            local radius = w.physical.Size.Y / 2
+            local surface = angular * radius
+            local slip = math.abs(surface - speed) / math.max(speed, 1)
+            if slip > maxSlip then maxSlip = slip end
+        end
+    end
+    self.slipRatio = math.clamp(maxSlip, 0, 3)
+end
+
+function Module:_updateSpin(handle, dt)
+    local primary = handle.root.PrimaryPart
+    local vel = primary.AssemblyLinearVelocity
+    local speed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+    if speed < 5 then self.spinActive = false; return end
+    local angular = primary.AssemblyAngularVelocity
+    local yawRate = math.abs(angular.Y)
+    local expectedYaw = speed / 50
+    local spinRatio = yawRate / math.max(expectedYaw, 0.01)
+    self.spinActive = spinRatio > 3.0
+    if self.spinActive then
+        local now = os.clock()
+        if now - self.lastSpinEmit > 1.0 then
+            self.lastSpinEmit = now
+            _G.VX.bus:emit("chassis.spinDetected", { ratio = spinRatio })
+        end
+    end
+end
+
+function Module:_updateTireTemp(dt)
+    if not self.core.settings.physics.tireTempEnabled then return end
+    local handle = self.authority:getHandle()
+    if not handle then return end
+    local speed = self:_getSpeedStuds(handle)
+    local absSteer = math.abs(self.powertrain:getSmoothedThrottle())
+    local ambient = 0.2
+    for name, temp in pairs(self.tireTemp) do
+        local heat = (speed / 100) * 0.03 + (self.slipRatio * 0.05) + absSteer * 0.01
+        local cool = (temp - ambient) * 0.4
+        self.tireTemp[name] = math.clamp(temp + (heat - cool) * dt * 4, 0, 1)
+    end
+end
+
+function Module:_computeGripModifiers()
+    local settings = self.core.settings
+    local config = self.core.config
+    local handle = self.authority:getHandle()
+    local speed = self:_getSpeedStuds(handle)
+    local throttle = self.powertrain:getSmoothedThrottle()
+
+    local baseFront = settings.frontGrip or 1.0
+    local baseRear  = settings.rearGrip  or 0.9
+
+    self.downforceFront = 1.0
+    self.downforceRear = 1.0
+    if settings.physics.aeroDownforce then
+        local prof = self.profiles:current()
+        local coef = settings.physics.downforceCoefficient * (prof.downforceCoef or 0.30)
+        local speedFactor = (speed / config.downforceRefSpeed) ^ 2
+        local bonus = speedFactor * coef
+        self.downforceFront = math.clamp(1 + bonus, config.downforceClampMin, config.downforceClampMax)
+        self.downforceRear = math.clamp(1 + bonus * config.downforceRearFactor, config.downforceClampMin, config.downforceClampMax)
+    end
+
+    self.wtFront = 1.0
+    self.wtRear = 1.0
+    self.wtLeft = 1.0
+    self.wtRight = 1.0
+    if settings.physics.weightTransfer then
+        local mode = settings.weightTransferMode or "Normal"
+        local intensity = settings.weightTransferIntensity or 0.30
+        if mode == "Normal" then
+            local accelTransfer = throttle * intensity
+            self.wtFront = math.clamp(1 - accelTransfer * config.wtFrontLoss, 0.5, 1.5)
+            self.wtRear = math.clamp(1 + accelTransfer * config.wtRearGain, 0.5, 1.5)
+            local steerInput = _G.VX.Input and _G.VX.Input:getRawSteer() or 0
+            local lateralTransfer = math.abs(steerInput) * (speed / 100) * intensity * config.wtLateralCoef
+            self.wtLeft = math.clamp(1 - lateralTransfer * steerInput, 0.5, 1.5)
+            self.wtRight = math.clamp(1 + lateralTransfer * steerInput, 0.5, 1.5)
+            if self.spinActive then
+                self.wtRear = math.min(1.5, self.wtRear * 1.4)
+                self.wtFront = math.max(0.6, self.wtFront * 0.9)
+            end
+        elseif mode == "Drift" then
+            local throttleBias = (throttle > 0.5) and 1 or 0
+            local steerInput = _G.VX.Input and _G.VX.Input:getRawSteer() or 0
+            local driftFactor = math.clamp(math.abs(steerInput) * speed / 50, 0, 1)
+            self.wtFront = math.clamp(1 + (-throttle) * 0.25, 0.6, 1.4)
+            self.wtRear = math.clamp(1 - throttleBias * 0.30 * intensity - driftFactor * 0.25 * intensity + 0.10, 0.4, 1.2)
+            self.wtLeft = math.clamp(1 - steerInput * 0.15, 0.7, 1.3)
+            self.wtRight = math.clamp(1 + steerInput * 0.15, 0.7, 1.3)
+        end
+        local verticalBonus = (self.slopeAngle / 45) * config.wtVerticalCoef
+        self.wtFront = self.wtFront * (1 + verticalBonus)
+        self.wtRear = self.wtRear * (1 - verticalBonus * 0.5)
+    end
+
+    local tempFrontMul = 1.0
+    local tempRearMul = 1.0
+    if settings.physics.tireTempEnabled then
+        local avgF = (self.tireTemp.frontLeft + self.tireTemp.frontRight) / 2
+        local avgR = (self.tireTemp.backLeft + self.tireTemp.backRight) / 2
+        tempFrontMul = self:_tempGripCurve(avgF)
+        tempRearMul = self:_tempGripCurve(avgR)
+    end
+
+    self.combinedFrontGrip = baseFront * self.downforceFront * self.wtFront * tempFrontMul
+    self.combinedRearGrip = baseRear * self.downforceRear * self.wtRear * tempRearMul
+    self.combinedFrontGrip = math.clamp(self.combinedFrontGrip, 0.1, 2.5)
+    self.combinedRearGrip = math.clamp(self.combinedRearGrip, 0.1, 2.5)
+end
+
+function Module:_tempGripCurve(temp)
+    if temp < 0.3 then return 0.7 + temp end
+    if temp < 0.7 then return 1.0 end
+    return math.max(0.7, 1.0 - (temp - 0.7) * 0.5)
+end
+
+function Module:_applyGripWrites(handle)
+    for _, w in ipairs(handle.wheels) do
+        if w.physical and w.physical.Parent then
+            local target = w.isFront and self.combinedFrontGrip or self.combinedRearGrip
+            pcall(function()
+                local props = w.physical.CustomPhysicalProperties
+                local d = props and props.Density or 0.7
+                local e = props and props.Elasticity or 0.5
+                local fw = props and props.FrictionWeight or 2
+                local ew = props and props.ElasticityWeight or 1
+                local cur = props and props.Friction or 1.0
+                if math.abs(cur - target) > 0.02 then
+                    w.physical.CustomPhysicalProperties = PhysicalProperties.new(d, target, e, fw, ew)
+                end
+            end)
+        end
+    end
+end
+
+function Module:_applyAeroImpulse(handle, dt)
+    if not self.core.settings.physics.aeroDrag then return end
+    local primary = handle.root.PrimaryPart
+    if not primary then return end
+    local vel = primary.AssemblyLinearVelocity
+    local speed = vel.Magnitude
+    if speed < 5 then return end
+    local massPart = handle.mass
+    if not massPart then return end
+    local targetTop = self.core.settings.topSpeed * 0.626
+    local ratio = speed / math.max(targetTop, 1)
+    if ratio < self.core.config.dragSoftCeiling then return end
+    local prof = self.profiles:current()
+    local overshoot = (ratio - self.core.config.dragSoftCeiling) / (1 - self.core.config.dragSoftCeiling)
+    local dragForce = (prof.dragCoef or 0.0004) * speed * speed * overshoot
+    pcall(function()
+        primary:ApplyImpulse(-vel.Unit * dragForce * massPart.Mass * dt)
+    end)
+end
+
+function Module:_applyEngineBraking(handle, dt)
+    if not self.core.settings.physics.engineBraking then return end
+    if self.core.settings.coastAssist then return end
+    local throttle = self.powertrain:getSmoothedThrottle()
+    local rpm = self.powertrain:getRPM()
+    if throttle > 0.1 or throttle < -0.1 then return end
+    if rpm < self.core.config.engineBrakeMinRpm then return end
+    local primary = handle.root.PrimaryPart
+    if not primary then return end
+    local vel = primary.AssemblyLinearVelocity
+    if vel.Magnitude < 2 then return end
+    local prof = self.profiles:current()
+    local rpmFactor = math.clamp((rpm - self.core.config.engineBrakeMinRpm) / math.max(prof.redlineRPM - self.core.config.engineBrakeMinRpm, 1), 0, 1)
+    local brakeForce = math.clamp(rpmFactor * self.core.settings.physics.engineBrakingStrength, 0, self.core.config.engineBrakeMaxCoef)
+    local massPart = handle.mass
+    if not massPart then return end
+    pcall(function()
+        primary:ApplyImpulse(-vel.Unit * brakeForce * massPart.Mass * dt)
+    end)
+end
+
+function Module:_getSpeedStuds(handle)
+    if not handle or not handle.root or not handle.root.PrimaryPart then return 0 end
+    local v = handle.root.PrimaryPart.AssemblyLinearVelocity
+    return Vector3.new(v.X, 0, v.Z).Magnitude
+end
+
+function Module:getSlipRatio() return self.slipRatio end
+function Module:getSlopeAngle() return self.slopeAngle end
+function Module:getEffectiveGripFront() return self.combinedFrontGrip end
+function Module:getEffectiveGripRear() return self.combinedRearGrip end
+function Module:getWeightTransfer() return { frontMul = self.wtFront, rearMul = self.wtRear, leftMul = self.wtLeft, rightMul = self.wtRight } end
+function Module:getTireTemp(axle)
+    if axle == "front" then return (self.tireTemp.frontLeft + self.tireTemp.frontRight) / 2 end
+    if axle == "rear" then return (self.tireTemp.backLeft + self.tireTemp.backRight) / 2 end
+    return 0
+end
+
+return Module
