@@ -1,0 +1,246 @@
+--[[
+    VX_Input v3.0.2
+    Mobile pedals + steering only. No keyboard input.
+    Attribute writes removed — VehicleControls handles them (harmless).
+]]
+
+local VX = _G.VX
+if not VX or not VX.Framework then error("VX_Input requires VX_Kernel") end
+
+local Players = game:GetService("Players")
+local Player = Players.LocalPlayer
+
+local Module = VX.Framework.Module.new({
+    Name = "Input",
+    Dependencies = { "Core", "Authority", "VehicleState" },
+    Version = "3.0.2",
+})
+
+function Module:Construct()
+    self._accel      = false
+    self._brake      = false
+    self._steerLeft  = false
+    self._steerRight = false
+    self._clutch     = false
+    self._lastBoth   = false
+    self._conns = { mobile = {}, exit = {} }
+    self._attached = false
+end
+
+function Module:Init(deps)
+    self.core = deps.Core
+    self.authority = deps.Authority
+    self.state = deps.VehicleState
+end
+
+function Module:Start()
+    _G.VX.Input = self
+
+    _G.VX.bus:on("vehicle.stateChanged", function(evt)
+        if evt.to == "Ready" or evt.to == "Idle" then
+            self:_attach()
+        elseif evt.to == "Exiting" or evt.to == "Disabled" then
+            self:_detach()
+        end
+    end)
+
+    if self.state:isReady() then self:_attach() end
+
+    print("[VX] Input ready")
+end
+
+function Module:Stop()
+    self:_detach()
+    if _G.VX.Input == self then _G.VX.Input = nil end
+end
+
+function Module:heartbeat() return true end
+
+function Module:_addConn(bucket, conn)
+    if not conn then return end
+    table.insert(self._conns[bucket], conn)
+end
+
+function Module:_clearBucket(name)
+    for _, conn in ipairs(self._conns[name] or {}) do
+        pcall(function() conn:Disconnect() end)
+    end
+    self._conns[name] = {}
+end
+
+function Module:_attach()
+    if self._attached then return end
+    self._attached = true
+
+    -- Force pedals visible first (Authority does this too, redundant safety)
+    pcall(function() self.authority:_forcePedalsVisible() end)
+
+    self:_attachMobile()
+    print("[VX] Input: attached")
+end
+
+function Module:_detach()
+    if not self._attached then return end
+    self._attached = false
+    self:_clearBucket("mobile")
+    self:_clearBucket("exit")
+    self._accel = false
+    self._brake = false
+    self._steerLeft = false
+    self._steerRight = false
+    self._clutch = false
+    print("[VX] Input: detached")
+end
+
+function Module:_attachMobile()
+    task.spawn(function()
+        local gui = Player:WaitForChild("PlayerGui", 5)
+        if not gui then return end
+        local handler = gui:WaitForChild("MainGUIHandler", 5)
+        if not handler then return end
+
+        local function tryHook()
+            local vc = handler:FindFirstChild("VehicleControls")
+            if not vc then return end
+            local ctrls = vc:FindFirstChild("Controls")
+            if not ctrls then return end
+
+            local pedals   = ctrls:FindFirstChild("Pedals")
+            local steering = ctrls:FindFirstChild("Steering")
+            local buttons  = ctrls:FindFirstChild("Buttons")
+            local exitFrame = ctrls:FindFirstChild("ExitFrame")
+            local exit2    = ctrls:FindFirstChild("Exit2")
+
+            if pedals then
+                self:_hookButton(pedals:FindFirstChild("Accelerator"), "accel")
+                self:_hookButton(pedals:FindFirstChild("Brake"), "brake")
+            end
+            if steering then
+                self:_hookButton(steering:FindFirstChild("Left"), "left")
+                self:_hookButton(steering:FindFirstChild("Right"), "right")
+            end
+            if buttons then
+                self:_hookButton(buttons:FindFirstChild("Accelerator"), "accel")
+                self:_hookButton(buttons:FindFirstChild("Brake"), "brake")
+                self:_hookExit(buttons:FindFirstChild("JumpButton"))
+            end
+            if exitFrame then self:_hookExit(exitFrame:FindFirstChild("Exit")) end
+            if exit2 then self:_hookExit(exit2) end
+        end
+
+        tryHook()
+
+        -- Re-hook if VehicleControls is recreated (game sometimes rebuilds)
+        local c = handler.ChildAdded:Connect(function(child)
+            if child.Name == "VehicleControls" then
+                task.wait(0.2)
+                tryHook()
+            end
+        end)
+        self:_addConn("mobile", c)
+    end)
+end
+
+function Module:_hookButton(btn, kind)
+    if not btn then return end
+    local c1 = btn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if kind == "accel" then self:_setAccel(true)
+            elseif kind == "brake" then self:_setBrake(true)
+            elseif kind == "left" then self:_setSteerLeft(true)
+            elseif kind == "right" then self:_setSteerRight(true)
+            end
+        end
+    end)
+    local c2 = btn.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if kind == "accel" then self:_setAccel(false)
+            elseif kind == "brake" then self:_setBrake(false)
+            elseif kind == "left" then self:_setSteerLeft(false)
+            elseif kind == "right" then self:_setSteerRight(false)
+            end
+        end
+    end)
+    self:_addConn("mobile", c1)
+    self:_addConn("mobile", c2)
+end
+
+function Module:_hookExit(btn)
+    if not btn then return end
+    local c = btn.Activated:Connect(function()
+        self:_requestExit()
+    end)
+    self:_addConn("exit", c)
+end
+
+function Module:_setAccel(v)
+    if self._accel == v then return end
+    self._accel = v
+    _G.VX.bus:emit("input.throttle", { value = self:getRawThrottle() })
+    self:_checkBoth()
+end
+
+function Module:_setBrake(v)
+    if self._brake == v then return end
+    self._brake = v
+    _G.VX.bus:emit("input.brake", { value = v })
+    self:_checkBoth()
+end
+
+function Module:_setSteerLeft(v)
+    if self._steerLeft == v then return end
+    self._steerLeft = v
+    _G.VX.bus:emit("input.steer", { value = self:getRawSteer() })
+end
+
+function Module:_setSteerRight(v)
+    if self._steerRight == v then return end
+    self._steerRight = v
+    _G.VX.bus:emit("input.steer", { value = self:getRawSteer() })
+end
+
+function Module:_checkBoth()
+    local both = self._accel and self._brake
+    if both ~= self._lastBoth then
+        self._lastBoth = both
+        _G.VX.bus:emit("input.both", { pressed = both })
+    end
+end
+
+function Module:_requestExit()
+    _G.VX.bus:emit("input.exit", {})
+    local char = Player.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then hum.Sit = false end
+    end
+end
+
+function Module:getRawThrottle()
+    local settings = _G.VX.settings
+    if self._clutch then return 0 end
+    if self._accel and self._brake then return 0 end
+    if self._accel then return 1 end
+    if self._brake then return -(settings.brakingPower or 0.75) end
+    return 0
+end
+
+function Module:getRawSteer()
+    if self._steerLeft and not self._steerRight then return -1 end
+    if self._steerRight and not self._steerLeft then return 1 end
+    return 0
+end
+
+function Module:isAccelHeld() return self._accel end
+function Module:isBrakeHeld() return self._brake end
+function Module:isClutchHeld() return self._clutch end
+function Module:isBothPedalsHeld() return self._accel and self._brake end
+
+function Module:toggleClutch()
+    self._clutch = not self._clutch
+    _G.VX.bus:emit("input.clutch", { value = self._clutch })
+end
+
+return Module
