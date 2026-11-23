@@ -1,0 +1,394 @@
+--[[
+    VX_Profiles v3.0.0
+    Engine profile data with torque curves, diff types, shift strategies.
+
+    Depends on: Core
+    Exposes:
+      get(index)              → profile table
+      current()               → active profile
+      setCurrent(index)       → switch (persists)
+      getAll()                → array
+      getTorqueCurveFor(p)    → torque curve array
+      getTorqueAtRPM(p, rpm)  → interpolated torque factor
+
+    Registers:
+      settings.engineProfile  (enum with profile names)
+      events "profiles.changed"
+]]
+
+local VX = _G.VX
+if not VX or not VX.Framework then error("VX_Profiles requires VX_Kernel") end
+
+local Module = VX.Framework.Module.new({
+    Name = "Profiles",
+    Dependencies = { "Core" },
+    Version = "3.0.0",
+})
+
+-- ==================== TORQUE CURVES ====================
+-- Each curve: array of { rpm, torqueFactor } sorted by RPM ascending.
+local TORQUE_CURVES = {
+    default = {
+        { 1000, 0.55 }, { 2000, 0.75 }, { 3500, 0.95 },
+        { 4500, 1.00 }, { 5500, 0.98 }, { 7000, 0.90 },
+        { 8000, 0.72 }, { 8500, 0.60 },
+    },
+    turbo_flat = {
+        { 1000, 0.40 }, { 2000, 0.60 }, { 3000, 0.85 },
+        { 4000, 1.05 }, { 5000, 1.10 }, { 6000, 1.05 },
+        { 7000, 0.95 }, { 8000, 0.75 },
+    },
+    na_v12 = {
+        { 1000, 0.45 }, { 2000, 0.65 }, { 3500, 0.85 },
+        { 5000, 0.98 }, { 6000, 1.02 }, { 7000, 1.00 },
+        { 8000, 0.92 }, { 8800, 0.78 },
+    },
+    high_rev = {
+        { 1200, 0.35 }, { 2500, 0.55 }, { 4000, 0.78 },
+        { 5500, 0.95 }, { 7000, 1.05 }, { 8500, 1.05 },
+        { 10000, 0.92 }, { 11000, 0.75 },
+    },
+    na_high = {
+        { 1000, 0.42 }, { 2000, 0.62 }, { 3500, 0.82 },
+        { 5000, 0.95 }, { 6500, 1.05 }, { 7500, 1.00 },
+        { 8200, 0.85 }, { 8600, 0.70 },
+    },
+}
+
+-- ==================== PROFILES ====================
+local PROFILES = {
+    {
+        name = "Default",
+        soundId = "128279981806309",
+        refRpm = 3500,
+        idleRPM = 900, maxRPM = 8500, redlineRPM = 8200,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.0,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "default",
+        differential = "open",
+        shiftStrategy = "automatic",
+        revLimiterType = "hard",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3500,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.25, dragCoef = 0.0004,
+        weightKg = 1500,
+        brakeBiasDefault = 0.65,
+    },
+    {
+        name = "McLaren F1",
+        soundId = "89427678123759",
+        refRpm = 3500,
+        idleRPM = 800, maxRPM = 7800, redlineRPM = 7500,
+        volumeMultiplier = 3.0,
+        rpmRiseMultiplier = 1.2,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "na_high",
+        differential = "lsd",
+        shiftStrategy = "sport",
+        revLimiterType = "hard",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3200,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.35, dragCoef = 0.0003,
+        weightKg = 1138,
+        brakeBiasDefault = 0.62,
+    },
+    {
+        name = "Huracan",
+        soundId = "103566671541178",
+        refRpm = 3500,
+        idleRPM = 800, maxRPM = 8500, redlineRPM = 8200,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.3,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "na_v12",
+        differential = "lsd",
+        shiftStrategy = "sport",
+        revLimiterType = "ignition",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3400,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.30, dragCoef = 0.0004,
+        weightKg = 1422,
+        brakeBiasDefault = 0.65,
+    },
+    {
+        name = "Huracan 2",
+        soundId = "80652339555077",
+        refRpm = 3500,
+        idleRPM = 800, maxRPM = 8500, redlineRPM = 8200,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.3,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "na_v12",
+        differential = "lsd",
+        shiftStrategy = "sport",
+        revLimiterType = "ignition",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3400,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.30, dragCoef = 0.0004,
+        weightKg = 1422,
+        brakeBiasDefault = 0.65,
+    },
+    {
+        name = "Aventador",
+        soundId = "80692873028903",
+        refRpm = 3500,
+        idleRPM = 800, maxRPM = 8000, redlineRPM = 7800,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.4,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "na_v12",
+        differential = "lsd",
+        shiftStrategy = "race",
+        revLimiterType = "ignition",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3600,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.32, dragCoef = 0.0004,
+        weightKg = 1575,
+        brakeBiasDefault = 0.66,
+    },
+    {
+        name = "Koenigsegg",
+        soundId = "123655450845901",
+        refRpm = 3500,
+        idleRPM = 800, maxRPM = 8000, redlineRPM = 7500,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.3,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "turbo_flat",
+        differential = "lsd",
+        shiftStrategy = "race",
+        revLimiterType = "soft",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3800,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.38, dragCoef = 0.0003,
+        weightKg = 1360,
+        brakeBiasDefault = 0.68,
+    },
+    {
+        name = "McLaren",
+        soundId = "5856728701",
+        refRpm = 3500,
+        idleRPM = 800, maxRPM = 7800, redlineRPM = 7500,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.3,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "turbo_flat",
+        differential = "lsd",
+        shiftStrategy = "sport",
+        revLimiterType = "hard",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3200,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.35, dragCoef = 0.0003,
+        weightKg = 1300,
+        brakeBiasDefault = 0.62,
+    },
+    {
+        name = "Valkyrie",
+        soundId = "9091845802",
+        refRpm = 5000,
+        idleRPM = 1200, maxRPM = 11100, redlineRPM = 10800,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.7,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {30,60,90,120,150,180,210},
+        torqueCurve = "high_rev",
+        differential = "lsd",
+        shiftStrategy = "race",
+        revLimiterType = "ignition",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = false, turboSpoolRPM = 4000,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.45, dragCoef = 0.0003,
+        weightKg = 1030,
+        brakeBiasDefault = 0.70,
+    },
+    {
+        name = "Zonda",
+        soundId = "110865384780538",
+        refRpm = 7006,
+        idleRPM = 900, maxRPM = 8500, redlineRPM = 8200,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.5,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "na_high",
+        differential = "lsd",
+        shiftStrategy = "sport",
+        revLimiterType = "ignition",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = false, turboSpoolRPM = 4500,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.35, dragCoef = 0.0004,
+        weightKg = 1070,
+        brakeBiasDefault = 0.66,
+    },
+    {
+        name = "Race",
+        soundId = "128279981806309",
+        refRpm = 4500,
+        idleRPM = 1000, maxRPM = 9000, redlineRPM = 8700,
+        volumeMultiplier = 1.2,
+        rpmRiseMultiplier = 2.0,
+        gearRatios = {3.60,2.10,1.50,1.15,0.90,0.75,0.62},
+        speedThresholds = {30,55,80,105,130,155,180},
+        torqueCurve = "high_rev",
+        differential = "locked",
+        shiftStrategy = "race",
+        revLimiterType = "ignition",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3000,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0.10,
+        downforceCoef = 0.55, dragCoef = 0.00035,
+        weightKg = 900,
+        brakeBiasDefault = 0.70,
+    },
+}
+
+-- ==================== LIFECYCLE ====================
+function Module:Construct()
+    self.list = PROFILES
+    self._currentIndex = 1
+end
+
+function Module:Init(deps)
+    -- Register engineProfile enum with actual labels
+    local labels = {}
+    for i, p in ipairs(PROFILES) do labels[i] = p.name end
+
+    pcall(function()
+        _G.VX.registry:set("settings", "engineProfile", {
+            type = "number_stepped",
+            default = 1, min = 1, max = #PROFILES, step = 1,
+            category = "Engine",
+            label = "Engine Profile",
+            enumLabels = labels,
+            description = "Changes engine sound, gear ratios, torque curve",
+        }, "Profiles")
+    end)
+
+    -- Pick active
+    local idx = _G.VX.settings.engineProfile or 1
+    if not PROFILES[idx] then
+        idx = 1
+        _G.VX.settings.engineProfile = 1
+    end
+    self._currentIndex = idx
+end
+
+function Module:Start()
+    -- React to profile changes
+    _G.VX.bus:on("settings.changed", function(evt)
+        if evt and evt.path == "engineProfile" and PROFILES[evt.new] then
+            self._currentIndex = evt.new
+            _G.VX.bus:emit("profiles.changed", {
+                index = evt.new,
+                profile = PROFILES[evt.new],
+            })
+        end
+    end)
+    print("[VX] Profiles loaded: " .. #PROFILES .. " available")
+end
+
+function Module:Stop() end
+function Module:heartbeat() return true end
+
+-- ==================== API ====================
+function Module:get(index)
+    return PROFILES[index or self._currentIndex] or PROFILES[1]
+end
+
+function Module:current()
+    return self:get(self._currentIndex)
+end
+
+function Module:setCurrent(index)
+    if not PROFILES[index] then return false end
+    _G.VX.setSetting("engineProfile", index)
+    return true
+end
+
+function Module:getAll()
+    return PROFILES
+end
+
+function Module:getCurrentIndex()
+    return self._currentIndex
+end
+
+-- ==================== TORQUE CURVE ====================
+function Module:getTorqueCurveFor(profile)
+    local key = profile and profile.torqueCurve or "default"
+    return TORQUE_CURVES[key] or TORQUE_CURVES.default
+end
+
+function Module:getTorqueAtRPM(profile, rpm)
+    local curve = self:getTorqueCurveFor(profile)
+    if #curve == 0 then return 0.70 end
+    if rpm <= curve[1][1] then return curve[1][2] end
+    if rpm >= curve[#curve][1] then return curve[#curve][2] end
+    for i = 1, #curve - 1 do
+        local a, b = curve[i], curve[i + 1]
+        if rpm >= a[1] and rpm <= b[1] then
+            local t = (rpm - a[1]) / (b[1] - a[1])
+            return a[2] + (b[2] - a[2]) * t
+        end
+    end
+    return 0.70
+end
+
+return Module
