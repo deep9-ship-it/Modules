@@ -1,6 +1,6 @@
 --[[
     VX_Panel.lua — Left-Side GT3 Tuning Panel (All 45 Settings Across 5 Tabs)
-    Version: 3.3.0
+    Version: 3.3.1
 ]]
 
 local VX = _G.VX
@@ -9,24 +9,28 @@ if not VX or not VX.Framework then
 end
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 
 local Module = VX.Framework.Module.new({
     Name = "Panel",
     Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "UI" },
-    Version = "3.3.0",
+    Version = "3.3.1",
 })
 
 local C = {
     bg = Color3.fromRGB(13, 15, 21),
-    panel = Color3.fromRGB(20, 23, 32),
-    row = Color3.fromRGB(27, 31, 43),
+    panel = Color3.fromRGB(20, 24, 34),
+    row = Color3.fromRGB(27, 32, 45),
+    rowAlt = Color3.fromRGB(34, 40, 56),
     accent = Color3.fromRGB(0, 190, 255),
-    green = Color3.fromRGB(70, 220, 120),
-    amber = Color3.fromRGB(255, 180, 50),
-    text = Color3.fromRGB(240, 244, 250),
-    muted = Color3.fromRGB(140, 150, 170),
+    green = Color3.fromRGB(68, 222, 122),
+    amber = Color3.fromRGB(255, 185, 48),
+    red = Color3.fromRGB(255, 72, 72),
+    text = Color3.fromRGB(242, 246, 252),
+    muted = Color3.fromRGB(135, 146, 168),
+    border = Color3.fromRGB(48, 56, 76),
 }
 
 local TABS = { "Dynamics", "Engine", "Audio", "Visuals", "System" }
@@ -35,14 +39,16 @@ local function _corner(parent, r)
     local c = Instance.new("UICorner")
     c.CornerRadius = UDim.new(0, r or 8)
     c.Parent = parent
+    return c
 end
 
-local function _stroke(parent, col, trans)
+local function _stroke(parent, col, trans, thickness)
     local s = Instance.new("UIStroke")
-    s.Color = col or C.accent
-    s.Transparency = trans or 0.72
-    s.Thickness = 1
+    s.Color = col or C.border
+    s.Transparency = trans or 0.55
+    s.Thickness = thickness or 1
     s.Parent = parent
+    return s
 end
 
 function Module:_trackConn(conn)
@@ -61,16 +67,30 @@ function Module:_clearConns()
     self._conns = {}
 end
 
+function Module:_getSpeed()
+    local auth = _G.VX.Authority
+    local root = auth and auth:getRoot()
+    if root and root.PrimaryPart then
+        local raw = root.PrimaryPart.AssemblyLinearVelocity.Magnitude
+        local units = _G.VX.getSetting and _G.VX.getSetting("ui.units") or "KMH"
+        return (units == "MPH") and (raw * 0.389) or (raw * 0.626), units
+    end
+    return 0, (_G.VX.getSetting and _G.VX.getSetting("ui.units") or "KMH")
+end
+
 function Module:Construct()
     self._conns = {}
     self._gui = nil
     self._panel = nil
     self._toggleBtn = nil
     self._scroll = nil
+    self._sysInfoLbl = nil
     self._isOpen = false
     self._activeTab = "Dynamics"
     self._tabBtns = {}
+    self._profileCards = {}
     self._rowUpdaters = {}
+    self._lastSysUpdate = 0
 end
 
 function Module:Init(deps)
@@ -93,8 +113,23 @@ function Module:Start()
     end))
 
     self:_trackConn(_G.VX.bus:on("profiles.changed", function()
-        if self._activeTab == "Engine" or self._activeTab == "System" then
-            self:_switchTab(self._activeTab)
+        self:_refreshProfileCards()
+    end))
+
+    self:_trackConn(UserInputService.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.KeyCode == Enum.KeyCode.F5 then
+            self:toggle()
+        end
+    end))
+
+    self:_trackConn(RunService.Heartbeat:Connect(function()
+        if self._isOpen and self._activeTab == "System" and self._sysInfoLbl then
+            local now = os.clock()
+            if now - self._lastSysUpdate >= 0.3 then
+                self._lastSysUpdate = now
+                self:_refreshSystemCard()
+            end
         end
     end))
 end
@@ -103,6 +138,46 @@ function Module:setHidden(hidden)
     if self._gui then
         self._gui.Enabled = not hidden
     end
+end
+
+function Module:_refreshAllRows()
+    for _, fn in pairs(self._rowUpdaters) do
+        pcall(fn)
+    end
+    self:_refreshProfileCards()
+end
+
+function Module:_refreshProfileCards()
+    local activeIdx = self.profiles:getCurrentIndex()
+    for idx, card in pairs(self._profileCards) do
+        if card and card.btn and card.btn.Parent then
+            local sel = (idx == activeIdx)
+            card.btn.BackgroundColor3 = sel and C.accent or C.row
+            card.nameLbl.TextColor3 = sel and C.bg or C.text
+            card.subLbl.TextColor3 = sel and C.bg or C.muted
+        end
+    end
+end
+
+function Module:_refreshSystemCard()
+    if not self._sysInfoLbl or not self._sysInfoLbl.Parent then return end
+    local vs = _G.VX.Modules and _G.VX.Modules.VehicleState
+    local st = vs and vs:getState() or "Unknown"
+    local spd, units = self:_getSpeed()
+    local prof = self.profiles:current()
+    local status = _G.VX.getStatus and _G.VX.getStatus()
+    local modCount = (status and status.modules) and #status.modules or 0
+    self._sysInfoLbl.Text = string.format(
+        "Kernel v%s  |  Modules: %d\nState: %s  |  Speed: %.0f %s\nRPM: %d  |  Gear: %s\nActive Profile: %s",
+        tostring(_G.VX.Version),
+        modCount,
+        st,
+        spd,
+        units,
+        math.floor(self.powertrain.rpm or 0),
+        (self.powertrain.gear == -1) and "R" or ((self.powertrain.gear == 0) and "N" or tostring(self.powertrain.gear or 1)),
+        prof and prof.name or "Default"
+    )
 end
 
 function Module:_createPanel()
@@ -122,53 +197,53 @@ function Module:_createPanel()
     gui.Parent = pg
     self._gui = gui
 
-    -- LEFT-SIDE TOGGLE HANDLE
+    -- LEFT-SIDE TOGGLE BUTTON
     local btn = Instance.new("TextButton")
     btn.Name = "ToggleBtn"
     btn.Size = UDim2.new(0, 44, 0, 44)
     btn.AnchorPoint = Vector2.new(0, 0.5)
     btn.Position = UDim2.new(0, 14, 0.5, 0)
     btn.BackgroundColor3 = C.bg
-    btn.BackgroundTransparency = 0.1
+    btn.BackgroundTransparency = 0.08
     btn.Font = Enum.Font.GothamBlack
     btn.TextSize = 14
     btn.TextColor3 = C.accent
     btn.Text = "VX"
     btn.Parent = gui
     _corner(btn, 10)
-    _stroke(btn, C.accent, 0.35)
+    _stroke(btn, C.accent, 0.35, 1.2)
     self._toggleBtn = btn
     self:_trackConn(btn.MouseButton1Click:Connect(function() self:toggle() end))
 
-    -- LEFT-SIDE SLIDING MENU
+    -- LEFT-SIDE SLIDING PANEL
     local panel = Instance.new("Frame")
     panel.Name = "MainPanel"
-    panel.Size = UDim2.new(0, 344, 0.82, 0)
+    panel.Size = UDim2.new(0, 348, 0.84, 0)
     panel.AnchorPoint = Vector2.new(0, 0.5)
-    panel.Position = UDim2.new(0, -364, 0.5, 0)
+    panel.Position = UDim2.new(0, -368, 0.5, 0)
     panel.BackgroundColor3 = C.bg
-    panel.BackgroundTransparency = 0.06
+    panel.BackgroundTransparency = 0.05
     panel.Visible = false
     panel.Parent = gui
     _corner(panel, 12)
-    _stroke(panel, C.accent, 0.5)
+    _stroke(panel, C.accent, 0.45, 1.2)
     self._panel = panel
 
     local sizeConstraint = Instance.new("UISizeConstraint")
     sizeConstraint.MinSize = Vector2.new(320, 360)
-    sizeConstraint.MaxSize = Vector2.new(360, 560)
+    sizeConstraint.MaxSize = Vector2.new(364, 580)
     sizeConstraint.Parent = panel
 
     -- Header
     local header = Instance.new("Frame")
-    header.Size = UDim2.new(1, 0, 0, 40)
+    header.Size = UDim2.new(1, 0, 0, 42)
     header.BackgroundColor3 = C.panel
     header.BorderSizePixel = 0
     header.Parent = panel
     _corner(header, 12)
 
     local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -50, 1, 0)
+    title.Size = UDim2.new(1, -90, 1, 0)
     title.Position = UDim2.new(0, 14, 0, 0)
     title.BackgroundTransparency = 1
     title.Font = Enum.Font.GothamBlack
@@ -178,9 +253,20 @@ function Module:_createPanel()
     title.Text = "VX // GT3 TUNING"
     title.Parent = header
 
+    local hint = Instance.new("TextLabel")
+    hint.Size = UDim2.new(0, 36, 0, 20)
+    hint.Position = UDim2.new(1, -76, 0, 11)
+    hint.BackgroundColor3 = C.row
+    hint.Font = Enum.Font.GothamBold
+    hint.TextSize = 10
+    hint.TextColor3 = C.muted
+    hint.Text = "F5"
+    hint.Parent = header
+    _corner(hint, 4)
+
     local closeBtn = Instance.new("TextButton")
     closeBtn.Size = UDim2.new(0, 28, 0, 28)
-    closeBtn.Position = UDim2.new(1, -34, 0, 6)
+    closeBtn.Position = UDim2.new(1, -34, 0, 7)
     closeBtn.BackgroundColor3 = C.row
     closeBtn.Font = Enum.Font.GothamBold
     closeBtn.TextSize = 13
@@ -190,10 +276,10 @@ function Module:_createPanel()
     _corner(closeBtn, 6)
     self:_trackConn(closeBtn.MouseButton1Click:Connect(function() self:close() end))
 
-    -- Tabs Row
+    -- Tab Bar
     local tabBar = Instance.new("Frame")
     tabBar.Size = UDim2.new(1, -16, 0, 30)
-    tabBar.Position = UDim2.new(0, 8, 0, 46)
+    tabBar.Position = UDim2.new(0, 8, 0, 48)
     tabBar.BackgroundTransparency = 1
     tabBar.Parent = panel
 
@@ -218,10 +304,10 @@ function Module:_createPanel()
         end))
     end
 
-    -- Scroll Content
+    -- Content Scroll
     local scroll = Instance.new("ScrollingFrame")
-    scroll.Size = UDim2.new(1, -16, 1, -130)
-    scroll.Position = UDim2.new(0, 8, 0, 82)
+    scroll.Size = UDim2.new(1, -16, 1, -134)
+    scroll.Position = UDim2.new(0, 8, 0, 84)
     scroll.BackgroundTransparency = 1
     scroll.ScrollBarThickness = 4
     scroll.ScrollBarImageColor3 = C.accent
@@ -232,12 +318,21 @@ function Module:_createPanel()
     local list = Instance.new("UIListLayout")
     list.Padding = UDim.new(0, 6)
     list.Parent = scroll
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingRight = UDim.new(0, 4)
+    pad.PaddingBottom = UDim.new(0, 6)
+    pad.Parent = scroll
     self._scroll = scroll
 
-    -- Footer
+    self:_createFooter(panel)
+    self:_switchTab("Dynamics")
+end
+
+function Module:_createFooter(panel)
     local footer = Instance.new("Frame")
-    footer.Size = UDim2.new(1, -16, 0, 34)
-    footer.Position = UDim2.new(0, 8, 1, -42)
+    footer.Size = UDim2.new(1, -16, 0, 36)
+    footer.Position = UDim2.new(0, 8, 1, -44)
     footer.BackgroundTransparency = 1
     footer.Parent = panel
 
@@ -255,8 +350,8 @@ function Module:_createPanel()
         b.TextColor3 = col
         b.Text = text
         b.Parent = footer
-        _corner(b, 6)
-        _stroke(b, col, 0.55)
+        _corner(b, 7)
+        _stroke(b, col, 0.5)
         self:_trackConn(b.MouseButton1Click:Connect(fn))
     end
 
@@ -268,418 +363,17 @@ function Module:_createPanel()
     footerBtn("Load", C.accent, function()
         if self.profiles:loadPreset("Custom1") then
             self.ui:notify("Preset", "Loaded Custom1", C.accent, 2)
-            self:_switchTab(self._activeTab)
+            self:_refreshAllRows()
+        else
+            self.ui:notify("Preset", "No Custom1 preset saved", C.amber, 2)
         end
     end)
     footerBtn("Reset All", C.amber, function()
         _G.VX.resetAll()
-        self.ui:notify("System", "All settings reset", C.amber, 2)
-        self:_switchTab(self._activeTab)
+        self.ui:notify("System", "All settings reset to defaults", C.amber, 2)
+        self:_refreshAllRows()
     end)
-
-    self:_switchTab("Dynamics")
 end
 
 function Module:open()
-    if not self._panel then return end
-    self._isOpen = true
-    self._panel.Visible = true
-    TweenService:Create(self._panel, TweenInfo.new(0.24, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-        Position = UDim2.new(0, 14, 0.5, 0),
-    }):Play()
-    if self._toggleBtn then
-        TweenService:Create(self._toggleBtn, TweenInfo.new(0.24, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-            Position = UDim2.new(0, 366, 0.5, 0),
-        }):Play()
-    end
-end
-
-function Module:close()
-    if not self._panel then return end
-    self._isOpen = false
-    local tw = TweenService:Create(self._panel, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
-        Position = UDim2.new(0, -364, 0.5, 0),
-    })
-    tw:Play()
-    if self._toggleBtn then
-        TweenService:Create(self._toggleBtn, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
-            Position = UDim2.new(0, 14, 0.5, 0),
-        }):Play()
-    end
-    tw.Completed:Once(function()
-        if not self._isOpen and self._panel then
-            self._panel.Visible = false
-        end
-    end)
-end
-
-function Module:toggle()
-    if self._isOpen then self:close() else self:open() end
-end
-
-function Module:_switchTab(tabName)
-    self._activeTab = tabName
-    self._rowUpdaters = {}
-
-    for name, b in pairs(self._tabBtns) do
-        local sel = (name == tabName)
-        b.BackgroundColor3 = sel and C.accent or C.row
-        b.TextColor3 = sel and C.bg or C.muted
-    end
-
-    for _, child in ipairs(self._scroll:GetChildren()) do
-        if not child:IsA("UIListLayout") then
-            child:Destroy()
-        end
-    end
-
-    if tabName == "Dynamics" then
-        self:_buildDynamics()
-    elseif tabName == "Engine" then
-        self:_buildEngine()
-    elseif tabName == "Audio" then
-        self:_buildAudio()
-    elseif tabName == "Visuals" then
-        self:_buildVisuals()
-    elseif tabName == "System" then
-        self:_buildSystem()
-    end
-end
-
-function Module:_addSection(title)
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, 0, 0, 20)
-    lbl.BackgroundTransparency = 1
-    lbl.Font = Enum.Font.GothamBold
-    lbl.TextSize = 11
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.TextColor3 = C.accent
-    lbl.Text = string.upper(title)
-    lbl.Parent = self._scroll
-end
-
-function Module:_addButtonRow(text, col, fn)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, 0, 0, 32)
-    btn.BackgroundColor3 = C.row
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 12
-    btn.TextColor3 = col or C.accent
-    btn.Text = text
-    btn.Parent = self._scroll
-    _corner(btn, 6)
-    _stroke(btn, col or C.accent, 0.6)
-    self:_trackConn(btn.MouseButton1Click:Connect(fn))
-end
-
-function Module:_addSettingRow(path)
-    local reg = _G.VX.registry and _G.VX.registry:get("settings", path)
-    local schema = reg and reg.schema or reg
-    if not schema then return end
-
-    local cur = _G.VX.getSetting(path)
-    if cur == nil then cur = schema.default end
-
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, (schema.type == "float" or schema.type == "int") and 52 or 36)
-    row.BackgroundColor3 = C.row
-    row.Parent = self._scroll
-    _corner(row, 6)
-
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(0.6, -8, 0, 22)
-    lbl.Position = UDim2.new(0, 10, 0, (schema.type == "boolean" or schema.type == "enum") and 7 or 4)
-    lbl.BackgroundTransparency = 1
-    lbl.Font = Enum.Font.GothamSemibold
-    lbl.TextSize = 12
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.TextColor3 = C.text
-    lbl.Text = schema.label or path
-    lbl.Parent = row
-
-    if schema.type == "boolean" then
-        local pill = Instance.new("TextButton")
-        pill.Size = UDim2.new(0, 56, 0, 22)
-        pill.Position = UDim2.new(1, -66, 0, 7)
-        pill.Font = Enum.Font.GothamBold
-        pill.TextSize = 11
-        pill.Parent = row
-        _corner(pill, 11)
-
-        local function sync()
-            local v = _G.VX.getSetting(path) == true
-            pill.BackgroundColor3 = v and C.green or C.panel
-            pill.TextColor3 = v and C.bg or C.muted
-            pill.Text = v and "ON" or "OFF"
-        end
-        sync()
-        self._rowUpdaters[path] = sync
-
-        self:_trackConn(pill.MouseButton1Click:Connect(function()
-            _G.VX.setSetting(path, not (_G.VX.getSetting(path) == true))
-            sync()
-        end))
-
-    elseif schema.type == "enum" and schema.options then
-        local holder = Instance.new("Frame")
-        holder.Size = UDim2.new(0.45, -10, 0, 24)
-        holder.Position = UDim2.new(0.55, 0, 0, 6)
-        holder.BackgroundTransparency = 1
-        holder.Parent = row
-
-        local hl = Instance.new("UIListLayout")
-        hl.FillDirection = Enum.FillDirection.Horizontal
-        hl.HorizontalAlignment = Enum.HorizontalAlignment.Right
-        hl.Padding = UDim.new(0, 4)
-        hl.Parent = holder
-
-        local btns = {}
-        for _, opt in ipairs(schema.options) do
-            local b = Instance.new("TextButton")
-            b.Size = UDim2.new(0, math.max(36, math.floor(132 / #schema.options)), 1, 0)
-            b.Font = Enum.Font.GothamBold
-            b.TextSize = 10
-            b.Text = tostring(opt)
-            b.Parent = holder
-            _corner(b, 5)
-            btns[opt] = b
-            self:_trackConn(b.MouseButton1Click:Connect(function()
-                _G.VX.setSetting(path, opt)
-            end))
-        end
-
-        local function sync()
-            local v = _G.VX.getSetting(path)
-            for opt, b in pairs(btns) do
-                local active = (v == opt)
-                b.BackgroundColor3 = active and C.accent or C.panel
-                b.TextColor3 = active and C.bg or C.muted
-            end
-        end
-        sync()
-        self._rowUpdaters[path] = sync
-
-    elseif schema.type == "int" and schema.enumLabels then
-        local minV = schema.min or 0
-        local maxV = schema.max or (#schema.enumLabels - 1)
-        row.Size = UDim2.new(1, 0, 0, 38)
-
-        local valBtn = Instance.new("TextButton")
-        valBtn.Size = UDim2.new(0.42, -10, 0, 24)
-        valBtn.Position = UDim2.new(0.58, 0, 0, 7)
-        valBtn.BackgroundColor3 = C.panel
-        valBtn.Font = Enum.Font.GothamBold
-        valBtn.TextSize = 11
-        valBtn.TextColor3 = C.accent
-        valBtn.Parent = row
-        _corner(valBtn, 6)
-
-        local function sync()
-            local v = math.clamp(math.floor(_G.VX.getSetting(path) or minV), minV, maxV)
-            local labelIdx = v - minV + 1
-            valBtn.Text = schema.enumLabels[labelIdx] or tostring(v)
-        end
-        sync()
-        self._rowUpdaters[path] = sync
-
-        self:_trackConn(valBtn.MouseButton1Click:Connect(function()
-            local v = math.floor(_G.VX.getSetting(path) or minV) + 1
-            if v > maxV then v = minV end
-            _G.VX.setSetting(path, v)
-            sync()
-        end))
-
-    elseif schema.type == "float" or schema.type == "int" then
-        local minV = schema.min or 0
-        local maxV = schema.max or 1
-        local step = schema.step or (schema.type == "int" and 1 or 0.05)
-
-        local valLbl = Instance.new("TextLabel")
-        valLbl.Size = UDim2.new(0.35, -10, 0, 20)
-        valLbl.Position = UDim2.new(0.65, 0, 0, 4)
-        valLbl.BackgroundTransparency = 1
-        valLbl.Font = Enum.Font.GothamBold
-        valLbl.TextSize = 11
-        valLbl.TextXAlignment = Enum.TextXAlignment.Right
-        valLbl.TextColor3 = C.accent
-        valLbl.Parent = row
-
-        local track = Instance.new("Frame")
-        track.Size = UDim2.new(1, -20, 0, 8)
-        track.Position = UDim2.new(0, 10, 0, 32)
-        track.BackgroundColor3 = C.panel
-        track.Parent = row
-        _corner(track, 4)
-
-        local fill = Instance.new("Frame")
-        fill.BackgroundColor3 = C.accent
-        fill.Size = UDim2.new(0, 0, 1, 0)
-        fill.Parent = track
-        _corner(fill, 4)
-
-        local function sync()
-            local v = tonumber(_G.VX.getSetting(path)) or minV
-            local pct = math.clamp((v - minV) / math.max(0.0001, maxV - minV), 0, 1)
-            fill.Size = UDim2.new(pct, 0, 1, 0)
-            valLbl.Text = (schema.type == "int") and string.format("%d", math.floor(v + 0.5)) or string.format("%.2f", v)
-        end
-        sync()
-        self._rowUpdaters[path] = sync
-
-        local dragging = false
-        local function applyX(x)
-            local rel = math.clamp((x - track.AbsolutePosition.X) / math.max(1, track.AbsoluteSize.X), 0, 1)
-            local raw = minV + rel * (maxV - minV)
-            local snapped = math.clamp(math.floor(raw / step + 0.5) * step, minV, maxV)
-            if schema.type == "int" then snapped = math.floor(snapped + 0.5) end
-            _G.VX.setSetting(path, snapped)
-            sync()
-        end
-
-        self:_trackConn(track.InputBegan:Connect(function(inp)
-            if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-                dragging = true
-                applyX(inp.Position.X)
-            end
-        end))
-        self:_trackConn(UserInputService.InputChanged:Connect(function(inp)
-            if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
-                applyX(inp.Position.X)
-            end
-        end))
-        self:_trackConn(UserInputService.InputEnded:Connect(function(inp)
-            if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
-                dragging = false
-            end
-        end))
-    end
-end
-
-function Module:_buildDynamics()
-    self:_addSection("Drivetrain & Balance")
-    self:_addSettingRow("drivetrain")
-    self:_addSettingRow("physics.driveMode")
-    self:_addSettingRow("frontGrip")
-    self:_addSettingRow("rearGrip")
-    self:_addSettingRow("physics.aeroDownforce")
-    self:_addSettingRow("steeringSensitivity")
-    self:_addSettingRow("brakingPower")
-    self:_addSettingRow("physicsTiltLevel")
-
-    self:_addSection("Assists & Chassis Simulation")
-    self:_addSettingRow("physics.tractionControl")
-    self:_addSettingRow("physics.abs")
-    self:_addSettingRow("physics.tireTemp")
-    self:_addSettingRow("physics.brakeFade")
-    self:_addSettingRow("physics.slopeLoad")
-    self:_addSettingRow("physics.engineBraking")
-end
-
-function Module:_buildEngine()
-    self:_addSection("Engine Profile")
-
-    local grid = Instance.new("Frame")
-    grid.Size = UDim2.new(1, 0, 0, 168)
-    grid.BackgroundTransparency = 1
-    grid.Parent = self._scroll
-
-    local gl = Instance.new("UIGridLayout")
-    gl.CellSize = UDim2.new(0.5, -3, 0, 28)
-    gl.CellPadding = UDim2.new(0, 6, 0, 6)
-    gl.Parent = grid
-
-    local activeIdx = self.profiles:getCurrentIndex()
-    for i, prof in ipairs(self.profiles:getAll()) do
-        local b = Instance.new("TextButton")
-        local sel = (i == activeIdx)
-        b.BackgroundColor3 = sel and C.accent or C.row
-        b.Font = Enum.Font.GothamBold
-        b.TextSize = 11
-        b.TextColor3 = sel and C.bg or C.text
-        b.Text = prof.name
-        b.Parent = grid
-        _corner(b, 6)
-        self:_trackConn(b.MouseButton1Click:Connect(function()
-            self.profiles:setCurrent(i)
-        end))
-    end
-
-    self:_addSection("Forced Induction")
-    self:_addSettingRow("turboStage")
-
-    self:_addSection("Transmission & Launch")
-    self:_addSettingRow("physics.realisticShifting")
-    self:_addSettingRow("physics.shiftDelay")
-    self:_addSettingRow("physics.revLimiter")
-    self:_addSettingRow("physics.launchControl")
-    self:_addSettingRow("physics.launchTargetRPM")
-    self:_addSettingRow("physics.twostep")
-    self:_addSettingRow("physics.coldStart")
-    self:_addSettingRow("physics.idleHunting")
-    self:_addButtonRow("Trigger Cold Start", C.amber, function()
-        self.powertrain:triggerColdStart()
-    end)
-end
-
-function Module:_buildAudio()
-    self:_addSection("Gain & Pitch")
-    self:_addSettingRow("masterVolume")
-    self:_addSettingRow("engineBoost")
-    self:_addSettingRow("audio.volumeBoost")
-    self:_addSettingRow("pitchOffset")
-
-    self:_addSection("Effects")
-    self:_addSettingRow("audio.compressor")
-    self:_addSettingRow("audio.turboSpool")
-    self:_addSettingRow("audio.shiftSounds")
-    self:_addSettingRow("audio.backfires")
-    self:_addSettingRow("audio.exhaustPops")
-end
-
-function Module:_buildVisuals()
-    self:_addSection("Camera & Vehicle Effects")
-    self:_addSettingRow("visuals.cameraFOV")
-    self:_addSettingRow("visuals.cameraVibration")
-    self:_addSettingRow("visuals.bodyTilt")
-    self:_addSettingRow("visuals.exhaustFlames")
-
-    self:_addSection("HUD Overlays")
-    self:_addSettingRow("visuals.telemetry")
-    self:_addSettingRow("visuals.notifications")
-end
-
-function Module:_buildSystem()
-    self:_addSection("Core & Interface")
-    self:_addSettingRow("enabled")
-    self:_addSettingRow("performanceMode")
-    self:_addSettingRow("ui.units")
-    self:_addSettingRow("ui.scale")
-    self:_addSettingRow("ui.videoMode")
-    self:_addSettingRow("ui.diagnostics")
-
-    self:_addSection("Live Info")
-    local info = Instance.new("TextLabel")
-    info.Size = UDim2.new(1, 0, 0, 48)
-    info.BackgroundColor3 = C.row
-    info.Font = Enum.Font.Code
-    info.TextSize = 11
-    info.TextColor3 = C.text
-    info.Text = string.format("Kernel v%s\nProfile: %s", tostring(_G.VX.Version), self.profiles:current().name)
-    info.Parent = self._scroll
-    _corner(info, 6)
-end
-
-function Module:heartbeat()
-    return self._gui ~= nil and self._gui.Parent ~= nil
-end
-
-function Module:Stop()
-    self:_clearConns()
-    if self._gui then
-        self._gui:Destroy()
-        self._gui = nil
-    end
-    _G.VX.Panel = nil
-end
-
-return Module
+    if not
