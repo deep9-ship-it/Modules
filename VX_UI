@@ -1,8 +1,8 @@
 --[[
-    VX_UI v3.1.0
-    - Video mode: hides ALL MainGUIHandler descendants except Pedals/Steering
+    VX_UI v3.1.1
+    - Fixed: obj:method parse error in _update (twostep check)
+    - Video mode: hides ALL MainGUIHandler except pedals/steering
     - Dashboard stays visible
-    - PSI display = boostPressure directly
 ]]
 
 local VX = _G.VX
@@ -16,7 +16,7 @@ local PlayerGui = Player:WaitForChild("PlayerGui")
 local Module = VX.Framework.Module.new({
     Name = "UI",
     Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "VehicleState" },
-    Version = "3.1.0",
+    Version = "3.1.1",
 })
 
 function Module:Construct()
@@ -28,7 +28,7 @@ function Module:Construct()
     self.notifQueue = {}
 
     self.dashboardRefs = {
-        root = nil, speedText = nil, unitText = nil, gearText = nil, psiText = nil,
+        root = nil, speedText = nil, gearText = nil, psiText = nil,
         rpmFill = nil, rpmFlash = nil, launchInd = nil,
         lastFill = 0, fillTween = nil, flashPhase = 0,
     }
@@ -98,7 +98,6 @@ function Module:_createScreenGui()
     self.gui = gui
 
     local notifScreen = Instance.new("Frame")
-    notifScreen.Name = "Notifications"
     notifScreen.Size = UDim2.new(1,0,1,0)
     notifScreen.BackgroundTransparency = 1
     notifScreen.ZIndex = 50
@@ -117,26 +116,21 @@ function Module:_createDashboard()
     dash.Active = true
     dash.Visible = false
     dash.ZIndex = 10
-    corner(dash, 12)
-    stroke(dash, Color3.fromRGB(100,200,255), 2)
+    corner(dash, 12); stroke(dash, Color3.fromRGB(100,200,255), 2)
     dash.Parent = self.gui
 
     local barBg = Instance.new("Frame")
     barBg.Size = UDim2.new(1,-16,0,12)
     barBg.Position = UDim2.new(0,8,0,8)
     barBg.BackgroundColor3 = Color3.fromRGB(30,30,40)
-    barBg.BorderSizePixel = 0
     barBg.ZIndex = 11
-    corner(barBg, 5)
-    barBg.Parent = dash
+    corner(barBg, 5); barBg.Parent = dash
 
     local fill = Instance.new("Frame")
     fill.Size = UDim2.new(0,0,1,0)
     fill.BackgroundColor3 = Color3.fromRGB(40,200,80)
-    fill.BorderSizePixel = 0
     fill.ZIndex = 12
-    corner(fill, 5)
-    fill.Parent = barBg
+    corner(fill, 5); fill.Parent = barBg
 
     local grad = Instance.new("UIGradient")
     grad.Color = ColorSequence.new({
@@ -153,8 +147,7 @@ function Module:_createDashboard()
     flash.BackgroundColor3 = Color3.fromRGB(255,50,50)
     flash.BackgroundTransparency = 1
     flash.ZIndex = 13
-    corner(flash, 5)
-    flash.Parent = fill
+    corner(flash, 5); flash.Parent = fill
 
     local speed = Instance.new("TextLabel")
     speed.Size = UDim2.new(0.42,0,0,44)
@@ -260,10 +253,8 @@ function Module:_createSettingsButton()
     btn.Font = Enum.Font.GothamBold
     btn.AutoButtonColor = false
     btn.ZIndex = 20
-    corner(btn, 22)
-    stroke(btn, Color3.fromRGB(100,200,255), 2)
+    corner(btn, 22); stroke(btn, Color3.fromRGB(100,200,255), 2)
     btn.Parent = self.gui
-
     btn.MouseButton1Click:Connect(function()
         local panel = _G.VX.Panel
         if not panel then return end
@@ -274,12 +265,12 @@ end
 
 function Module:_onStateChange(evt)
     if evt.to == "Ready" or evt.to == "Idle" then
-        self.dashboard.Visible = true
-        self.settingsBtn.Visible = true
+        if self.dashboard then self.dashboard.Visible = true end
+        if self.settingsBtn then self.settingsBtn.Visible = true end
         self:_startLoop()
     elseif evt.to == "Exiting" or evt.to == "Disabled" then
-        self.dashboard.Visible = false
-        self.settingsBtn.Visible = false
+        if self.dashboard then self.dashboard.Visible = false end
+        if self.settingsBtn then self.settingsBtn.Visible = false end
         self:_stopLoop()
         if self.videoMode then self:toggleVideoMode() end
     end
@@ -319,6 +310,12 @@ function Module:_update()
     local prof = self.profiles:current()
     local isLimited = self.powertrain:isRevLimiting()
 
+    -- Safe twostep check (parse-error fix)
+    local twostepActive = false
+    if self.powertrain and self.powertrain.isTwostepActive then
+        twostepActive = self.powertrain:isTwostepActive()
+    end
+
     self.dashboardRefs.speedText.Text = tostring(speed)
     self.dashboardRefs.speedText.TextColor3 = speed > 100 and Color3.fromRGB(255,220,100) or Color3.fromRGB(255,255,255)
 
@@ -328,7 +325,6 @@ function Module:_update()
     elseif rpm > prof.redlineRPM * 0.9 then self.dashboardRefs.gearText.TextColor3 = Color3.fromRGB(255,200,40)
     else self.dashboardRefs.gearText.TextColor3 = Color3.fromRGB(255,255,255) end
 
-    -- PSI: direct boost value (already in PSI)
     self.dashboardRefs.psiText.Text = string.format("%.1f PSI", boost)
     if boost > 60 then self.dashboardRefs.psiText.TextColor3 = Color3.fromRGB(255,100,100)
     elseif boost > 30 then self.dashboardRefs.psiText.TextColor3 = Color3.fromRGB(240,200,60)
@@ -350,8 +346,7 @@ function Module:_update()
         self.dashboardRefs.flashPhase = 0
     end
 
-    -- Launch indicator
-    if self.powertrain:isTwostepActive and self.powertrain:isTwostepActive() then
+    if twostepActive then
         self.dashboardRefs.launchInd.Visible = true
         self.dashboardRefs.launchInd.Text = "2-STEP"
         self.dashboardRefs.launchInd.TextColor3 = Color3.fromRGB(255,100,50)
@@ -373,7 +368,6 @@ function Module:_update()
     if self.telemetry and self.telemetry.Visible then self:_updateTelemetry() end
 end
 
--- Notifications (abbreviated)
 function Module:notify(text, duration)
     if self.videoMode then return end
     duration = duration or 2.5
@@ -436,16 +430,15 @@ function Module:_updateTelemetry()
     r["RPM"].Text = string.format("RPM: %d", math.floor(self.powertrain:getRPM()))
     r["Gear"].Text = string.format("Gear: %s", tostring(self.powertrain:getGear()))
     r["Slip"].Text = string.format("Slip: %.2f", self.chassis:getSlipRatio())
-    r["Grip Front"].Text = string.format("Front μ: %.2f", self.chassis:getEffectiveGripFront())
-    r["Grip Rear"].Text = string.format("Rear μ: %.2f", self.chassis:getEffectiveGripRear())
-    r["Slope"].Text = string.format("Slope: %.1f°", self.chassis:getSlopeAngle())
+    r["Grip Front"].Text = string.format("Front mu: %.2f", self.chassis:getEffectiveGripFront())
+    r["Grip Rear"].Text = string.format("Rear mu: %.2f", self.chassis:getEffectiveGripRear())
+    r["Slope"].Text = string.format("Slope: %.1f", self.chassis:getSlopeAngle())
     r["Shift"].Text = string.format("Shift: %s", self.powertrain:getShiftState())
     r["Launch"].Text = string.format("Launch: %s", self.powertrain:getLaunchState())
     r["Boost"].Text = string.format("Boost: %.1f PSI", self.drive:getBoost())
     r["Tire Temp"].Text = string.format("Tire T: %.2f", self.chassis:getTireTemp("front"))
 end
 
--- ==================== VIDEO MODE (REWRITE) ====================
 function Module:toggleVideoMode()
     self.videoMode = not self.videoMode
     _G.VX.setSetting("videoMode", self.videoMode)
@@ -458,55 +451,36 @@ function Module:isVideoMode() return self.videoMode end
 function Module:_enterVideoMode()
     self.hiddenElements = {}
 
-    local function tryHide(inst)
-        if inst and inst:IsA("GuiObject") and inst.Visible then
-            self.hiddenElements[inst] = inst.Visible
-            inst.Visible = false
-        end
-    end
-
-    -- Hide our telemetry, diagnostics, notifications
-    if self.telemetry then tryHide(self.telemetry) end
-    if self.diagnosticsPanel then tryHide(self.diagnosticsPanel) end
+    if self.telemetry then self.hiddenElements[self.telemetry] = self.telemetry.Visible; self.telemetry.Visible = false end
+    if self.diagnosticsPanel then self.hiddenElements[self.diagnosticsPanel] = self.diagnosticsPanel.Visible; self.diagnosticsPanel.Visible = false end
     if self.notifScreen then self.notifScreen.Visible = false end
 
-    -- Hide ALL MainGUIHandler descendants EXCEPT pedals, steering, and their ancestors
     pcall(function()
         local handler = PlayerGui:FindFirstChild("MainGUIHandler")
         if not handler then return end
 
-        local keepRoots = {}
-        local function addKeepRoot(inst)
-            if inst then keepRoots[inst] = true end
-        end
-
-        -- Find Pedals and Steering in current UI
-        for _, descendant in ipairs(handler:GetDescendants()) do
-            if descendant.Name == "Pedals" or descendant.Name == "Steering" then
-                addKeepRoot(descendant)
-                local cur = descendant
+        local keep = {}
+        for _, d in ipairs(handler:GetDescendants()) do
+            if d.Name == "Pedals" or d.Name == "Steering" then
+                local cur = d
                 while cur and cur ~= handler do
-                    addKeepRoot(cur)
+                    keep[cur] = true
                     cur = cur.Parent
                 end
+                -- Also keep all descendants of Pedals/Steering
+                for _, sub in ipairs(d:GetDescendants()) do keep[sub] = true end
             end
         end
 
-        -- Now hide everything else
-        for _, descendant in ipairs(handler:GetDescendants()) do
-            if descendant:IsA("GuiObject") then
-                if not keepRoots[descendant] then
-                    -- Make sure it's not a descendant of a kept root
-                    local isKept = false
-                    for kept, _ in pairs(keepRoots) do
-                        if descendant == kept or descendant:IsDescendantOf(kept) then
-                            isKept = true
-                            break
-                        end
-                    end
-                    if not isKept then
-                        tryHide(descendant)
-                    end
+        for _, d in ipairs(handler:GetDescendants()) do
+            if d:IsA("GuiObject") and d.Visible then
+                local isKept = false
+                for kept, _ in pairs(keep) do
+                    if d == kept or d:IsDescendantOf(kept) then isKept = true; break end
+                end
+                if not isKept then
+                    self.hiddenElements[d] = d.Visible
+                    d.Visible = false
                 end
             end
         end
@@ -521,37 +495,19 @@ function Module:_enterVideoMode()
                 pcall(function()
                     local handler = PlayerGui:FindFirstChild("MainGUIHandler")
                     if not handler then return end
-                    for _, descendant in ipairs(handler:GetDescendants()) do
-                        if descendant:IsA("GuiObject") and descendant.Visible then
-                            -- Skip if part of keep list
-                            local isKept = false
-                            for kept, _ in pairs(self.hiddenElements) do
-                                if descendant == kept or descendant:IsDescendantOf(kept) then
-                                    -- Actually hiddenElements stores hidden ones; we need a keep list
-                                end
-                            end
-                        end
-                    end
-                    -- Simpler re-hide: any newly-visible UI element not in keep list → hide
-                    -- Recompute keep roots
-                    local keepRoots = {}
+                    local keep = {}
                     for _, d in ipairs(handler:GetDescendants()) do
                         if d.Name == "Pedals" or d.Name == "Steering" then
-                            keepRoots[d] = true
                             local cur = d
-                            while cur and cur ~= handler do
-                                keepRoots[cur] = true
-                                cur = cur.Parent
-                            end
+                            while cur and cur ~= handler do keep[cur] = true; cur = cur.Parent end
+                            for _, sub in ipairs(d:GetDescendants()) do keep[sub] = true end
                         end
                     end
                     for _, d in ipairs(handler:GetDescendants()) do
                         if d:IsA("GuiObject") and d.Visible then
                             local isKept = false
-                            for kept, _ in pairs(keepRoots) do
-                                if d == kept or d:IsDescendantOf(kept) then
-                                    isKept = true; break
-                                end
+                            for kept, _ in pairs(keep) do
+                                if d == kept or d:IsDescendantOf(kept) then isKept = true; break end
                             end
                             if not isKept then
                                 self.hiddenElements[d] = d.Visible
@@ -574,7 +530,6 @@ function Module:_exitVideoMode()
     if self.videoModeWatcher then pcall(function() task.cancel(self.videoModeWatcher) end); self.videoModeWatcher = nil end
 end
 
--- ==================== DIAGNOSTICS PANEL ====================
 function Module:_createDiagnosticsPanel()
     local p = Instance.new("Frame")
     p.Size = UDim2.new(0, 340, 0, 440)
@@ -588,7 +543,7 @@ function Module:_createDiagnosticsPanel()
     local title = Instance.new("TextLabel")
     title.Size = UDim2.new(1,-20,0,24)
     title.Position = UDim2.new(0,10,0,6)
-    title.Text = "VX Diagnostics (F3)"
+    title.Text = "VX Diagnostics"
     title.TextColor3 = Color3.fromRGB(100,200,255)
     title.BackgroundTransparency = 1
     title.TextXAlignment = Enum.TextXAlignment.Left
@@ -602,7 +557,6 @@ function Module:_createDiagnosticsPanel()
     scroll.BackgroundTransparency = 1
     scroll.BorderSizePixel = 0
     scroll.ScrollBarThickness = 4
-    scroll.CanvasSize = UDim2.new(0,0,0,0)
     scroll.ZIndex = 101
     scroll.Parent = p
     self.diagnosticsPanel = p
