@@ -1,58 +1,61 @@
 --[[
-    VX_Powertrain.lua — RPM, Shifting, Clutch, Rev Limiter, Cold Start, Idle Hunting, Launch Control & 2-Step
-    Version: 3.2.3
+    VX_Powertrain v3.2.0
+- Upshift trigger: RPM >= effectiveRedline * 0.98
+- Downshift trigger: RPM < lowRpmDownshift (default 2800)
+- Emergency downshift: RPM < stallThreshold (default 1050)
+- Predicted RPM ratio: gearRatios[lower] / gearRatios[current]
+- Reverse exit gate: gas (> 0.1) exits reverse cleanly; speed only used for reverse entry & drop-to-gear-1
 ]]
 
 local VX = _G.VX
-if not VX or not VX.Framework then
-    error("[VX_Powertrain] Requires VX_Kernel")
-end
+if not VX or not VX.Framework then error("VX_Powertrain requires VX_Kernel") end
 
-local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local Player = Players.LocalPlayer
 
 local Module = VX.Framework.Module.new({
     Name = "Powertrain",
     Dependencies = { "Core", "Profiles", "Input", "VehicleState" },
-    Version = "3.2.3",
+    Version = "3.2.0",
 })
 
-local function _getSetting(path, fallback)
-    if _G.VX and type(_G.VX.getSetting) == "function" then
-        local v = _G.VX.getSetting(path)
-        if v ~= nil then
-            return v
-        end
-    end
-    return fallback
-end
+local TICK_NORMAL = 60
+local TICK_LOW = 30
+local STUDS_TO_MPH = 0.626
+local DEFAULT_LOW_RPM_DOWNSHIFT = 2800
+local DEFAULT_STALL_THRESHOLD = 1050
+local DEFAULT_SHIFT_COOLDOWN = 0.10
 
 function Module:Construct()
     self.rpm = 900
     self.gear = 1
+    self.shiftCooldown = 0
+    self.shiftState = "closed"
     self.smoothedThrottle = 0
-    self.throttle = 0
-    self.brake = 0
-    self.steer = 0
-    self.clutchOpen = false
-    self.isShifting = false
-    self.launchState = "Idle"
-    self.slopeLoadFactor = 1.0
+    self.targetThrottle = 0
+    self.revLimiterActive = false
+    self.revLimiterPhase = 0
 
-    self._revLimiting = false
-    self._twostepActive = false
-    self._shiftTimer = 0
-    self._pendingGear = nil
-    self._revCutTimer = 0
-    self._launchHoldTimer = 0
-    self._launchReleaseTimer = 0
-    self._twostepTimer = 0
-    self._idleHuntPhase = 0
-    self._coldStartActive = false
-    self._coldStartTimer = 0
+    self.launch = {
+        state = "idle", startTime = 0, releaseTime = 0,
+        rpmTarget = 6500, rpm = 900, cooldownEnd = 0,
+        twostepActive = false, twostepStartTime = 0, lastTwostepBackfire = 0,
+    }
+
+    self.pendingUpshift = { active = false, targetGear = nil, shiftTime = 0 }
+    self._loopThread = nil
+    self._running = false
+    self._shiftEvents = 0
+    self._lastShiftTime = 0
+    self._lastShiftUpTime = 0
+    self._lastShiftDownTime = 0
+    self._coldStartEndTime = 0
     self._coldStartDone = false
-    self._lastSpeed = 0
-    self._accum = 0
-    self._conns = {}
+    self._bogUntil = 0
+    self._bogMagnitude = 0
+    self._lastSmoothed = 0
+    self._idleHuntPhase = 0
+    self._loadFactor = 1.0
 end
 
 function Module:Init(deps)
@@ -62,478 +65,515 @@ function Module:Init(deps)
     self.state = deps.VehicleState
 end
 
--- ==================== PUBLIC GETTERS ====================
-
-function Module:getRPM()
-    return self.rpm
+function Module:Start()
+    _G.VX.Powertrain = self
+    _G.VX.bus:on("vehicle.stateChanged", function(evt)
+        if evt.to == "Ready" or evt.to == "Idle" then self:_start()
+        elseif evt.to == "Exiting" or evt.to == "Disabled" then self:_stop() end
+    end)
+    self:_registerDiagnostics()
 end
 
-function Module:getSmoothedThrottle()
-    return self.smoothedThrottle
+function Module:Stop()
+    self:_stop()
+    if _G.VX.Powertrain == self then _G.VX.Powertrain = nil end
 end
 
-function Module:getGear()
-    return self.gear
+function Module:heartbeat() return true end
+
+function Module:_registerDiagnostics()
+    local D = _G.VX.diagnostics
+    pcall(function()
+        D.register("powertrain.rpm", { fn = function() return { value = math.floor(self.rpm), unit = "rpm", status = "normal" } end, category = "Powertrain" }, "Powertrain")
+        D.register("powertrain.gear", { fn = function() return { value = self.gear, unit = "", status = "normal" } end, category = "Powertrain" }, "Powertrain")
+        D.register("powertrain.launch", { fn = function() return { value = self.launch.state, unit = "", status = "normal" } end, category = "Powertrain" }, "Powertrain")
+    end)
 end
 
-function Module:getShiftState()
-    return self.clutchOpen and "open" or "closed"
-end
-
-function Module:getLaunchState()
-    if self.launchState == "Armed" or self.launchState == "Ready" then
-        return "holding"
-    elseif self.launchState == "Released" then
-        return "released"
-    end
-    return "idle"
-end
-
-function Module:getSlopeLoadFactor()
-    return self.slopeLoadFactor
-end
-
-function Module:isRevLimiting()
-    return self._revLimiting == true
-end
-
-function Module:isTwostepActive()
-    return self._twostepActive == true
-end
-
--- ==================== COLD START ====================
-
-function Module:triggerColdStart()
+function Module:_start()
+    if self._running then return end
+    self._running = true
+    local prof = self.profiles:current()
+    self.rpm = prof.idleRPM
+    self.gear = 1
+    self.shiftState = "closed"
+    self.shiftCooldown = 0
+    self.revLimiterActive = false
+    self._coldStartEndTime = 0
     self._coldStartDone = false
-    self._coldStartActive = true
-    self._coldStartTimer = 0
-    local prof = self.profiles and self.profiles:current()
-    local baseIdle = (prof and prof.idleRPM) or 900
-    self.rpm = math.max(self.rpm or baseIdle, baseIdle + 900)
-    _G.VX.bus:emit("engine.coldStartBegin", { manual = true })
-    return true
+    self.launch.state = "idle"
+    self.launch.twostepActive = false
+    self.pendingUpshift.active = false
+    self.pendingUpshift.targetGear = nil
+
+    self._loopThread = task.spawn(function()
+        local perf = self.core.settings._effectivePerformance
+        local tickRate = (perf == "low") and TICK_LOW or TICK_NORMAL
+        local interval = 1 / tickRate
+        local lastTick = os.clock()
+        while self._running do
+            local now = os.clock()
+            local dt = now - lastTick
+            lastTick = now
+            if dt <= 0 or dt > 0.1 then dt = interval end
+            pcall(function() self:_update(dt) end)
+            local toSleep = interval - (os.clock() - now)
+            if toSleep > 0 then task.wait(toSleep) end
+        end
+    end)
+    print("[VX] Powertrain started")
 end
 
-function Module:_updateColdStart(dt, prof)
-    if self._coldStartDone or not _getSetting("physics.coldStart", true) then
-        self._coldStartActive = false
-        return 0
-    end
-
-    local cfg = self.core and (self.core.config or self.core._config)
-    local coldCfg = (cfg and cfg.coldStart) or {
-        duration = 3.2,
-        idleAdd = 850,
-        flareDecay = 0.35,
-    }
-
-    if not self._coldStartActive then
-        self._coldStartActive = true
-        self._coldStartTimer = 0
-        _G.VX.bus:emit("engine.coldStartBegin", {})
-    end
-
-    self._coldStartTimer += dt
-    if self._coldStartTimer >= coldCfg.duration then
-        self._coldStartActive = false
-        self._coldStartDone = true
-        _G.VX.bus:emit("engine.coldStartEnd", {})
-        return 0
-    end
-
-    local frac = 1 - (self._coldStartTimer / coldCfg.duration)
-    return coldCfg.idleAdd * (frac ^ (coldCfg.flareDecay + 0.65))
+function Module:_stop()
+    if not self._running then return end
+    self._running = false
+    if self._loopThread then pcall(function() task.cancel(self._loopThread) end); self._loopThread = nil end
+    self.launch.state = "idle"
+    self.launch.twostepActive = false
+    self.pendingUpshift.active = false
+    print("[VX] Powertrain stopped")
 end
 
--- ==================== LAUNCH CONTROL ====================
-
-function Module:_updateLaunchControl(dt, prof, accelHeld, brakeHeld, bothHeld, speed)
-    if not _getSetting("physics.launchControl", true) then
-        self.launchState = "Idle"
-        return nil
-    end
-
-    local cfg = self.core and (self.core.config or self.core._config)
-    local launchCfg = (cfg and cfg.launch) or {}
-    local target = _getSetting("physics.launchTargetRPM") or launchCfg.rpmTarget or 4500
-    local holdMin = launchCfg.holdMinTime or 0.6
-    local bothActive = bothHeld or (accelHeld and brakeHeld)
-
-    if speed < 5 and bothActive and self.gear >= 1 then
-        if self.launchState == "Idle" or self.launchState == "Released" then
-            self.launchState = "Armed"
-            self._launchHoldTimer = 0
-            _G.VX.bus:emit("vehicle.launchStart", { rpm = self.rpm, target = target })
-        elseif self.launchState == "Armed" then
-            self._launchHoldTimer += dt
-            if self._launchHoldTimer >= holdMin then
-                self.launchState = "Ready"
-            end
-        end
-        return target
-    elseif (self.launchState == "Armed" or self.launchState == "Ready") and not brakeHeld then
-        local quality = "miss"
-        if accelHeld then
-            local diff = math.abs(self.rpm - target)
-            if diff <= (launchCfg.perfectWindow or 400) and self.launchState == "Ready" then
-                quality = "perfect"
-            elseif diff <= (launchCfg.goodWindow or 850) then
-                quality = "good"
-            end
-        end
-        self.launchState = "Released"
-        self._launchReleaseTimer = 0.6
-        _G.VX.bus:emit("vehicle.launchRelease", {
-            quality = quality,
-            rpm = self.rpm,
-            ratio = self.rpm / math.max(1, target),
-        })
-        _G.VX.bus:emit("vehicle.launchQuality", {
-            quality = string.upper(quality),
-        })
-    elseif self.launchState == "Released" then
-        self._launchReleaseTimer -= dt
-        if self._launchReleaseTimer <= 0 then
-            self.launchState = "Idle"
-        end
-    elseif self.launchState ~= "Idle" and speed >= 15 then
-        self.launchState = "Idle"
-    end
-
-    return nil
+function Module:_update(dt)
+    local prof = self.profiles:current()
+    self:_updateLaunch(dt)
+    self:_updateThrottleSmoother(dt)
+    self:_updateRPM(dt, prof)
+    if self.shiftCooldown > 0 then self.shiftCooldown = math.max(0, self.shiftCooldown - dt) end
+    self:_updateGear(dt, prof)
+    if self.shiftState == "open" and self.shiftCooldown <= 0 then self.shiftState = "closed" end
+    self:_updateRevLimiter(dt, prof)
+    self:_updateColdStart(dt, prof)
+    self:_updateIdleHunt(dt, prof)
+    self._loadFactor = self:_computeLoadFactor(prof)
 end
 
--- ==================== 2-STEP LIMITER ====================
-
-function Module:_updateTwoStep(dt, prof, accelHeld, brakeHeld, clutchHeld, speed)
-    if not _getSetting("physics.twostep", true) or self.launchState == "Armed" or self.launchState == "Ready" then
-        if self._twostepActive then
-            self._twostepActive = false
-            _G.VX.bus:emit("vehicle.twostepEnd", {})
-        end
-        return nil
+function Module:_getMaxGear(prof)
+    if prof and prof.gearRatios and #prof.gearRatios > 0 then
+        return #prof.gearRatios
     end
-
-    local cfg = self.core and (self.core.config or self.core._config)
-    local tsCfg = (cfg and cfg.twostep) or {}
-    local minRpm = tsCfg.minRPM or 4200
-    local maxRpm = tsCfg.maxRPM or 5200
-    local freq = tsCfg.bounceFreq or 18
-
-    local canTwoStep = speed < 4 and accelHeld and not brakeHeld and (clutchHeld or self.gear == 0)
-    if canTwoStep and self.rpm >= minRpm then
-        if not self._twostepActive then
-            self._twostepActive = true
-            self._twostepTimer = 0
-            _G.VX.bus:emit("vehicle.twostepStart", {})
-        end
-        self._twostepTimer += dt
-        local bounce = math.sin(self._twostepTimer * freq * math.pi * 2)
-        if bounce > 0.85 and math.random() < (tsCfg.backfireProb or 0.55) * dt * 15 then
-            _G.VX.bus:emit("vehicle.backfire", { source = "twostep", count = 1 })
-        end
-        return (minRpm + maxRpm) * 0.5 + bounce * ((maxRpm - minRpm) * 0.5)
-    elseif self._twostepActive then
-        self._twostepActive = false
-        _G.VX.bus:emit("vehicle.twostepEnd", {})
-    end
-
-    return nil
+    return 7
 end
 
--- ==================== GEAR SHIFTING ====================
+function Module:_getSpeedScale(prof)
+    local maxGear = self:_getMaxGear(prof)
+    local profileTop = (prof.speedThresholds and prof.speedThresholds[maxGear]) or 175
+    return self.core.settings.topSpeed / math.max(profileTop, 1)
+end
 
-function Module:_beginShift(targetGear, up, prof, emergency)
-    local realistic = _getSetting("physics.realisticShifting", true)
-    local delay = _getSetting("physics.shiftDelay") or prof.shiftDelay or 0.08
-    local prevGear = self.gear
-    local rpmBefore = self.rpm
+function Module:_getGearMaxMPH(prof, gear)
+    local maxGear = self:_getMaxGear(prof)
+    local speedScale = self:_getSpeedScale(prof)
+    local threshold = prof.speedThresholds and prof.speedThresholds[gear]
+    if not threshold or threshold <= 0 then
+        threshold = (prof.speedThresholds and prof.speedThresholds[maxGear]) or 175
+    end
+    return threshold * speedScale
+end
 
-    if realistic and delay > 0.01 then
-        self.isShifting = true
-        self.clutchOpen = true
-        self._shiftTimer = delay
-        self._pendingGear = targetGear
+function Module:_getEffectiveRedline(prof)
+    local settings = self.core.settings
+    local effectiveRedline = prof.redlineRPM
+    if settings.physics and settings.physics.coldStart and self._coldStartEndTime > 0 and os.clock() < self._coldStartEndTime then
+        local duration = math.max(settings.physics.coldStartDuration or 1, 0.01)
+        local remain = (self._coldStartEndTime - os.clock()) / duration
+        effectiveRedline = prof.redlineRPM - (self.core.config.coldStartRedlineDrop or 0) * remain
+    end
+    return effectiveRedline
+end
+
+function Module:_updateThrottleSmoother(dt)
+    local settings = self.core.settings
+    local tiltLevel = settings.physicsTiltLevel
+    local smoothingOn = (tiltLevel == "Medium" or tiltLevel == "High" or tiltLevel == "Extreme")
+
+    if self.launch.twostepActive or self.launch.state == "holding" then
+        self.smoothedThrottle = 0; self.targetThrottle = 0; return
+    end
+    if self.launch.state == "releasing" then
+        self.smoothedThrottle = 1.0; self.targetThrottle = 1.0; return
+    end
+    if self.shiftState == "open" and settings.realisticShifting then
+        self.smoothedThrottle = 0; self.targetThrottle = 0; return
+    end
+
+    local raw = self.input:getRawThrottle()
+    self.targetThrottle = raw
+
+    if not smoothingOn then
+        self.smoothedThrottle = raw
+        return
+    end
+
+    local cur = self.smoothedThrottle
+    local target = raw
+    local rate
+    local brakeSpeed = settings.brakeSpeed or 5.0
+
+    if target < -0.05 then rate = brakeSpeed
+    elseif cur < -0.05 and target > -0.05 then rate = brakeSpeed
+    elseif target > cur + 0.05 then
+        if settings.throttleUltra then rate = 100
+        elseif self.rpm >= self.core.config.launch.rpmTarget * 0.6 then rate = 2.0
+        elseif cur < 0.05 then rate = 0.4
+        else rate = 3.0 end
+    elseif target < cur - 0.05 then rate = 0.4
+    else rate = 5.0 end
+
+    local new = cur + (target - cur) * math.min(rate * dt, 1)
+    self.smoothedThrottle = new
+
+    if settings.physics and settings.physics.engineBog then
+        local delta = new - self._lastSmoothed
+        if delta > 0.5 and self.rpm < 2500 then
+            self._bogUntil = os.clock() + 0.12
+            self._bogMagnitude = delta * 200
+        end
+        self._lastSmoothed = new
+    end
+end
+
+function Module:_updateRPM(dt, prof)
+    if self.launch.twostepActive then return end
+
+    if self.launch.state == "holding" then
+        local target = self.launch.rpmTarget
+        local diff = target - self.rpm
+        self.rpm = self.rpm + diff * self.core.config.launch.rpmBuildRate * dt
+        self.rpm = math.min(self.rpm, prof.redlineRPM)
+        return
+    end
+
+    if self.gear == -1 then
+        self.rpm = prof.idleRPM + math.abs(self.smoothedThrottle) * (prof.maxRPM - prof.idleRPM) * 0.4
+        return
+    end
+
+    local speed = self:_getSpeed()
+    local gearMaxMPH = self:_getGearMaxMPH(prof, self.gear)
+    local throttle = self.smoothedThrottle
+    local effectiveRedline = self:_getEffectiveRedline(prof)
+
+    local target
+    if speed < 5 then
+        target = math.min(prof.idleRPM + throttle * (prof.maxRPM - prof.idleRPM), effectiveRedline * 0.85)
     else
-        self.gear = targetGear
-        self.isShifting = false
-        self.clutchOpen = false
+        local speedRatio = math.min(speed / math.max(gearMaxMPH, 1), 1.0)
+        local kinematicRPM = prof.idleRPM + speedRatio * (effectiveRedline - prof.idleRPM)
+        local throttleRPM = prof.idleRPM + throttle * (prof.maxRPM - prof.idleRPM)
+        target = math.min(throttleRPM, kinematicRPM)
     end
 
-    local ratioOld = prof.gearRatios[math.max(1, prevGear)] or 1
-    local ratioNew = prof.gearRatios[math.max(1, targetGear)] or 1
-    local rpmAfter = math.clamp(rpmBefore * (ratioNew / math.max(0.01, ratioOld)), prof.idleRPM, prof.maxRPM)
-
-    if up and math.random() < (prof.backfireProb or 0.4) then
-        _G.VX.bus:emit("vehicle.backfire", { source = "shift", count = 1 })
+    local diff = target - self.rpm
+    if diff > 0 then
+        local rate = self:_rpmRiseRate(prof)
+        local load = prof.gearRatios[1] / math.max(prof.gearRatios[self.gear] or prof.gearRatios[1], 0.01)
+        self.rpm = self.rpm + (diff * rate / math.sqrt(load)) * 10 * dt
+    else
+        self.rpm = self.rpm + diff * self.core.config.rpmFallRate * 10 * dt
     end
+
+    if os.clock() < self._bogUntil then
+        local remain = (self._bogUntil - os.clock()) / 0.12
+        self.rpm = self.rpm - self._bogMagnitude * remain * dt * 10
+    end
+
+    self.rpm = math.max(prof.idleRPM * 0.9, math.min(effectiveRedline + 100, self.rpm))
+end
+
+function Module:_rpmRiseRate(prof)
+    local base = self.core.config.rpmRiseRates[self.gear] or 0.1
+    return base * (prof.rpmRiseMultiplier or 1.0)
+end
+
+function Module:_clearPendingUpshift()
+    self.pendingUpshift.active = false
+    self.pendingUpshift.targetGear = nil
+end
+
+function Module:_updateGear(dt, prof)
+    if self.shiftCooldown > 0 then return end
+    if self.launch.state == "holding" or self.launch.twostepActive then return end
+
+    local speed = self:_getSpeed()
+    local maxGear = self:_getMaxGear(prof)
+    local effectiveRedline = self:_getEffectiveRedline(prof)
+    local lowRpmDownshift = self.core.config.lowRpmDownshift or DEFAULT_LOW_RPM_DOWNSHIFT
+    local stallThreshold = self.core.config.stallThreshold or DEFAULT_STALL_THRESHOLD
+
+    -- Reverse exit gate: applying gas exits reverse cleanly
+    if self.gear == -1 then
+        if self.smoothedThrottle > 0.1 then
+            self:_clearPendingUpshift()
+            self:_doShift(1, "up", false)
+        end
+        return
+    end
+
+    -- Speed use #1: enter reverse when stationary/slow and holding brake/reverse throttle
+    if self.smoothedThrottle < -0.1 and speed < 5 then
+        self:_clearPendingUpshift()
+        self:_doShift(-1, "down", false)
+        return
+    end
+
+    -- Speed use #2: drop to gear 1 when coming to a stop
+    if speed < 5 then
+        self:_clearPendingUpshift()
+        if self.gear > 1 then
+            self:_doShift(1, "down", false)
+        end
+        return
+    end
+
+    -- Pending upshift execution
+    if self.pendingUpshift.active then
+        if os.clock() >= self.pendingUpshift.shiftTime then
+            local targetGear = self.pendingUpshift.targetGear
+            self:_clearPendingUpshift()
+            if targetGear and targetGear <= maxGear and self.gear < maxGear and self.rpm >= effectiveRedline * 0.98 then
+                self:_doShift(targetGear, "up", false)
+            end
+        end
+        return
+    end
+
+    -- Upshift trigger: RPM >= redline * 0.98
+    if self.rpm >= effectiveRedline * 0.98 and self.gear < maxGear then
+        local newGear = self.gear + 1
+        if self.core.settings.shiftDelay and newGear >= 2 and newGear <= 4 then
+            self.pendingUpshift.active = true
+            self.pendingUpshift.targetGear = newGear
+            self.pendingUpshift.shiftTime = os.clock() + (0.4 + math.random() * 0.9)
+        else
+            self:_doShift(newGear, "up", false)
+        end
+        return
+    end
+
+    -- Downshift logic: RPM-based with corrected gearRatios[lower] / gearRatios[current]
+    if self.gear > 1 then
+        local lowerGear = self.gear - 1
+        local lowerRatio = prof.gearRatios[lowerGear]
+        local currentRatio = prof.gearRatios[self.gear]
+        local canDownshift = true
+
+        if lowerRatio and currentRatio and currentRatio > 0 then
+            local predictedRPM = self.rpm * (lowerRatio / currentRatio)
+            canDownshift = predictedRPM < (prof.maxRPM - 400)
+        end
+
+        if not canDownshift then return end
+
+        -- Emergency downshift when RPM drops below stall threshold
+        if self.rpm < stallThreshold then
+            self:_doShift(lowerGear, "down", true)
+            return
+        end
+
+        -- Normal downshift when RPM falls below lowRpmDownshift (default 2800)
+        if self.rpm < lowRpmDownshift then
+            self:_doShift(lowerGear, "down", false)
+        end
+    end
+end
+
+function Module:_doShift(newGear, direction, emergency)
+    if newGear == self.gear then return end
+    local oldGear = self.gear
+    local rpmBefore = self.rpm
+    local prof = self.profiles:current()
+
+    self.gear = newGear
+    if newGear > 0 and oldGear > 0 then
+        local ratio = prof.gearRatios[newGear] / prof.gearRatios[oldGear]
+        self.rpm = self.rpm * ratio * (1 - (self.core.config.upshiftRpmDrop or 0) * 0.5)
+    elseif newGear == 1 then
+        self.rpm = prof.idleRPM
+    end
+
+    local baseCooldown = self.core.config.shiftCooldown or DEFAULT_SHIFT_COOLDOWN
+    if self.core.settings.realisticShifting then
+        self.shiftState = "open"
+        local clutchDur = (self.core.settings.physics and self.core.settings.physics.clutchSimulation and self.core.settings.physics.clutchDuration) or 0.15
+        self.shiftCooldown = math.max(baseCooldown, clutchDur)
+    else
+        self.shiftState = "closed"
+        self.shiftCooldown = baseCooldown
+    end
+
+    self._shiftEvents = self._shiftEvents + 1
+    self._lastShiftTime = os.clock()
+    if direction == "up" then self._lastShiftUpTime = os.clock()
+    else self._lastShiftDownTime = os.clock() end
 
     _G.VX.bus:emit("vehicle.shift", {
-        up = up,
-        from = prevGear,
-        to = targetGear,
-        rpmBefore = rpmBefore,
-        rpmAfter = rpmAfter,
-        emergency = emergency == true,
+        up = direction == "up", from = oldGear, to = newGear,
+        rpmBefore = rpmBefore, rpmAfter = self.rpm, emergency = emergency or false,
     })
 end
 
--- ==================== MAIN SIMULATION STEP ====================
+function Module:_updateRevLimiter(dt, prof)
+    local throttle = self.smoothedThrottle
+    if self.launch.twostepActive then return end
+    local maxGear = self:_getMaxGear(prof)
+    local effectiveRedline = self:_getEffectiveRedline(prof)
 
-function Module:_update(dt)
-    local st = self.state:getVehicleState()
-    if st == "Disabled" or st == "Exiting" or _getSetting("enabled", true) == false then
-        self.rpm = 0
-        self.smoothedThrottle = 0
-        self.throttle = 0
-        self.brake = 0
-        self.steer = 0
-        self.clutchOpen = false
-        self.isShifting = false
-        if self._revLimiting then
-            self._revLimiting = false
+    -- Rev limiter only in top gear (otherwise upshift handles redline)
+    if throttle > 0.7 and self.rpm >= effectiveRedline and self.gear >= maxGear then
+        if not self.revLimiterActive then
+            self.revLimiterActive = true
+            self.revLimiterPhase = 0
+            _G.VX.bus:emit("engine.revLimit", { active = true })
+        end
+        self.revLimiterPhase = self.revLimiterPhase + dt
+        local phase = self.revLimiterPhase % 0.16
+        if phase < 0.08 then
+            self.rpm = math.max(effectiveRedline - 100, self.rpm - 800 * dt)
+        end
+    else
+        if self.revLimiterActive then
+            self.revLimiterActive = false
             _G.VX.bus:emit("engine.revLimit", { active = false })
         end
-        if self._twostepActive then
-            self._twostepActive = false
+    end
+end
+
+function Module:_updateColdStart(dt, prof)
+    local enabled = self.core.settings.physics and self.core.settings.physics.coldStart
+    if not enabled or self._coldStartDone then return end
+    local now = os.clock()
+    if self._coldStartEndTime == 0 then
+        self._coldStartEndTime = now + (self.core.settings.physics.coldStartDuration or 5)
+        _G.VX.bus:emit("engine.coldStartBegin", {})
+    elseif now >= self._coldStartEndTime then
+        self._coldStartEndTime = 0
+        self._coldStartDone = true
+        _G.VX.bus:emit("engine.coldStartEnd", {})
+    end
+end
+
+function Module:_updateIdleHunt(dt, prof)
+    if not (self.core.settings.physics and self.core.settings.physics.idleHunting) then return end
+    if self.smoothedThrottle > 0.1 then return end
+    if self.rpm > prof.idleRPM * 1.4 then return end
+    self._idleHuntPhase = self._idleHuntPhase + dt
+    local wobble = math.sin(self._idleHuntPhase * 3) * 20
+    self.rpm = self.rpm + wobble * dt * 4
+end
+
+function Module:_computeLoadFactor(prof)
+    if not (self.core.settings.physics and self.core.settings.physics.engineLoad) then return 1.0 end
+    local authority = _G.VX.Authority
+    local handle = authority and authority:getHandle()
+    if not handle or not handle.root or not handle.root.PrimaryPart then return 1.0 end
+    local upY = handle.root.PrimaryPart.CFrame.UpVector.Y
+    if upY >= 0.999 then return 1.0 end
+    local slope = 1 - upY
+    local sens = self.core.settings.physics.engineLoadSensitivity or 1
+    return math.max(0.3, 1 - slope * sens * 5)
+end
+
+function Module:_updateLaunch(dt)
+    local cfg = self.core.config.launch
+    local tsCfg = self.core.config.twostep
+    local bothPedals = self.input:isBothPedalsHeld()
+    local speed = self:_getSpeed()
+    local launch = self.launch
+    local lcEnabled = self.core.settings.launchControlEnabled
+
+    if not lcEnabled then
+        if bothPedals and speed < tsCfg.minSpeed and self.gear == 1 then
+            if not launch.twostepActive then
+                launch.twostepActive = true
+                launch.twostepStartTime = os.clock()
+                launch.lastTwostepBackfire = 0
+                _G.VX.bus:emit("vehicle.twostepStart", {})
+            end
+            local elapsed = os.clock() - launch.twostepStartTime
+            local prof = self.profiles:current()
+            local bounce = math.sin(elapsed * tsCfg.bounceFreqHz * math.pi * 2) * tsCfg.bounceAmplitude
+            self.rpm = prof.redlineRPM + bounce
+            self.smoothedThrottle = 0
+            self.targetThrottle = 0
+            if elapsed - launch.lastTwostepBackfire > tsCfg.backfireInterval then
+                launch.lastTwostepBackfire = elapsed
+                _G.VX.bus:emit("vehicle.backfire", { source = "twostep", count = 1 })
+            end
+        elseif launch.twostepActive then
+            launch.twostepActive = false
             _G.VX.bus:emit("vehicle.twostepEnd", {})
         end
         return
     end
 
-    local prof = self.profiles:current()
-    local redline = prof.redlineRPM or prof.redline or 7500
-    local rawThr = self.input:getRawThrottle()
-    local accelHeld = self.input:isAccelHeld()
-    local brakeHeld = self.input:isBrakeHeld()
-    local clutchHeld = self.input:isClutchHeld()
-    local bothHeld = self.input:isBothPedalsHeld()
-    local rawStr = self.input:getRawSteer()
-
-    self.smoothedThrottle += (rawThr - self.smoothedThrottle) * math.min(1, dt * 12)
-    self.throttle = math.max(0, self.smoothedThrottle)
-    self.brake = math.max(0, -self.smoothedThrottle)
-    self.steer += (rawStr - self.steer) * math.min(1, dt * 10)
-
-    local auth = _G.VX.Authority
-    local h = auth and auth:getHandle()
-    local speed = 0
-    local velPart = h and ((h.root and h.root.PrimaryPart) or h.chassis)
-    if velPart then
-        speed = velPart.AssemblyLinearVelocity.Magnitude * 0.626
-    end
-    local speedDrop = (self._lastSpeed - speed) / math.max(dt, 0.001)
-    self._lastSpeed = speed
-
-    -- Slope load factor
-    self.slopeLoadFactor = 1.0
-    if _getSetting("physics.slopeLoad", true) and _G.VX.Chassis then
-        local slope = _G.VX.Chassis.slopeAngle or 0
-        self.slopeLoadFactor = math.clamp(1.0 + slope * 0.015, 0.75, 1.45)
-    end
-
-    -- Auto-direction (Reverse <-> 1st) at low speed
-    if not self.isShifting then
-        if self.gear >= 1 and brakeHeld and not accelHeld and speed < 3 then
-            self.gear = -1
-        elseif self.gear == -1 and accelHeld and speed < 3 then
-            self.gear = 1
-        elseif self.gear == 0 and accelHeld and not clutchHeld then
-            self.gear = 1
-        end
-    end
-
-    -- Clutch & ongoing shift completion
-    if self.isShifting then
-        self._shiftTimer -= dt
-        if self._shiftTimer <= 0 then
-            if self._pendingGear then
-                local oldRatio = prof.gearRatios[math.max(1, self.gear)] or 1
-                self.gear = self._pendingGear
-                local newRatio = prof.gearRatios[math.max(1, self.gear)] or 1
-                self.rpm = math.clamp(self.rpm * (newRatio / math.max(0.01, oldRatio)), prof.idleRPM, prof.maxRPM)
-                self._pendingGear = nil
-            end
-            self.isShifting = false
-        end
-    end
-    self.clutchOpen = self.isShifting or clutchHeld
-
-    -- Cold start & idle hunting
-    local coldAdd = self:_updateColdStart(dt, prof)
-    local huntAdd = 0
-    if _getSetting("physics.idleHunting", true) and speed < 3 and not accelHeld then
-        self._idleHuntPhase += dt * 4.2
-        huntAdd = math.sin(self._idleHuntPhase) * 35 + math.sin(self._idleHuntPhase * 1.7) * 18
-    end
-
-    -- Launch control & 2-step overrides
-    local launchRpm = self:_updateLaunchControl(dt, prof, accelHeld, brakeHeld, bothHeld, speed)
-    local twostepRpm = self:_updateTwoStep(dt, prof, accelHeld, brakeHeld, clutchHeld, speed)
-
-    local idleTarget = prof.idleRPM + coldAdd + huntAdd
-    local gearCount = #prof.gearRatios
-    local gearRatio = prof.gearRatios[math.clamp(math.abs(self.gear), 1, gearCount)] or 1.0
-    local wheelDrivenRpm = idleTarget + (speed / 0.626) * gearRatio * prof.finalDrive * 10.5
-
-    local targetRpm = idleTarget
-    if launchRpm then
-        targetRpm = launchRpm + math.sin(os.clock() * 50) * 90
-    elseif twostepRpm then
-        targetRpm = twostepRpm
-    elseif clutchHeld and not self.isShifting then
-        -- Free-rev in clutch open
-        targetRpm = idleTarget + (accelHeld and 1 or 0) * (prof.maxRPM - idleTarget)
-    elseif self.isShifting then
-        targetRpm = math.max(idleTarget, self.rpm - 1800 * dt)
-    else
-        local freeRev = idleTarget + self.throttle * (prof.maxRPM - idleTarget)
-        if speed < 5 then
-            targetRpm = freeRev
-        else
-            targetRpm = math.max(wheelDrivenRpm, idleTarget + self.throttle * 650)
-        end
-    end
-
-    -- Engine bog resistance when lugging at low RPM under full throttle
-    local bogMult = 1.0
-    if not self.clutchOpen and self.gear >= 2 and speed > 5 and self.rpm < prof.idleRPM * 1.35 and self.throttle > 0.5 then
-        bogMult = 0.65
-    end
-
-    local riseRate = (4800 * bogMult) / self.slopeLoadFactor
-    local fallRate = 3200
-    if targetRpm > self.rpm then
-        self.rpm = math.min(targetRpm, self.rpm + riseRate * dt)
-    else
-        self.rpm = math.max(targetRpm, self.rpm - fallRate * dt)
-    end
-
-    -- Rev limiter
-    if _getSetting("physics.revLimiter", true) and self.rpm >= redline and accelHeld then
-        if not self._revLimiting then
-            self._revLimiting = true
-            _G.VX.bus:emit("engine.revLimit", { active = true })
-        end
-        self._revCutTimer += dt
-        if self._revCutTimer >= 0.06 then
-            self._revCutTimer = 0
-            self.rpm = redline - math.random(180, 320)
-            if math.random() < 0.35 then
-                _G.VX.bus:emit("vehicle.backfire", { source = "revlimit", count = 1 })
+    if launch.state == "idle" then
+        if bothPedals and speed < cfg.minSpeed and self.gear == 1 then
+            if os.clock() >= launch.cooldownEnd then
+                launch.state = "arming"
+                launch.startTime = os.clock()
+                launch.rpmTarget = math.min(cfg.rpmTarget, self.profiles:current().redlineRPM - 100)
             end
         end
-    elseif self._revLimiting then
-        self._revLimiting = false
-        _G.VX.bus:emit("engine.revLimit", { active = false })
-    end
-
-    self.rpm = math.clamp(self.rpm, prof.idleRPM * 0.85, prof.maxRPM)
-
-    -- Auto shifting
-    if not self.isShifting and not clutchHeld and self.gear >= 1 and self.launchState == "Idle" then
-        local upRpm = redline * 0.94
-        local downRpm = prof.idleRPM + (redline - prof.idleRPM) * 0.34
-        local emergencyDown = (speedDrop > 45 and self.brake > 0.5 and self.rpm < redline * 0.65)
-
-        if self.gear < gearCount and self.rpm >= upRpm and self.throttle > 0.25 and speed > 8 then
-            self:_beginShift(self.gear + 1, true, prof, false)
-        elseif self.gear > 1 and (self.rpm <= downRpm or emergencyDown) and (speed < 12 or self.brake > 0.2 or self.throttle > 0.65 or emergencyDown) then
-            self:_beginShift(self.gear - 1, false, prof, emergencyDown)
+    elseif launch.state == "arming" then
+        if not bothPedals then launch.state = "idle"; return end
+        if os.clock() - launch.startTime >= 0.15 then
+            launch.state = "holding"
+            launch.rpm = self.rpm
+            _G.VX.bus:emit("vehicle.launchStart", { rpm = self.rpm, target = launch.rpmTarget })
         end
-    end
-
-    -- Valid Idle <-> Driving transitions
-    if st == "Idle" or st == "Driving" then
-        if speed > 3 or self.throttle > 0.15 or self.brake > 0.15 then
-            if st ~= "Driving" then
-                self.state:transition("Driving")
+    elseif launch.state == "holding" then
+        local authority = _G.VX.Authority
+        local handle = authority and authority:getHandle()
+        if handle and handle.root then
+            pcall(function()
+                if handle.root:GetAttribute("ThrottleFloat") ~= nil then
+                    handle.root:SetAttribute("ThrottleFloat", 0)
+                end
+            end)
+        end
+        if not bothPedals then
+            local accelHeld = self.input:isAccelHeld()
+            local brakeHeld = self.input:isBrakeHeld()
+            if accelHeld and not brakeHeld then
+                launch.state = "releasing"
+                launch.releaseTime = os.clock()
+                local ratio = self.rpm / launch.rpmTarget
+                local quality = "miss"
+                if ratio >= cfg.windowPerfectMin and ratio <= cfg.windowPerfectMax then quality = "perfect"
+                elseif ratio >= cfg.windowGoodMin and ratio <= cfg.windowGoodMax then quality = "good" end
+                _G.VX.bus:emit("vehicle.launchRelease", { quality = quality, rpm = self.rpm, ratio = ratio })
+            else
+                launch.state = "idle"
+                launch.cooldownEnd = os.clock() + 0.5
             end
-        elseif st ~= "Idle" then
-            self.state:transition("Idle")
+        elseif os.clock() - launch.startTime > cfg.maxTime then
+            launch.state = "idle"
+            launch.cooldownEnd = os.clock() + 0.5
+        end
+    elseif launch.state == "releasing" then
+        if os.clock() - launch.releaseTime > cfg.releaseDuration then
+            launch.state = "idle"
+            launch.cooldownEnd = os.clock() + 0.3
         end
     end
 end
 
--- ==================== LIFECYCLE ====================
-
-function Module:Start()
-    _G.VX.Powertrain = self
-
-    table.insert(self._conns, _G.VX.bus:on("vehicle.stateChanged", function(evt)
-        if evt and evt.to == "Ready" then
-            self._coldStartDone = false
-            self._coldStartActive = false
-            self._coldStartTimer = 0
-            self.gear = 1
-        elseif evt and evt.to == "Disabled" then
-            self.launchState = "Idle"
-            self._twostepActive = false
-            self._revLimiting = false
-            self.isShifting = false
-            self.clutchOpen = false
-        end
-    end))
-
-    table.insert(self._conns, RunService.Heartbeat:Connect(function(dt)
-        local hz = self.core:getTickRate()
-        local step = 1 / hz
-        self._accum += math.min(dt, 0.1)
-        while self._accum >= step do
-            self._accum -= step
-            self:_update(step)
-        end
-    end))
-
-    local D = _G.VX.diagnostics
-    if D then
-        D.register("powertrain.rpm", {
-            category = "Powertrain",
-            fn = function()
-                return { value = math.floor(self.rpm), unit = "rpm", status = self._revLimiting and "warn" or "normal" }
-            end,
-        }, "Powertrain")
-        D.register("powertrain.gear", {
-            category = "Powertrain",
-            fn = function()
-                return { value = self.gear, unit = "", status = self.isShifting and "warn" or "normal" }
-            end,
-        }, "Powertrain")
-        D.register("powertrain.launchState", {
-            category = "Powertrain",
-            fn = function()
-                return { value = self.launchState, unit = "", status = "normal" }
-            end,
-        }, "Powertrain")
-        D.register("powertrain.throttle", {
-            category = "Powertrain",
-            fn = function()
-                return { value = math.floor(self.smoothedThrottle * 100), unit = "%", status = "normal" }
-            end,
-        }, "Powertrain")
-        D.register("powertrain.clutch", {
-            category = "Powertrain",
-            fn = function()
-                return { value = self.clutchOpen and "OPEN" or "CLOSED", unit = "", status = self.clutchOpen and "warn" or "normal" }
-            end,
-        }, "Powertrain")
-    end
+function Module:_getSpeed()
+    local authority = _G.VX.Authority
+    local handle = authority and authority:getHandle()
+    if not handle or not handle.root or not handle.root.PrimaryPart then return 0 end
+    local v = handle.root.PrimaryPart.AssemblyLinearVelocity
+    return Vector3.new(v.X, 0, v.Z).Magnitude * STUDS_TO_MPH
 end
 
-function Module:Stop()
-    for _, c in ipairs(self._conns) do
-        if typeof(c) == "RBXScriptConnection" then
-            c:Disconnect()
-        elseif type(c) == "table" and c.Disconnect then
-            c:Disconnect()
-        end
-    end
-    self._conns = {}
-    _G.VX.Powertrain = nil
-end
-
-function Module:heartbeat()
-    return #self._conns > 0
-end
+function Module:getRPM() return self.rpm end
+function Module:getGear() return self.gear end
+function Module:getSmoothedThrottle() return self.smoothedThrottle end
+function Module:isRevLimiting() return self.revLimiterActive end
+function Module:getShiftState() return self.shiftState end
+function Module:getLaunchState() return self.launch.state end
+function Module:isTwostepActive() return self.launch.twostepActive end
+function Module:getSlopeLoadFactor() return self._loadFactor end
 
 return Module
