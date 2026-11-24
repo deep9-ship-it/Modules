@@ -1,10 +1,11 @@
 --[[
-    VX_Powertrain v3.2.0
-- Upshift trigger: RPM >= effectiveRedline * 0.98
-- Downshift trigger: RPM < lowRpmDownshift (default 2800)
-- Emergency downshift: RPM < stallThreshold (default 1050)
-- Predicted RPM ratio: gearRatios[lower] / gearRatios[current]
-- Reverse exit gate: gas (> 0.1) exits reverse cleanly; speed only used for reverse entry & drop-to-gear-1
+    VX_Powertrain v3.2.1
+    - Upshift trigger: RPM >= effectiveRedline * 0.98
+    - Downshift trigger: RPM < lowRpmDownshift (default 2800)
+    - Emergency downshift: RPM < stallThreshold (default 1050)
+    - Predicted RPM ratio: gearRatios[lower] / gearRatios[current]
+    - Reverse exit gate: gas (> 0.1) exits reverse cleanly; speed only used for reverse entry & drop-to-gear-1
+    - PrimaryPart fallback in _getSpeed() & _computeLoadFactor() + clean Stop() disconnect
 ]]
 
 local VX = _G.VX
@@ -16,7 +17,7 @@ local Player = Players.LocalPlayer
 local Module = VX.Framework.Module.new({
     Name = "Powertrain",
     Dependencies = { "Core", "Profiles", "Input", "VehicleState" },
-    Version = "3.2.0",
+    Version = "3.2.1",
 })
 
 local TICK_NORMAL = 60
@@ -44,6 +45,7 @@ function Module:Construct()
 
     self.pendingUpshift = { active = false, targetGear = nil, shiftTime = 0 }
     self._loopThread = nil
+    self._stateConn = nil
     self._running = false
     self._shiftEvents = 0
     self._lastShiftTime = 0
@@ -67,14 +69,31 @@ end
 
 function Module:Start()
     _G.VX.Powertrain = self
-    _G.VX.bus:on("vehicle.stateChanged", function(evt)
-        if evt.to == "Ready" or evt.to == "Idle" then self:_start()
-        elseif evt.to == "Exiting" or evt.to == "Disabled" then self:_stop() end
+    self._stateConn = _G.VX.bus:on("vehicle.stateChanged", function(evt)
+        if not evt then return end
+        if evt.to == "Ready" or evt.to == "Idle" then
+            self:_start()
+        elseif evt.to == "Exiting" or evt.to == "Disabled" then
+            self:_stop()
+        end
     end)
     self:_registerDiagnostics()
+
+    local authority = _G.VX.Authority
+    if authority and authority:getHandle() then
+        self:_start()
+    end
 end
 
 function Module:Stop()
+    if self._stateConn then
+        if typeof(self._stateConn) == "RBXScriptConnection" then
+            self._stateConn:Disconnect()
+        elseif type(self._stateConn) == "table" and self._stateConn.Disconnect then
+            self._stateConn:Disconnect()
+        end
+        self._stateConn = nil
+    end
     self:_stop()
     if _G.VX.Powertrain == self then _G.VX.Powertrain = nil end
 end
@@ -127,7 +146,10 @@ end
 function Module:_stop()
     if not self._running then return end
     self._running = false
-    if self._loopThread then pcall(function() task.cancel(self._loopThread) end); self._loopThread = nil end
+    if self._loopThread then
+        pcall(function() task.cancel(self._loopThread) end)
+        self._loopThread = nil
+    end
     self.launch.state = "idle"
     self.launch.twostepActive = false
     self.pendingUpshift.active = false
@@ -188,13 +210,19 @@ function Module:_updateThrottleSmoother(dt)
     local smoothingOn = (tiltLevel == "Medium" or tiltLevel == "High" or tiltLevel == "Extreme")
 
     if self.launch.twostepActive or self.launch.state == "holding" then
-        self.smoothedThrottle = 0; self.targetThrottle = 0; return
+        self.smoothedThrottle = 0
+        self.targetThrottle = 0
+        return
     end
     if self.launch.state == "releasing" then
-        self.smoothedThrottle = 1.0; self.targetThrottle = 1.0; return
+        self.smoothedThrottle = 1.0
+        self.targetThrottle = 1.0
+        return
     end
     if self.shiftState == "open" and settings.realisticShifting then
-        self.smoothedThrottle = 0; self.targetThrottle = 0; return
+        self.smoothedThrottle = 0
+        self.targetThrottle = 0
+        return
     end
 
     local raw = self.input:getRawThrottle()
@@ -210,15 +238,25 @@ function Module:_updateThrottleSmoother(dt)
     local rate
     local brakeSpeed = settings.brakeSpeed or 5.0
 
-    if target < -0.05 then rate = brakeSpeed
-    elseif cur < -0.05 and target > -0.05 then rate = brakeSpeed
+    if target < -0.05 then
+        rate = brakeSpeed
+    elseif cur < -0.05 and target > -0.05 then
+        rate = brakeSpeed
     elseif target > cur + 0.05 then
-        if settings.throttleUltra then rate = 100
-        elseif self.rpm >= self.core.config.launch.rpmTarget * 0.6 then rate = 2.0
-        elseif cur < 0.05 then rate = 0.4
-        else rate = 3.0 end
-    elseif target < cur - 0.05 then rate = 0.4
-    else rate = 5.0 end
+        if settings.throttleUltra then
+            rate = 100
+        elseif self.rpm >= self.core.config.launch.rpmTarget * 0.6 then
+            rate = 2.0
+        elseif cur < 0.05 then
+            rate = 0.4
+        else
+            rate = 3.0
+        end
+    elseif target < cur - 0.05 then
+        rate = 0.4
+    else
+        rate = 5.0
+    end
 
     local new = cur + (target - cur) * math.min(rate * dt, 1)
     self.smoothedThrottle = new
@@ -404,12 +442,19 @@ function Module:_doShift(newGear, direction, emergency)
 
     self._shiftEvents = self._shiftEvents + 1
     self._lastShiftTime = os.clock()
-    if direction == "up" then self._lastShiftUpTime = os.clock()
-    else self._lastShiftDownTime = os.clock() end
+    if direction == "up" then
+        self._lastShiftUpTime = os.clock()
+    else
+        self._lastShiftDownTime = os.clock()
+    end
 
     _G.VX.bus:emit("vehicle.shift", {
-        up = direction == "up", from = oldGear, to = newGear,
-        rpmBefore = rpmBefore, rpmAfter = self.rpm, emergency = emergency or false,
+        up = direction == "up",
+        from = oldGear,
+        to = newGear,
+        rpmBefore = rpmBefore,
+        rpmAfter = self.rpm,
+        emergency = emergency or false,
     })
 end
 
@@ -466,8 +511,9 @@ function Module:_computeLoadFactor(prof)
     if not (self.core.settings.physics and self.core.settings.physics.engineLoad) then return 1.0 end
     local authority = _G.VX.Authority
     local handle = authority and authority:getHandle()
-    if not handle or not handle.root or not handle.root.PrimaryPart then return 1.0 end
-    local upY = handle.root.PrimaryPart.CFrame.UpVector.Y
+    local part = handle and ((handle.root and handle.root.PrimaryPart) or handle.platform or handle.chassis or handle.seat)
+    if not part then return 1.0 end
+    local upY = part.CFrame.UpVector.Y
     if upY >= 0.999 then return 1.0 end
     local slope = 1 - upY
     local sens = self.core.settings.physics.engineLoadSensitivity or 1
@@ -516,7 +562,10 @@ function Module:_updateLaunch(dt)
             end
         end
     elseif launch.state == "arming" then
-        if not bothPedals then launch.state = "idle"; return end
+        if not bothPedals then
+            launch.state = "idle"
+            return
+        end
         if os.clock() - launch.startTime >= 0.15 then
             launch.state = "holding"
             launch.rpm = self.rpm
@@ -540,8 +589,11 @@ function Module:_updateLaunch(dt)
                 launch.releaseTime = os.clock()
                 local ratio = self.rpm / launch.rpmTarget
                 local quality = "miss"
-                if ratio >= cfg.windowPerfectMin and ratio <= cfg.windowPerfectMax then quality = "perfect"
-                elseif ratio >= cfg.windowGoodMin and ratio <= cfg.windowGoodMax then quality = "good" end
+                if ratio >= cfg.windowPerfectMin and ratio <= cfg.windowPerfectMax then
+                    quality = "perfect"
+                elseif ratio >= cfg.windowGoodMin and ratio <= cfg.windowGoodMax then
+                    quality = "good"
+                end
                 _G.VX.bus:emit("vehicle.launchRelease", { quality = quality, rpm = self.rpm, ratio = ratio })
             else
                 launch.state = "idle"
@@ -562,8 +614,9 @@ end
 function Module:_getSpeed()
     local authority = _G.VX.Authority
     local handle = authority and authority:getHandle()
-    if not handle or not handle.root or not handle.root.PrimaryPart then return 0 end
-    local v = handle.root.PrimaryPart.AssemblyLinearVelocity
+    local part = handle and ((handle.root and handle.root.PrimaryPart) or handle.platform or handle.chassis or handle.seat)
+    if not part then return 0 end
+    local v = part.AssemblyLinearVelocity
     return Vector3.new(v.X, 0, v.Z).Magnitude * STUDS_TO_MPH
 end
 
