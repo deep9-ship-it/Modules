@@ -1,6 +1,6 @@
 --[[
-    VX_Panel.lua — Left-Side GT3 Tuning Panel (All 45 Settings Across 5 Tabs)
-    Version: 3.3.2
+    VX_Panel.lua — Left-Side GT3 Tuning Panel (All 58 Live Settings Across 5 Tabs)
+    Version: 3.3.3
 ]]
 
 local VX = _G.VX
@@ -16,7 +16,7 @@ local UserInputService = game:GetService("UserInputService")
 local Module = VX.Framework.Module.new({
     Name = "Panel",
     Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "UI" },
-    Version = "3.3.2",
+    Version = "3.3.3",
 })
 
 local C = {
@@ -52,7 +52,9 @@ local function _stroke(parent, col, trans, thickness)
 end
 
 function Module:_trackConn(conn)
-    if conn then table.insert(self._conns, conn) end
+    if conn then
+        table.insert(self._conns, conn)
+    end
     return conn
 end
 
@@ -69,13 +71,15 @@ end
 
 function Module:_getSpeed()
     local auth = _G.VX.Authority
+    local handle = auth and auth:getHandle()
     local root = auth and auth:getRoot()
-    if root and root.PrimaryPart then
-        local raw = root.PrimaryPart.AssemblyLinearVelocity.Magnitude
-        local units = _G.VX.getSetting and _G.VX.getSetting("ui.units") or "KMH"
+    local velPart = (root and root.PrimaryPart) or (handle and handle.chassis)
+    local units = (_G.VX.getSetting and _G.VX.getSetting("ui.units")) or "KMH"
+    if velPart then
+        local raw = velPart.AssemblyLinearVelocity.Magnitude
         return (units == "MPH") and (raw * 0.389) or (raw * 0.626), units
     end
-    return 0, (_G.VX.getSetting and _G.VX.getSetting("ui.units") or "KMH")
+    return 0, units
 end
 
 function Module:Construct()
@@ -105,6 +109,10 @@ end
 
 function Module:Start()
     self:_createPanel()
+
+    if _G.VX.getSetting and _G.VX.getSetting("ui.videoMode") == true then
+        self:setHidden(true)
+    end
 
     self:_trackConn(_G.VX.bus:on("settings.changed", function(evt)
         if evt and evt.path and self._rowUpdaters[evt.path] then
@@ -162,11 +170,15 @@ end
 function Module:_refreshSystemCard()
     if not self._sysInfoLbl or not self._sysInfoLbl.Parent then return end
     local vs = _G.VX.Modules and _G.VX.Modules.VehicleState
-    local st = vs and vs:get() or "Unknown"
+    local st = vs and vs:getVehicleState() or "Unknown"
     local spd, units = self:_getSpeed()
     local prof = self.profiles:current()
     local status = _G.VX.getStatus and _G.VX.getStatus()
     local modCount = (status and status.modules) and #status.modules or 0
+    local rpm = self.powertrain.getRPM and self.powertrain:getRPM() or (self.powertrain.rpm or 0)
+    local gear = self.powertrain.getGear and self.powertrain:getGear() or (self.powertrain.gear or 1)
+    local gearStr = (gear == -1) and "R" or ((gear == 0) and "N" or tostring(gear))
+
     self._sysInfoLbl.Text = string.format(
         "Kernel v%s  |  Modules: %d\nState: %s  |  Speed: %.0f %s\nRPM: %d  |  Gear: %s\nActive Profile: %s",
         tostring(_G.VX.Version),
@@ -174,8 +186,8 @@ function Module:_refreshSystemCard()
         st,
         spd,
         units,
-        math.floor(self.powertrain.rpm or 0),
-        (self.powertrain.gear == -1) and "R" or ((self.powertrain.gear == 0) and "N" or tostring(self.powertrain.gear or 1)),
+        math.floor(rpm),
+        gearStr,
         prof and prof.name or "Default"
     )
 end
@@ -197,6 +209,7 @@ function Module:_createPanel()
     gui.Parent = pg
     self._gui = gui
 
+    -- LEFT-SIDE TOGGLE BUTTON
     local btn = Instance.new("TextButton")
     btn.Name = "ToggleBtn"
     btn.Size = UDim2.new(0, 44, 0, 44)
@@ -214,6 +227,7 @@ function Module:_createPanel()
     self._toggleBtn = btn
     self:_trackConn(btn.MouseButton1Click:Connect(function() self:toggle() end))
 
+    -- LEFT-SIDE SLIDING PANEL
     local panel = Instance.new("Frame")
     panel.Name = "MainPanel"
     panel.Size = UDim2.new(0, 348, 0.84, 0)
@@ -232,6 +246,7 @@ function Module:_createPanel()
     sizeConstraint.MaxSize = Vector2.new(364, 580)
     sizeConstraint.Parent = panel
 
+    -- Header
     local header = Instance.new("Frame")
     header.Size = UDim2.new(1, 0, 0, 42)
     header.BackgroundColor3 = C.panel
@@ -273,6 +288,7 @@ function Module:_createPanel()
     _corner(closeBtn, 6)
     self:_trackConn(closeBtn.MouseButton1Click:Connect(function() self:close() end))
 
+    -- Tabs Row
     local tabBar = Instance.new("Frame")
     tabBar.Size = UDim2.new(1, -16, 0, 30)
     tabBar.Position = UDim2.new(0, 8, 0, 48)
@@ -300,6 +316,7 @@ function Module:_createPanel()
         end))
     end
 
+    -- Content Scroll
     local scroll = Instance.new("ScrollingFrame")
     scroll.Size = UDim2.new(1, -16, 1, -134)
     scroll.Position = UDim2.new(0, 8, 0, 84)
@@ -488,6 +505,7 @@ function Module:_addSettingRow(path)
     lbl.TextSize = 12
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     lbl.TextColor3 = C.text
+    lbl.TextTruncate = Enum.TextTruncate.AtEnd
     lbl.Text = schema.label or path
     lbl.Parent = row
 
@@ -583,6 +601,7 @@ function Module:_addSettingRow(path)
         local minV = schema.min or 0
         local maxV = schema.max or 1
         local step = schema.step or (schema.type == "int" and 1 or 0.05)
+        local invStep = 1 / step
 
         local valLbl = Instance.new("TextLabel")
         valLbl.Size = UDim2.new(0.35, -10, 0, 20)
@@ -639,8 +658,12 @@ function Module:_addSettingRow(path)
         _corner(knob, 7)
 
         local function formatVal(v)
-            if schema.type == "int" then
+            if schema.type == "int" or step >= 1 then
                 return string.format("%d", math.floor(v + 0.5))
+            elseif step < 0.001 then
+                return string.format("%.4f", v)
+            elseif step < 0.01 then
+                return string.format("%.3f", v)
             end
             return string.format("%.2f", v)
         end
@@ -648,7 +671,7 @@ function Module:_addSettingRow(path)
         local function sync()
             local v = tonumber(_G.VX.getSetting(path))
             if v == nil then v = schema.default or minV end
-            local pct = math.clamp((v - minV) / math.max(0.0001, maxV - minV), 0, 1)
+            local pct = math.clamp((v - minV) / math.max(0.00001, maxV - minV), 0, 1)
             fill.Size = UDim2.new(pct, 0, 1, 0)
             knob.Position = UDim2.new(pct, 0, 0.5, 0)
             valLbl.Text = formatVal(v)
@@ -656,11 +679,17 @@ function Module:_addSettingRow(path)
         sync()
         self._rowUpdaters[path] = sync
 
+        local function snapValue(raw)
+            local snapped = math.clamp(math.floor(raw * invStep + 0.5) / invStep, minV, maxV)
+            if schema.type == "int" then
+                snapped = math.floor(snapped + 0.5)
+            end
+            return snapped
+        end
+
         local function nudge(delta)
             local cur = tonumber(_G.VX.getSetting(path)) or schema.default or minV
-            local nextV = math.clamp(math.floor((cur + delta) / step + 0.5) * step, minV, maxV)
-            if schema.type == "int" then nextV = math.floor(nextV + 0.5) end
-            _G.VX.setSetting(path, nextV)
+            _G.VX.setSetting(path, snapValue(cur + delta))
             sync()
         end
 
@@ -670,10 +699,7 @@ function Module:_addSettingRow(path)
         local dragging = false
         local function applyX(x)
             local rel = math.clamp((x - track.AbsolutePosition.X) / math.max(1, track.AbsoluteSize.X), 0, 1)
-            local raw = minV + rel * (maxV - minV)
-            local snapped = math.clamp(math.floor(raw / step + 0.5) * step, minV, maxV)
-            if schema.type == "int" then snapped = math.floor(snapped + 0.5) end
-            _G.VX.setSetting(path, snapped)
+            _G.VX.setSetting(path, snapValue(minV + rel * (maxV - minV)))
             sync()
         end
 
@@ -697,23 +723,37 @@ function Module:_addSettingRow(path)
 end
 
 function Module:_buildDynamics()
-    self:_addSection("Drivetrain & Balance")
+    self:_addSection("Drivetrain & Weight Transfer")
     self:_addSettingRow("drivetrain")
-    self:_addSettingRow("physics.driveMode")
+    self:_addSettingRow("weightTransferMode")
+    self:_addSettingRow("weightTransferIntensity")
+    self:_addSettingRow("physics.weightTransfer")
+
+    self:_addSection("Grip, Aero & Top Speed")
     self:_addSettingRow("frontGrip")
     self:_addSettingRow("rearGrip")
     self:_addSettingRow("physics.aeroDownforce")
+    self:_addSettingRow("physics.downforceCoefficient")
+    self:_addSettingRow("physics.aeroDrag")
+    self:_addSettingRow("topSpeed")
+
+    self:_addSection("Steering & Braking")
     self:_addSettingRow("steeringSensitivity")
+    self:_addSettingRow("physics.turnSpeed")
+    self:_addSettingRow("physics.maxSteerAngle")
+    self:_addSettingRow("physics.steeringDecay")
     self:_addSettingRow("brakingPower")
-    self:_addSettingRow("physicsTiltLevel")
+    self:_addSettingRow("coastAssist")
 
     self:_addSection("Assists & Chassis Simulation")
     self:_addSettingRow("physics.tractionControl")
-    self:_addSettingRow("physics.abs")
-    self:_addSettingRow("physics.tireTemp")
-    self:_addSettingRow("physics.brakeFade")
-    self:_addSettingRow("physics.slopeLoad")
+    self:_addSettingRow("physics.tractionControlSensitivity")
+    self:_addSettingRow("physics.absEnabled")
+    self:_addSettingRow("physics.tireTempEnabled")
+    self:_addSettingRow("physics.brakeFadeEnabled")
     self:_addSettingRow("physics.engineBraking")
+    self:_addSettingRow("physics.engineBrakingStrength")
+    self:_addSettingRow("physics.slopeLoad")
 end
 
 function Module:_buildEngine()
@@ -753,7 +793,7 @@ function Module:_buildEngine()
         subLbl.Font = Enum.Font.Code
         subLbl.TextSize = 10
         subLbl.TextXAlignment = Enum.TextXAlignment.Left
-        subLbl.Text = string.format("%d RPM | %dG", prof.redline, #prof.gearRatios)
+        subLbl.Text = string.format("%d RPM | %dG", prof.redlineRPM or prof.redline, #prof.gearRatios)
         subLbl.Parent = b
 
         self._profileCards[i] = { btn = b, nameLbl = nameLbl, subLbl = subLbl }
@@ -765,11 +805,15 @@ function Module:_buildEngine()
 
     self:_addSection("Forced Induction")
     self:_addSettingRow("turboStage")
+    self:_addSettingRow("turboCustomMultiplier")
 
-    self:_addSection("Transmission & Launch")
+    self:_addSection("Torque & Transmission")
+    self:_addSettingRow("physics.torqueCurve")
     self:_addSettingRow("physics.realisticShifting")
     self:_addSettingRow("physics.shiftDelay")
     self:_addSettingRow("physics.revLimiter")
+
+    self:_addSection("Launch & Idle")
     self:_addSettingRow("physics.launchControl")
     self:_addSettingRow("physics.launchTargetRPM")
     self:_addSettingRow("physics.twostep")
@@ -787,20 +831,21 @@ function Module:_buildAudio()
     self:_addSettingRow("audio.volumeBoost")
     self:_addSettingRow("pitchOffset")
 
-    self:_addSection("Sound Effects")
+    self:_addSection("Turbo & Sound Effects")
+    self:_addSettingRow("turboSpoolEnabled")
+    self:_addSettingRow("turboBlowoffEnabled")
     self:_addSettingRow("audio.compressor")
-    self:_addSettingRow("audio.turboSpool")
     self:_addSettingRow("audio.shiftSounds")
     self:_addSettingRow("audio.backfires")
     self:_addSettingRow("audio.exhaustPops")
 end
 
 function Module:_buildVisuals()
-    self:_addSection("Camera & Vehicle Effects")
-    self:_addSettingRow("visuals.cameraFOV")
-    self:_addSettingRow("visuals.cameraVibration")
-    self:_addSettingRow("visuals.bodyTilt")
-    self:_addSettingRow("visuals.exhaustFlames")
+    self:_addSection("Camera & Body Motion")
+    self:_addSettingRow("physicsTiltLevel")
+    self:_addSettingRow("fovDynamicsEnabled")
+    self:_addSettingRow("vehicleShaking")
+    self:_addSettingRow("shiftingJolt")
 
     self:_addSection("HUD Overlays")
     self:_addSettingRow("visuals.telemetry")
