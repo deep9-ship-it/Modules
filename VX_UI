@@ -1,6 +1,6 @@
 --[[
     VX_UI.lua — Middle-Bottom Dashboard HUD, Notifications, Telemetry (F2), Diagnostics (F3) & Video Mode (F4)
-    Version: 3.3.1
+    Version: 3.3.2
 ]]
 
 local VX = _G.VX
@@ -16,7 +16,7 @@ local UserInputService = game:GetService("UserInputService")
 local Module = VX.Framework.Module.new({
     Name = "UI",
     Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "VehicleState" },
-    Version = "3.3.1",
+    Version = "3.3.2",
 })
 
 local C = {
@@ -216,7 +216,6 @@ function Module:_createGui()
 end
 
 function Module:_createDashboard(gui)
-    -- MIDDLE BOTTOM DASHBOARD
     local dash = Instance.new("Frame")
     dash.Name = "Dashboard"
     dash.Size = UDim2.new(0, 344, 0, 154)
@@ -236,7 +235,6 @@ function Module:_createDashboard(gui)
     scale.Parent = dash
     self._dashScale = scale
 
-    -- Left: Speed + Units
     local speedLbl = Instance.new("TextLabel")
     speedLbl.Size = UDim2.new(0, 126, 0, 48)
     speedLbl.Position = UDim2.new(0, 14, 0, 8)
@@ -261,7 +259,6 @@ function Module:_createDashboard(gui)
     unitLbl.Parent = dash
     self._unitLbl = unitLbl
 
-    -- Center: Gear Badge
     local gearBox = Instance.new("Frame")
     gearBox.Size = UDim2.new(0, 54, 0, 54)
     gearBox.Position = UDim2.new(0.5, -27, 0, 10)
@@ -282,7 +279,6 @@ function Module:_createDashboard(gui)
     gearLbl.Parent = gearBox
     self._gearLbl = gearLbl
 
-    -- Right: Boost PSI + Boost Bar + RPM
     local boostLbl = Instance.new("TextLabel")
     boostLbl.Size = UDim2.new(0, 118, 0, 20)
     boostLbl.Position = UDim2.new(1, -132, 0, 10)
@@ -323,7 +319,6 @@ function Module:_createDashboard(gui)
     rpmLbl.Parent = dash
     self._rpmLbl = rpmLbl
 
-    -- RPM Bar + Redline Marker
     local rpmBg = Instance.new("Frame")
     rpmBg.Size = UDim2.new(1, -28, 0, 12)
     rpmBg.Position = UDim2.new(0, 14, 0, 76)
@@ -349,7 +344,6 @@ function Module:_createDashboard(gui)
     redMark.Parent = rpmBg
     self._redMark = redMark
 
-    -- Throttle & Brake Mini Bars
     local thrBg = Instance.new("Frame")
     thrBg.Size = UDim2.new(0.5, -18, 0, 5)
     thrBg.Position = UDim2.new(0, 14, 0, 94)
@@ -382,7 +376,6 @@ function Module:_createDashboard(gui)
     _corner(brkFill, 3)
     self._brkFill = brkFill
 
-    -- Meta & Active Flags
     local metaLbl = Instance.new("TextLabel")
     metaLbl.Size = UDim2.new(1, -28, 0, 18)
     metaLbl.Position = UDim2.new(0, 14, 0, 106)
@@ -396,7 +389,7 @@ function Module:_createDashboard(gui)
     self._metaLbl = metaLbl
 
     local flagsLbl = Instance.new("TextLabel")
-    flagsLbl.Size = UDim2.new(1, -28, 0, 18)
+    flagsLbl.Size = UDim2.new(1, -120, 0, 18)
     flagsLbl.Position = UDim2.new(0, 14, 0, 126)
     flagsLbl.BackgroundTransparency = 1
     flagsLbl.Font = Enum.Font.GothamBold
@@ -681,7 +674,7 @@ end
 
 function Module:_update()
     if not self._dash then return end
-    local st = self.state:getState()
+    local st = self.state:get()
     local active = (st ~= "Disabled" and st ~= "Exiting") and (_getSetting("enabled", true) ~= false) and not self._videoMode
     self._dash.Visible = active
 
