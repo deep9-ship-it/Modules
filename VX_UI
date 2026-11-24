@@ -1,6 +1,6 @@
 --[[
     VX_UI.lua — Middle-Bottom Dashboard HUD, Notifications, Telemetry (F2), Diagnostics (F3) & Video Mode (F4)
-    Version: 3.3.2
+    Version: 3.3.3
 ]]
 
 local VX = _G.VX
@@ -16,7 +16,7 @@ local UserInputService = game:GetService("UserInputService")
 local Module = VX.Framework.Module.new({
     Name = "UI",
     Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "VehicleState" },
-    Version = "3.3.2",
+    Version = "3.3.3",
 })
 
 local C = {
@@ -36,7 +36,9 @@ local C = {
 local function _getSetting(path, fallback)
     if _G.VX and type(_G.VX.getSetting) == "function" then
         local v = _G.VX.getSetting(path)
-        if v ~= nil then return v end
+        if v ~= nil then
+            return v
+        end
     end
     return fallback
 end
@@ -88,6 +90,8 @@ function Module:Construct()
     self._hiddenGuis = {}
     self._lastDiagUpdate = 0
     self._lastSpinNotify = 0
+    self._lastAbsCount = 0
+    self._lastAbsTime = 0
     self._videoMode = false
 end
 
@@ -110,7 +114,9 @@ function Module:Start()
             local prof = self.profiles:current()
             self:notify("VX Active", (prof and prof.name or "Engine") .. " Ready", C.accent, 2.5)
         elseif evt.to == "Disabled" then
-            if self._dash then self._dash.Visible = false end
+            if self._dash then
+                self._dash.Visible = false
+            end
         end
     end))
 
@@ -128,10 +134,11 @@ function Module:Start()
         self:notify("Launch Control", string.format("Armed @ %d RPM", target), C.amber, 1.8)
     end))
 
-    self:_trackConn(_G.VX.bus:on("vehicle.launchQuality", function(evt)
+    self:_trackConn(_G.VX.bus:on("vehicle.launchRelease", function(evt)
         if evt and evt.quality then
-            local col = (evt.quality == "PERFECT") and C.green or ((evt.quality == "GOOD") and C.accent or C.amber)
-            self:notify("Launch", evt.quality .. " LAUNCH!", col, 2.2)
+            local q = string.upper(tostring(evt.quality))
+            local col = (q == "PERFECT") and C.green or ((q == "GOOD") and C.accent or C.amber)
+            self:notify("Launch", q .. " LAUNCH!", col, 2.2)
         end
     end))
 
@@ -216,6 +223,7 @@ function Module:_createGui()
 end
 
 function Module:_createDashboard(gui)
+    -- MIDDLE BOTTOM DASHBOARD
     local dash = Instance.new("Frame")
     dash.Name = "Dashboard"
     dash.Size = UDim2.new(0, 344, 0, 154)
@@ -235,6 +243,7 @@ function Module:_createDashboard(gui)
     scale.Parent = dash
     self._dashScale = scale
 
+    -- Left: Speed + Units
     local speedLbl = Instance.new("TextLabel")
     speedLbl.Size = UDim2.new(0, 126, 0, 48)
     speedLbl.Position = UDim2.new(0, 14, 0, 8)
@@ -259,6 +268,7 @@ function Module:_createDashboard(gui)
     unitLbl.Parent = dash
     self._unitLbl = unitLbl
 
+    -- Center: Gear Badge
     local gearBox = Instance.new("Frame")
     gearBox.Size = UDim2.new(0, 54, 0, 54)
     gearBox.Position = UDim2.new(0.5, -27, 0, 10)
@@ -279,6 +289,7 @@ function Module:_createDashboard(gui)
     gearLbl.Parent = gearBox
     self._gearLbl = gearLbl
 
+    -- Right: Boost PSI + Boost Bar + RPM
     local boostLbl = Instance.new("TextLabel")
     boostLbl.Size = UDim2.new(0, 118, 0, 20)
     boostLbl.Position = UDim2.new(1, -132, 0, 10)
@@ -319,6 +330,7 @@ function Module:_createDashboard(gui)
     rpmLbl.Parent = dash
     self._rpmLbl = rpmLbl
 
+    -- RPM Bar + Redline Marker
     local rpmBg = Instance.new("Frame")
     rpmBg.Size = UDim2.new(1, -28, 0, 12)
     rpmBg.Position = UDim2.new(0, 14, 0, 76)
@@ -344,6 +356,7 @@ function Module:_createDashboard(gui)
     redMark.Parent = rpmBg
     self._redMark = redMark
 
+    -- Throttle & Brake Mini Bars
     local thrBg = Instance.new("Frame")
     thrBg.Size = UDim2.new(0.5, -18, 0, 5)
     thrBg.Position = UDim2.new(0, 14, 0, 94)
@@ -376,6 +389,7 @@ function Module:_createDashboard(gui)
     _corner(brkFill, 3)
     self._brkFill = brkFill
 
+    -- Meta & Active Flags
     local metaLbl = Instance.new("TextLabel")
     metaLbl.Size = UDim2.new(1, -28, 0, 18)
     metaLbl.Position = UDim2.new(0, 14, 0, 106)
@@ -384,7 +398,7 @@ function Module:_createDashboard(gui)
     metaLbl.TextSize = 11
     metaLbl.TextXAlignment = Enum.TextXAlignment.Left
     metaLbl.TextColor3 = C.muted
-    metaLbl.Text = "RWD  |  NORMAL  |  STG 1"
+    metaLbl.Text = "AWD  |  NORMAL  |  STG 1"
     metaLbl.Parent = dash
     self._metaLbl = metaLbl
 
@@ -508,7 +522,7 @@ function Module:_createTelemetry(gui)
     title.Text = "VISUAL TELEMETRY (F2)"
     title.Parent = f
 
-    local keys = { "State", "Speed", "RPM", "Gear", "Boost", "Inputs", "Slip", "Slope", "Friction", "Tires", "Brakes" }
+    local keys = { "State", "Speed", "RPM", "Gear", "Boost", "Inputs", "Slip", "Slope", "Grip", "Tires", "Brakes" }
     for i, k in ipairs(keys) do
         local lbl = Instance.new("TextLabel")
         lbl.Size = UDim2.new(1, -20, 0, 18)
@@ -674,7 +688,7 @@ end
 
 function Module:_update()
     if not self._dash then return end
-    local st = self.state:get()
+    local st = self.state:getVehicleState()
     local active = (st ~= "Disabled" and st ~= "Exiting") and (_getSetting("enabled", true) ~= false) and not self._videoMode
     self._dash.Visible = active
 
@@ -685,20 +699,22 @@ function Module:_update()
 
     local auth = _G.VX.Modules and _G.VX.Modules.Authority
     local root = auth and auth:getRoot()
-    local rawSpeed = (root and root.PrimaryPart) and root.PrimaryPart.AssemblyLinearVelocity.Magnitude or 0
+    local handle = auth and auth:getHandle()
+    local velPart = (root and root.PrimaryPart) or (handle and handle.chassis)
+    local rawSpeed = velPart and velPart.AssemblyLinearVelocity.Magnitude or 0
     local units = _getSetting("ui.units", "KMH")
     local speedVal = (units == "MPH") and (rawSpeed * 0.389) or (rawSpeed * 0.626)
 
     self._speedLbl.Text = tostring(math.floor(speedVal + 0.5))
     self._unitLbl.Text = (units == "MPH") and "MPH" or "KM/H"
 
-    local gear = self.powertrain.gear or 0
+    local gear = self.powertrain:getGear()
     self._gearLbl.Text = (gear == -1) and "R" or ((gear == 0) and "N" or tostring(gear))
 
     local prof = self.profiles:current()
     local maxRpm = (prof and prof.maxRPM) or 9000
-    local redline = (prof and prof.redline) or 7800
-    local rpm = self.powertrain.rpm or 0
+    local redline = (prof and (prof.redlineRPM or prof.redline)) or 7800
+    local rpm = self.powertrain:getRPM() or 0
     local pct = math.clamp(rpm / maxRpm, 0, 1)
     local redPct = math.clamp(redline / maxRpm, 0.5, 0.98)
 
@@ -707,49 +723,65 @@ function Module:_update()
     self._rpmFill.BackgroundColor3 = (rpm >= redline) and C.red or ((rpm >= redline * 0.86) and C.amber or C.green)
     self._redMark.Position = UDim2.new(redPct, 0, 0, -1)
 
-    local psi = self.drive.boostPSI or 0
+    local psi = self.drive.boostPressure or (self.drive.getBoost and self.drive:getBoost()) or 0
     local stg = _getSetting("turboStage", 1)
-    local stageCfg = self.core and self.core._config and self.core._config.turboStages and self.core._config.turboStages[stg]
-    local maxPsi = (stageCfg and stageCfg.psi) or 21
+    local customMult = _getSetting("turboCustomMultiplier", 1.0)
+    local cfg = self.core and (self.core.config or self.core._config)
+    local stageCfg = cfg and cfg.turboStages and cfg.turboStages[stg]
+    local maxPsi = ((stageCfg and stageCfg.targetBoostPSI) or 21) * customMult
     self._boostLbl.Text = string.format("%.1f PSI", psi)
-    self._boostFill.Size = UDim2.new(math.clamp(psi / maxPsi, 0, 1), 0, 1, 0)
+    self._boostFill.Size = UDim2.new(math.clamp(psi / math.max(1, maxPsi), 0, 1), 0, 1, 0)
 
     self._thrFill.Size = UDim2.new(math.clamp(self.powertrain.throttle or 0, 0, 1), 0, 1, 0)
     self._brkFill.Size = UDim2.new(math.clamp(self.powertrain.brake or 0, 0, 1), 0, 1, 0)
 
-    local dt = _getSetting("drivetrain", "RWD")
-    local dm = string.upper(_getSetting("physics.driveMode", "Normal"))
+    local dt = _getSetting("drivetrain", "AWD")
+    local dm = string.upper(tostring(_getSetting("weightTransferMode", "Normal")))
     self._metaLbl.Text = string.format("%s  |  %s  |  STG %d  |  %s", dt, dm, stg, prof and prof.name or "Default")
 
-    local flags = {}
-    if self.drive.tcsActive then table.insert(flags, "TCS") end
-    if self.drive.absActive then table.insert(flags, "ABS") end
-    if self.powertrain.isRevLimiting then table.insert(flags, "REV") end
-    if self.powertrain.twostepActive then table.insert(flags, "2-STEP") end
-    if self.powertrain.launchState == "Armed" or self.powertrain.launchState == "Ready" then
-        table.insert(flags, "LC:" .. string.upper(self.powertrain.launchState))
+    -- Detect active ABS pulses from DriveSystem counter
+    local absCount = self.drive._absActivations or 0
+    if absCount > self._lastAbsCount then
+        self._lastAbsCount = absCount
+        self._lastAbsTime = os.clock()
     end
-    if self.chassis.isSpinning then table.insert(flags, "SLIP") end
-    self._flagsLbl.Text = table.concat(flags, " • ")
-    self._flagsLbl.TextColor3 = self.chassis.isSpinning and C.amber or C.green
+    local absLive = (os.clock() - self._lastAbsTime) < 0.35
 
-    local bTemp = self.drive.brakeTemp or 60
-    self._brakeTempLbl.Text = string.format("BRK %.0fC", bTemp)
-    self._brakeTempLbl.TextColor3 = (bTemp >= 550) and C.red or ((bTemp >= 350) and C.amber or C.muted)
+    local spinning = self.chassis.spinActive == true
+    local flags = {}
+    if _getSetting("physics.tractionControl", true) and spinning then table.insert(flags, "TCS") end
+    if absLive then table.insert(flags, "ABS") end
+    if self.powertrain:isRevLimiting() then table.insert(flags, "REV") end
+    if self.powertrain:isTwostepActive() then table.insert(flags, "2-STEP") end
+    if self.powertrain:getShiftState() == "open" and not self.powertrain.isShifting then
+        table.insert(flags, "CLUTCH")
+    end
+    if self.powertrain:getLaunchState() == "holding" then
+        table.insert(flags, "LC:" .. string.upper(self.powertrain.launchState or "ARMED"))
+    end
+    if spinning then table.insert(flags, "SLIP") end
+    self._flagsLbl.Text = table.concat(flags, " • ")
+    self._flagsLbl.TextColor3 = spinning and C.amber or C.green
+
+    local bNorm = math.clamp(self.drive.brakeTemp or 0, 0, 1)
+    local bDeg = 60 + bNorm * 640
+    self._brakeTempLbl.Text = string.format("BRK %.0fC", bDeg)
+    self._brakeTempLbl.TextColor3 = (bNorm >= 0.75) and C.red or ((bNorm >= 0.45) and C.amber or C.muted)
 
     if self._telFrame and self._telFrame.Visible then
-        local tt = self.chassis.tireTemp or {}
+        local fTemp = 40 + (self.chassis:getTireTemp("front") or 0) * 90
+        local rTemp = 40 + (self.chassis:getTireTemp("rear") or 0) * 90
         self._telLabels.State.Text = string.format("State:    %s", st)
         self._telLabels.Speed.Text = string.format("Speed:    %.1f %s", speedVal, units)
         self._telLabels.RPM.Text = string.format("RPM:      %d / %d", math.floor(rpm), maxRpm)
         self._telLabels.Gear.Text = string.format("Gear:     %s", self._gearLbl.Text)
-        self._telLabels.Boost.Text = string.format("Boost:    %.1f / %d PSI", psi, maxPsi)
+        self._telLabels.Boost.Text = string.format("Boost:    %.1f / %.0f PSI", psi, maxPsi)
         self._telLabels.Inputs.Text = string.format("T/B/S:    %.0f%% / %.0f%% / %.2f", (self.powertrain.throttle or 0) * 100, (self.powertrain.brake or 0) * 100, self.powertrain.steer or 0)
-        self._telLabels.Slip.Text = string.format("Slip:     %.2f (%s)", self.chassis.slipRatio or 0, self.chassis.isSpinning and "SPIN" or "GRIP")
+        self._telLabels.Slip.Text = string.format("Slip:     %.2f (%s)", self.chassis.slipRatio or 0, spinning and "SPIN" or "GRIP")
         self._telLabels.Slope.Text = string.format("Slope:    %.1f deg", self.chassis.slopeAngle or 0)
-        self._telLabels.Friction.Text = string.format("Friction: F:%.2f R:%.2f", self.chassis.frontFriction or 0, self.chassis.rearFriction or 0)
-        self._telLabels.Tires.Text = string.format("Tires:    F:%.0fC R:%.0fC", tt.front or 40, tt.rear or 40)
-        self._telLabels.Brakes.Text = string.format("Brakes:   %.0f C", bTemp)
+        self._telLabels.Grip.Text = string.format("Grip:     F:%.2f R:%.2f", self.chassis.combinedFrontGrip or 0, self.chassis.combinedRearGrip or 0)
+        self._telLabels.Tires.Text = string.format("Tires:    F:%.0fC R:%.0fC", fTemp, rTemp)
+        self._telLabels.Brakes.Text = string.format("Brakes:   %.0f C", bDeg)
     end
 end
 
