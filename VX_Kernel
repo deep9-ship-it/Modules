@@ -1,54 +1,120 @@
 --[[
-    VX_Kernel v3.0.1
-    Framework + Registry + Loader + Hot-Reload + Diagnostics + Watchdog + Hotkeys
-
-    Load via:
-        loadstring(game:HttpGet("https://pastebin.com/raw/An52g8Tk"))()
+    VX_Kernel.lua — Microkernel, Topological Loader (GitHub), EventBus, Registry, Diagnostics & Watchdog
+    Version: 3.2.1
 ]]
 
-if _G.VX and _G.VX.Kernel then
-    warn("[VX] Kernel already loaded")
-    return _G.VX
+local VERSION = "3.2.1"
+
+local MODULE_URLS = {
+    Core         = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Core",
+    Profiles     = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Profile",
+    Remote       = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Remote",
+    Authority    = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_authority",
+    VehicleState = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_VehicleState",
+    Input        = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Input",
+    Powertrain   = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Powertrain",
+    DriveSystem  = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_DriveSystem",
+    Chassis      = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Chassis",
+    Audio        = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Audio",
+    Visuals      = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Visuals",
+    UI           = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_UI",
+    Panel        = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Panel",
+}
+
+local MODULE_ORDER = {
+    "Core",
+    "Authority",
+    "VehicleState",
+    "Input",
+    "Profiles",
+    "Remote",
+    "Powertrain",
+    "DriveSystem",
+    "Chassis",
+    "Audio",
+    "Visuals",
+    "UI",
+    "Panel",
+}
+
+local WATCHDOG_INTERVAL = 2.5
+local MAX_HEARTBEAT_FAILS = 3
+local HTTP_RETRIES = 2
+
+local function _deepCopy(tbl)
+    if type(tbl) ~= "table" then return tbl end
+    local copy = {}
+    for k, v in pairs(tbl) do
+        copy[k] = _deepCopy(v)
+    end
+    return copy
 end
 
--- ==================== FRAMEWORK: SIGNAL ====================
+-- Preserve user settings across hot-reloads
+local _preservedSettings = nil
+if _G.VX then
+    if type(_G.VX.settings) == "table" then
+        _preservedSettings = _deepCopy(_G.VX.settings)
+    end
+    if type(_G.VX.shutdown) == "function" then
+        pcall(_G.VX.shutdown)
+        task.wait(0.15)
+    end
+end
+
+-- ==================== SIGNAL & JANITOR ====================
+
 local Signal = {}
 Signal.__index = Signal
+
 function Signal.new()
     return setmetatable({ _handlers = {}, _nextId = 0 }, Signal)
 end
+
 function Signal:Connect(fn)
-    self._nextId = self._nextId + 1
+    self._nextId += 1
     local id = self._nextId
     self._handlers[id] = fn
+    local function disconnect()
+        self._handlers[id] = nil
+    end
     return {
-        Disconnect = function() self._handlers[id] = nil end,
+        Disconnect = disconnect,
+        disconnect = disconnect,
     }
 end
+
 function Signal:DisconnectAll()
     self._handlers = {}
 end
+
 function Signal:Fire(...)
     local snap = {}
-    for id, fn in pairs(self._handlers) do snap[id] = fn end
+    for id, fn in pairs(self._handlers) do
+        snap[id] = fn
+    end
     for id, fn in pairs(snap) do
         if self._handlers[id] then
             local ok, err = pcall(fn, ...)
-            if not ok then warn("[VX] Signal handler error: " .. tostring(err)) end
+            if not ok then
+                warn("[VX] Signal handler error: " .. tostring(err))
+            end
         end
     end
 end
 
--- ==================== FRAMEWORK: JANITOR ====================
 local Janitor = {}
 Janitor.__index = Janitor
+
 function Janitor.new()
     return setmetatable({ _items = {} }, Janitor)
 end
+
 function Janitor:Add(item)
     table.insert(self._items, item)
     return item
 end
+
 function Janitor:Cleanup()
     for i = #self._items, 1, -1 do
         local item = self._items[i]
@@ -62,253 +128,397 @@ function Janitor:Cleanup()
         end
     end
 end
-function Janitor:Clear() self:Cleanup() end
 
--- ==================== FRAMEWORK: MODULE ====================
+function Janitor:Clear()
+    self:Cleanup()
+end
+
+-- ==================== MODULE BASE ====================
+
 local Module = {}
 Module.__index = Module
+
 function Module.new(spec)
-    assert(spec.Name, "Module requires Name")
+    assert(type(spec) == "table" and type(spec.Name) == "string", "Module requires Name")
     return setmetatable({
-        _spec     = spec,
-        _name     = spec.Name,
-        _deps     = spec.Dependencies or {},
-        _state    = "loaded",
-        _janitor  = Janitor.new(),
-        _exports  = {},
-        _version  = spec.Version or "1.0.0",
+        Name = spec.Name,
+        Dependencies = spec.Dependencies or {},
+        Version = spec.Version or "1.0.0",
+        _spec = spec,
+        _name = spec.Name,
+        _deps = spec.Dependencies or {},
+        _state = "loaded",
+        _janitor = Janitor.new(),
+        _exports = {},
+        _version = spec.Version or "1.0.0",
     }, Module)
 end
-function Module:getName() return self._name end
+
+function Module:getName() return self.Name or self._name end
 function Module:getState() return self._state end
-function Module:getDeps() return self._deps end
-function Module:getVersion() return self._version end
+function Module:getDeps() return self.Dependencies or self._deps end
+function Module:getVersion() return self.Version or self._version end
 function Module:janitor() return self._janitor end
 function Module:setState(s) self._state = s end
+function Module:Construct() end
+function Module:Init() end
+function Module:Start() end
+function Module:Stop() end
+function Module:heartbeat() return true end
+
+-- ==================== BOOTSTRAP _G.VX ====================
+
+local VX = {
+    Kernel = true,
+    Version = VERSION,
+    Modules = {},
+    Framework = { Signal = Signal, Janitor = Janitor, Module = Module },
+    settings = _preservedSettings,
+    _booted = false,
+}
+_G.VX = VX
+
+local _bootOrder = {}
+local _failCounts = {}
+local _watchdogThread = nil
+local _hotkeyConns = {}
+
+-- ==================== EVENT BUS ====================
+
+local bus = { _listeners = {} }
+
+function bus:on(event, fn)
+    assert(type(event) == "string" and event ~= "", "bus:on requires event string")
+    assert(type(fn) == "function", "bus:on requires function")
+
+    local sig = self._listeners[event]
+    if not sig then
+        sig = Signal.new()
+        self._listeners[event] = sig
+    end
+    return sig:Connect(fn)
+end
+
+function bus:once(event, fn)
+    local conn
+    conn = self:on(event, function(data)
+        if conn then conn:Disconnect() end
+        fn(data)
+    end)
+    return conn
+end
+
+function bus:emit(event, payload)
+    local sig = self._listeners[event]
+    if sig then
+        sig:Fire(payload)
+    end
+end
+
+function bus:clear(event)
+    if event then
+        if self._listeners[event] then
+            self._listeners[event]:DisconnectAll()
+            self._listeners[event] = nil
+        end
+    else
+        for _, sig in pairs(self._listeners) do
+            sig:DisconnectAll()
+        end
+        self._listeners = {}
+    end
+end
+
+function bus:list()
+    local names = {}
+    for name in pairs(self._listeners) do
+        table.insert(names, name)
+    end
+    return names
+end
+
+VX.bus = bus
 
 -- ==================== REGISTRY ====================
-local Registry = {
-    _settings    = {},
-    _sounds      = {},
-    _events      = {},
-    _diagnostics = {},
-    _presets     = {},
-    _hotkeys     = {},
-    _parts       = {},
-    _owners      = {},
-    _onAdded  = Signal.new(),
-    _onRemoved = Signal.new(),
-}
 
-function Registry:set(kind, key, schema, owner)
-    assert(schema, "schema required")
-    local bucket = self["_" .. kind]
-    if not bucket then error("Unknown registry kind: " .. kind) end
-    if bucket[key] and self._owners[kind .. "." .. key] ~= owner then
-        error("Registry conflict: " .. kind .. "." .. key)
+local _regStore = {}
+local _onAdded = Signal.new()
+local _onRemoved = Signal.new()
+
+local registry = {}
+
+function registry:set(category, key, schema, owner)
+    assert(type(category) == "string" and category ~= "", "registry:set requires category")
+    assert(type(key) == "string" and key ~= "", "registry:set requires key")
+    assert(type(schema) == "table", "registry:set requires schema")
+
+    _regStore[category] = _regStore[category] or {}
+    local existing = _regStore[category][key]
+
+    if existing then
+        local merged = {}
+        for k, v in pairs(existing.schema) do merged[k] = v end
+        for k, v in pairs(schema) do merged[k] = v end
+        existing.schema = merged
+        existing.owner = owner or existing.owner
+        existing.updatedAt = os.clock()
+        _onAdded:Fire({ kind = category, key = key, schema = merged, owner = existing.owner })
+        return existing
     end
-    bucket[key] = schema
-    self._owners[kind .. "." .. key] = owner
-    self._onAdded:Fire({ kind = kind, key = key, schema = schema, owner = owner })
+
+    local entry = {
+        key = key,
+        schema = schema,
+        owner = owner or "unknown",
+        registeredAt = os.clock(),
+    }
+    _regStore[category][key] = entry
+    _onAdded:Fire({ kind = category, key = key, schema = schema, owner = entry.owner })
+    return entry
 end
 
-function Registry:get(kind, key)
-    local bucket = self["_" .. kind]
-    return bucket and bucket[key]
+function registry:get(category, key)
+    local cat = _regStore[category]
+    return cat and cat[key] or nil
 end
 
-function Registry:getAll(kind)
-    return self["_" .. kind] or {}
+function registry:list(category)
+    return _regStore[category] or {}
 end
 
-function Registry:remove(kind, key, owner)
-    local bucket = self["_" .. kind]
-    if not bucket then return end
-    if bucket[key] and self._owners[kind .. "." .. key] == owner then
-        bucket[key] = nil
-        self._owners[kind .. "." .. key] = nil
-        self._onRemoved:Fire({ kind = kind, key = key })
+function registry:getAll(category)
+    return _regStore[category] or {}
+end
+
+function registry:remove(category, key, owner)
+    local cat = _regStore[category]
+    if not cat then return end
+    if cat[key] and (not owner or cat[key].owner == owner) then
+        cat[key] = nil
+        _onRemoved:Fire({ kind = category, key = key })
     end
 end
 
-function Registry:removeAll(kind, owner)
-    local bucket = self["_" .. kind]
-    if not bucket then return end
+function registry:removeAll(category, owner)
+    local cat = _regStore[category]
+    if not cat then return end
     local doomed = {}
-    for key in pairs(bucket) do
-        if self._owners[kind .. "." .. key] == owner then
+    for key, entry in pairs(cat) do
+        if entry.owner == owner then
             table.insert(doomed, key)
         end
     end
-    for _, key in ipairs(doomed) do self:remove(kind, key, owner) end
+    for _, key in ipairs(doomed) do
+        self:remove(category, key, owner)
+    end
 end
 
-function Registry:dump()
+function registry:dump()
     local counts = {}
-    for _, kind in ipairs({"settings","sounds","events","diagnostics","presets","hotkeys","parts"}) do
+    for _, cat in ipairs({ "settings", "sounds", "events", "diagnostics", "presets", "hotkeys", "parts" }) do
         local n = 0
-        for _ in pairs(self["_" .. kind]) do n = n + 1 end
-        counts[kind] = n
+        for _ in pairs(_regStore[cat] or {}) do n += 1 end
+        counts[cat] = n
     end
     return counts
 end
 
-function Registry:onAdded(fn)   return self._onAdded:Connect(fn) end
-function Registry:onRemoved(fn) return self._onRemoved:Connect(fn) end
+function registry:onAdded(fn) return _onAdded:Connect(fn) end
+function registry:onRemoved(fn) return _onRemoved:Connect(fn) end
 
--- ==================== EVENT BUS ====================
-local EventBus = {}
-EventBus.__index = EventBus
-function EventBus.new()
-    return setmetatable({ _signals = {} }, EventBus)
-end
-function EventBus:on(name, fn)
-    if not self._signals[name] then self._signals[name] = Signal.new() end
-    return self._signals[name]:Connect(fn)
-end
-function EventBus:emit(name, payload)
-    if self._signals[name] then self._signals[name]:Fire(payload) end
-end
-function EventBus:clear()
-    for _, sig in pairs(self._signals) do sig:DisconnectAll() end
-    self._signals = {}
-end
-function EventBus:list()
-    local names = {}
-    for name in pairs(self._signals) do table.insert(names, name) end
-    return names
+VX.registry = registry
+
+-- ==================== DIAGNOSTICS ====================
+
+local _diagEntries = {}
+
+local diagnostics = {}
+
+function diagnostics.register(name, schema, owner)
+    assert(type(name) == "string" and name ~= "", "diagnostics.register requires name")
+    assert(type(schema) == "table" and type(schema.fn) == "function", "diagnostics.register requires schema.fn")
+    _diagEntries[name] = {
+        name = name,
+        schema = schema,
+        owner = owner or "unknown",
+    }
 end
 
--- ==================== MODULE URLS ====================
--- ⚠ THE 5 BELOW NEED RE-UPLOAD (they are the versions with syntax errors)
---   • VehicleState  → use the fixed version from my last message
---   • DriveSystem   → one-line fix (getState → getVehicleState)
---   • Chassis       → use the fixed version (no goto)
---   • Audio         → use the fixed version (no complex and/or)
---   • Visuals       → use the fixed version (fixed BindToRenderStep)
---
--- After re-uploading to pastebin/GitHub, replace those 5 URLs here.
-
-local MODULE_URLS = {
-    Core         = "https://pastebin.com/raw/F7Z4h9G6",
-    Profiles     = "https://pastebin.com/raw/jzHtqTEZ",
-    Remote       = "https://pastebin.com/raw/YqUpQ1r6",
-    Authority    = "https://pastebin.com/raw/dysVUmit",
-
-    -- ⚠ NEEDS UPDATE — upload the fixed VX_VehicleState
-    VehicleState = "https://pastebin.com/raw/Xr0vdsyS",
-
-    Input        = "https://pastebin.com/raw/mtTpU38a",
-    Powertrain   = "https://pastebin.com/raw/Q16xEuM5",
-
-    -- ⚠ NEEDS UPDATE — upload the fixed VX_DriveSystem (one-line change)
-    DriveSystem  = "https://pastebin.com/raw/5Gub08jK",
-
-    -- ⚠ NEEDS UPDATE — upload the fixed VX_Chassis (no goto)
-    Chassis      = "https://pastebin.com/raw/vUbc4K02",
-
-    -- ⚠ NEEDS UPDATE — push the fixed VX_Audio to GitHub
-    Audio        = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Audio",
-
-    -- ⚠ NEEDS UPDATE — push the fixed VX_Visuals to GitHub
-    Visuals      = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Visuals",
-
-    -- ✅ Already correct (they were skipped only because Chassis was missing)
-    UI           = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_UI",
-    Panel        = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Panel",
-}
-
--- ==================== NAMESPACE ====================
-local VX = _G.VX or {}
-_G.VX = VX
-VX.Kernel = true
-VX.Version = "20.0.1"
-VX.Framework = { Signal = Signal, Janitor = Janitor, Module = Module }
-VX.registry = Registry
-VX.bus = EventBus.new()
-VX.Modules = VX.Modules or {}
-
--- ==================== LOADER ====================
-local function fetchSource(url)
-    local ok, src = pcall(function() return game:HttpGet(url, true) end)
-    if not ok or not src or #src < 10 then
-        return nil, "HttpGet failed: " .. tostring(src)
-    end
-    return src
+function diagnostics.unregister(name)
+    _diagEntries[name] = nil
 end
 
-local function compileModule(name, url)
-    local src, err = fetchSource(url)
-    if not src then return nil, err end
-    local chunk, cerr = loadstring(src, "VX_" .. name)
-    if not chunk then return nil, "loadstring: " .. tostring(cerr) end
-    local ok, result = pcall(chunk)
-    if not ok then return nil, "runtime: " .. tostring(result) end
-    if type(result) ~= "table" or not result._name then
-        return nil, "module did not return a valid instance"
-    end
-    return result
-end
-
-local function loadAllModules()
-    local loaded = {}
-    for name, url in pairs(MODULE_URLS) do
-        local module, err = compileModule(name, url)
-        if module then
-            VX.Modules[name] = module
-            loaded[name] = module
-            module:setState("loaded")
-            print("[VX] Loaded: " .. name)
-        else
-            warn("[VX] Failed: " .. name .. " — " .. tostring(err))
+function diagnostics.unregisterByOwner(owner)
+    for name, entry in pairs(_diagEntries) do
+        if entry.owner == owner then
+            _diagEntries[name] = nil
         end
     end
-    return loaded
 end
 
-local function topologicalSort(modules)
-    local indegree, adj = {}, {}
-    for name in pairs(modules) do
-        indegree[name] = 0
-        adj[name] = {}
+function diagnostics.get(name)
+    local entry = _diagEntries[name]
+    if not entry then return nil end
+    local ok, res = pcall(entry.schema.fn)
+    return ok and res or nil
+end
+
+function diagnostics.getAll()
+    local out = {}
+    for name, entry in pairs(_diagEntries) do
+        local ok, result = pcall(entry.schema.fn)
+        local val = result
+        local unit = entry.schema.unit
+        local status = nil
+
+        if ok and type(result) == "table" and result.value ~= nil then
+            val = result.value
+            unit = unit or result.unit
+            status = result.status
+        elseif not ok then
+            val = "ERR: " .. tostring(result)
+            status = "error"
+        end
+
+        local schemaCopy = {}
+        for k, v in pairs(entry.schema) do
+            schemaCopy[k] = v
+        end
+        if unit and not schemaCopy.unit then
+            schemaCopy.unit = unit
+        end
+
+        out[name] = {
+            value = val,
+            unit = unit,
+            status = status,
+            raw = ok and result or nil,
+            schema = schemaCopy,
+            owner = entry.owner,
+            ok = ok,
+        }
     end
-    for name, mod in pairs(modules) do
-        for _, dep in ipairs(mod:getDeps()) do
-            if modules[dep] then
-                indegree[name] = indegree[name] + 1
-                table.insert(adj[dep], name)
-            else
-                warn("[VX] " .. name .. " depends on missing: " .. dep)
+    return out
+end
+
+VX.diagnostics = diagnostics
+
+-- ==================== LOADER & TOPOLOGICAL SORT ====================
+
+local function _httpGet(url, bustCache)
+    local target = url
+    if bustCache then
+        local sep = string.find(url, "?", 1, true) and "&" or "?"
+        target = url .. sep .. "t=" .. tostring(os.time())
+    end
+
+    local lastErr
+    for attempt = 1, HTTP_RETRIES + 1 do
+        local tryUrl = (attempt == 1) and target or url
+        local ok, res = pcall(game.HttpGet, game, tryUrl, true)
+        if ok and type(res) == "string" and #res > 10 then
+            return true, res
+        end
+        lastErr = res
+        if attempt <= HTTP_RETRIES then
+            task.wait(0.2 * attempt)
+        end
+    end
+    return false, lastErr
+end
+
+local function _compileModule(name, url, bustCache)
+    local ok, src = _httpGet(url, bustCache)
+    if not ok then
+        return nil, "HttpGet failed: " .. tostring(src)
+    end
+    local chunk, cerr = loadstring(src, "@VX_" .. name)
+    if not chunk then
+        return nil, "loadstring: " .. tostring(cerr)
+    end
+    local rok, mod = pcall(chunk)
+    if not rok then
+        return nil, "runtime: " .. tostring(mod)
+    end
+    if type(mod) ~= "table" or not (mod.Name or mod._name) then
+        return nil, "module did not return a valid VX Module instance"
+    end
+    return mod
+end
+
+local function _topoSort(modules, orderList)
+    local eligible = {}
+    local orderIdx = {}
+    for idx, name in ipairs(orderList) do
+        orderIdx[name] = idx
+        if modules[name] then
+            eligible[name] = modules[name]
+        end
+    end
+
+    local changed = true
+    while changed do
+        changed = false
+        for _, name in ipairs(orderList) do
+            local mod = eligible[name]
+            if mod then
+                for _, dep in ipairs(mod:getDeps()) do
+                    if not eligible[dep] then
+                        warn("[VX] Skipping " .. name .. " — missing dependency: " .. dep)
+                        eligible[name] = nil
+                        changed = true
+                        break
+                    end
+                end
             end
         end
     end
+
+    local indegree, adj = {}, {}
+    for name in pairs(eligible) do
+        indegree[name] = 0
+        adj[name] = {}
+    end
+    for name, mod in pairs(eligible) do
+        for _, dep in ipairs(mod:getDeps()) do
+            indegree[name] += 1
+            table.insert(adj[dep], name)
+        end
+    end
+
     local queue = {}
     for name, deg in pairs(indegree) do
         if deg == 0 then table.insert(queue, name) end
     end
+    table.sort(queue, function(a, b) return (orderIdx[a] or 999) < (orderIdx[b] or 999) end)
+
     local sorted = {}
     while #queue > 0 do
         local n = table.remove(queue, 1)
         table.insert(sorted, n)
-        for _, neighbor in ipairs(adj[n]) do
-            indegree[neighbor] = indegree[neighbor] - 1
-            if indegree[neighbor] == 0 then table.insert(queue, neighbor) end
+        for _, child in ipairs(adj[n]) do
+            indegree[child] -= 1
+            if indegree[child] == 0 then
+                table.insert(queue, child)
+                table.sort(queue, function(a, b) return (orderIdx[a] or 999) < (orderIdx[b] or 999) end)
+            end
         end
     end
     return sorted
 end
 
-local function runLifecycle(sorted, modules)
-    -- Construct
+local function _runLifecycle(sorted, modules)
     for _, name in ipairs(sorted) do
         local mod = modules[name]
-        if mod.Construct then
-            local ok, err = pcall(mod.Construct, mod)
-            if ok then mod:setState("constructed")
-            else mod:setState("failed"); warn("[VX] " .. name .. ".Construct: " .. tostring(err)) end
-        else mod:setState("constructed") end
+        local ok, err = pcall(mod.Construct, mod)
+        if ok then
+            mod:setState("constructed")
+        else
+            mod:setState("failed")
+            warn("[VX] " .. name .. ".Construct: " .. tostring(err))
+        end
     end
-    -- Init
+
     for _, name in ipairs(sorted) do
         local mod = modules[name]
         if mod:getState() == "constructed" then
@@ -316,166 +526,248 @@ local function runLifecycle(sorted, modules)
             for _, dep in ipairs(mod:getDeps()) do
                 local d = modules[dep]
                 if not d or d:getState() == "failed" or d:getState() == "skipped" then
-                    ok = false; break
+                    ok = false
+                    break
                 end
                 deps[dep] = d
             end
             if ok then
-                if mod.Init then
-                    local iok, err = pcall(mod.Init, mod, deps)
-                    if iok then mod:setState("inited")
-                    else mod:setState("failed"); warn("[VX] " .. name .. ".Init: " .. tostring(err)) end
-                else mod:setState("inited") end
-            else mod:setState("skipped"); warn("[VX] " .. name .. " skipped (missing deps)") end
+                local iok, err = pcall(mod.Init, mod, deps)
+                if iok then
+                    mod:setState("inited")
+                else
+                    mod:setState("failed")
+                    warn("[VX] " .. name .. ".Init: " .. tostring(err))
+                end
+            else
+                mod:setState("skipped")
+                warn("[VX] " .. name .. " skipped (missing deps)")
+            end
         end
     end
-    -- Start
+
     for _, name in ipairs(sorted) do
         local mod = modules[name]
         if mod:getState() == "inited" then
-            if mod.Start then
-                local ok, err = pcall(mod.Start, mod)
-                if ok then mod:setState("started")
-                else mod:setState("failed"); warn("[VX] " .. name .. ".Start: " .. tostring(err)) end
-            else mod:setState("started") end
+            local sok, err = pcall(mod.Start, mod)
+            if sok then
+                mod:setState("started")
+            else
+                mod:setState("failed")
+                warn("[VX] " .. name .. ".Start: " .. tostring(err))
+            end
         end
     end
 end
 
--- ==================== HOT-RELOAD ====================
+-- ==================== PUBLIC API ====================
+
+function VX.getModule(name)
+    return VX.Modules[name]
+end
+
+function VX.getStatus()
+    local list = {}
+    for _, name in ipairs(_bootOrder) do
+        local mod = VX.Modules[name]
+        if mod then
+            table.insert(list, {
+                name = mod:getName(),
+                version = mod:getVersion(),
+                state = mod:getState(),
+                failCount = _failCounts[name] or 0,
+            })
+        end
+    end
+    return { version = VERSION, booted = VX._booted, modules = list }
+end
+
+function VX.resetAll()
+    if type(VX.resetSetting) ~= "function" then
+        return false, "Core not ready"
+    end
+    local count = 0
+    for key, entry in pairs(registry:list("settings")) do
+        local ok, resetOk = pcall(VX.resetSetting, key)
+        if (not ok or not resetOk) and entry.schema and entry.schema.default ~= nil and type(VX.setSetting) == "function" then
+            pcall(VX.setSetting, key, _deepCopy(entry.schema.default))
+            count += 1
+        elseif ok and resetOk then
+            count += 1
+        end
+    end
+    return true, count
+end
+
 function VX.reload(name)
+    if not name then
+        local ok, src = _httpGet("https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Kernel", true)
+        if not ok then warn("[VX] Kernel reload failed: " .. tostring(src)); return false end
+        local chunk, err = loadstring(src, "@VX_Kernel")
+        if not chunk then warn("[VX] Kernel compile error: " .. tostring(err)); return false end
+        local rok, rerr = pcall(chunk)
+        if not rok then warn("[VX] Kernel runtime error: " .. tostring(rerr)); return false end
+        return true
+    end
+
     local existing = VX.Modules[name]
     local url = MODULE_URLS[name]
-    if not url then warn("[VX] No URL for " .. name); return false end
+    if not url then warn("[VX] No URL for " .. tostring(name)); return false end
+
     if existing then
-        for _, kind in ipairs({"settings","sounds","events","diagnostics","presets","hotkeys","parts"}) do
-            Registry:removeAll(kind, name)
+        for _, kind in ipairs({ "settings", "sounds", "events", "diagnostics", "presets", "hotkeys", "parts" }) do
+            registry:removeAll(kind, name)
         end
-        if existing.Stop then pcall(existing.Stop, existing) end
+        diagnostics.unregisterByOwner(name)
+        pcall(existing.Stop, existing)
+        if existing._janitor then pcall(function() existing._janitor:Cleanup() end) end
     end
-    local module, err = compileModule(name, url)
-    if not module then warn("[VX] Reload failed " .. name .. ": " .. tostring(err)); return false end
-    if module.Construct then pcall(module.Construct, module) end
+
+    local mod, err = _compileModule(name, url, true)
+    if not mod then warn("[VX] Reload failed " .. name .. ": " .. tostring(err)); return false end
+
+    pcall(mod.Construct, mod)
     local deps = {}
-    for _, dep in ipairs(module:getDeps()) do deps[dep] = VX.Modules[dep] end
-    if module.Init then pcall(module.Init, module, deps) end
-    if module.Start then pcall(module.Start, module) end
-    VX.Modules[name] = module
-    module:setState("started")
+    for _, dep in ipairs(mod:getDeps()) do deps[dep] = VX.Modules[dep] end
+    pcall(mod.Init, mod, deps)
+    pcall(mod.Start, mod)
+    VX.Modules[name] = mod
+    mod:setState("started")
+    _failCounts[name] = 0
     print("[VX] Reloaded: " .. name)
     return true
 end
 
 function VX.reloadAll()
-    for name in pairs(MODULE_URLS) do VX.reload(name) end
-end
-
--- ==================== DIAGNOSTICS ====================
-VX.diagnostics = { _reg = {} }
-
-function VX.diagnostics.register(key, schema, owner)
-    VX.diagnostics._reg[key] = { schema = schema, owner = owner }
-end
-
-function VX.diagnostics.get(key)
-    local r = VX.diagnostics._reg[key]
-    if not r then return nil end
-    local ok, res = pcall(r.schema.fn)
-    return ok and res or nil
-end
-
-function VX.diagnostics.getAll()
-    local out = {}
-    for key, r in pairs(VX.diagnostics._reg) do
-        local ok, res = pcall(r.schema.fn)
-        out[key] = { value = ok and res or nil, schema = r.schema, owner = r.owner }
+    for _, name in ipairs(_bootOrder) do
+        VX.reload(name)
     end
-    return out
+end
+
+function VX.shutdown()
+    VX._booted = false
+    if _watchdogThread then
+        pcall(task.cancel, _watchdogThread)
+        _watchdogThread = nil
+    end
+    for _, c in ipairs(_hotkeyConns) do
+        pcall(function() c:Disconnect() end)
+    end
+    _hotkeyConns = {}
+
+    for i = #_bootOrder, 1, -1 do
+        local name = _bootOrder[i]
+        local mod = VX.Modules[name]
+        if mod then
+            pcall(mod.Stop, mod)
+            if mod._janitor then pcall(function() mod._janitor:Cleanup() end) end
+            mod:setState("stopped")
+        end
+        VX[name] = nil
+    end
+    VX.UI = nil
+    VX.Panel = nil
+    bus:clear()
+    _diagEntries = {}
+    _regStore = {}
+    VX.Modules = {}
+    _bootOrder = {}
+    _failCounts = {}
+    print("[VX] Shutdown complete")
 end
 
 -- ==================== BOOT ====================
+
 print("[VX] Booting system...")
-local loaded = loadAllModules()
-local sorted = topologicalSort(loaded)
-runLifecycle(sorted, loaded)
+local loaded = {}
+for _, name in ipairs(MODULE_ORDER) do
+    local url = MODULE_URLS[name]
+    if url then
+        local mod, err = _compileModule(name, url, true)
+        if mod then
+            VX.Modules[name] = mod
+            loaded[name] = mod
+            mod:setState("loaded")
+            print("[VX] Loaded: " .. name)
+        else
+            warn("[VX] Failed: " .. name .. " — " .. tostring(err))
+        end
+    end
+end
+
+_bootOrder = _topoSort(loaded, MODULE_ORDER)
+_runLifecycle(_bootOrder, loaded)
+VX._booted = true
 
 print("========================================")
-print("  VX System Ready  —  v" .. VX.Version)
+print("  VX System Ready  —  v" .. VERSION)
 print("========================================")
-for _, name in ipairs(sorted) do
+for _, name in ipairs(_bootOrder) do
     local mod = loaded[name]
-    local icon = ({started="✓", failed="✗", skipped="⊘", inited="·", constructed="·"})[mod:getState()] or "?"
+    local icon = ({ started = "✓", failed = "✗", skipped = "⊘", inited = "·", constructed = "·" })[mod:getState()] or "?"
     print(string.format("  %s %-16s %s", icon, name, mod:getState()))
 end
 print("========================================")
-local d = Registry:dump()
-print(string.format("  Registry: %d settings, %d sounds, %d events, %d diagnostics",
-    d.settings, d.sounds, d.events, d.diagnostics))
+local d = registry:dump()
+print(string.format("  Registry: %d settings, %d sounds, %d events, %d diagnostics", d.settings, d.sounds, d.events, d.diagnostics))
 print("========================================")
 
 -- ==================== WATCHDOG ====================
-local watchdogActive = true
-task.spawn(function()
-    while watchdogActive do
-        task.wait(2)
-        for name, mod in pairs(VX.Modules) do
-            if mod:getState() == "started" and mod.heartbeat then
-                local ok, res = pcall(mod.heartbeat, mod)
-                if not ok or res == false then
-                    warn("[VX] Watchdog: " .. name .. " unhealthy")
+
+_watchdogThread = task.spawn(function()
+    while VX._booted do
+        task.wait(WATCHDOG_INTERVAL)
+        if not VX._booted then break end
+        for _, name in ipairs(_bootOrder) do
+            local mod = VX.Modules[name]
+            if mod and mod:getState() == "started" and mod.heartbeat then
+                local ok, alive = pcall(mod.heartbeat, mod)
+                if ok and alive ~= false then
+                    _failCounts[name] = 0
+                else
+                    _failCounts[name] = (_failCounts[name] or 0) + 1
+                    if _failCounts[name] >= MAX_HEARTBEAT_FAILS then
+                        warn("[VX] Watchdog restarting unhealthy module: " .. name)
+                        _failCounts[name] = 0
+                        VX.reload(name)
+                    end
                 end
             end
         end
     end
 end)
 
--- ==================== SHUTDOWN ====================
-VX.shutdown = function()
-    watchdogActive = false
-    for i = #sorted, 1, -1 do
-        local mod = loaded[sorted[i]]
-        if mod and mod.Stop then pcall(mod.Stop, mod) end
-    end
-    VX.bus:clear()
-    print("[VX] Shutdown complete")
-end
-
 -- ==================== HOTKEYS ====================
+
 local UIS = game:GetService("UserInputService")
 local panicStart = 0
 
-UIS.InputBegan:Connect(function(input, gp)
+table.insert(_hotkeyConns, UIS.InputBegan:Connect(function(input, gp)
     if gp then return end
     local kc = input.KeyCode
-    if kc == Enum.KeyCode.V and VX.Modules.UI then
+    if kc == Enum.KeyCode.V and VX.Modules.UI and VX.Modules.UI.toggleVideoMode then
         pcall(function() VX.Modules.UI:toggleVideoMode() end)
-    elseif kc == Enum.KeyCode.C and VX.Modules.Input then
+    elseif kc == Enum.KeyCode.C and VX.Modules.Input and VX.Modules.Input.toggleClutch then
         pcall(function() VX.Modules.Input:toggleClutch() end)
     elseif kc == Enum.KeyCode.F1 then
-        for _, name in ipairs(sorted) do
-            print(string.format("  %-16s %s", name, loaded[name]:getState()))
+        for _, name in ipairs(_bootOrder) do
+            local m = VX.Modules[name]
+            print(string.format("  %-16s %s", name, m and m:getState() or "missing"))
         end
-    elseif kc == Enum.KeyCode.F2 then
-        if _G.VX.setSetting and _G.VX.settings then
-            local cur = _G.VX.settings.physics.telemetryHud
-            _G.VX.setSetting("physics.telemetryHud", not cur)
-        end
-    elseif kc == Enum.KeyCode.F3 and VX.Modules.UI then
-        pcall(function() VX.Modules.UI:toggleDiagnostics() end)
     elseif kc == Enum.KeyCode.Backspace then
         panicStart = tick()
     end
-end)
+end))
 
-UIS.InputEnded:Connect(function(input)
+table.insert(_hotkeyConns, UIS.InputEnded:Connect(function(input)
     if input.KeyCode == Enum.KeyCode.Backspace then
-        if panicStart > 0 and tick() - panicStart >= 2 then
+        if panicStart > 0 and (tick() - panicStart) >= 2 then
             VX.shutdown()
         end
         panicStart = 0
     end
-end)
+end))
 
-print("[VX] Hotkeys: V=Video | C=Clutch | F1=Status | F2=Telemetry | F3=Diagnostics | Hold Shift+Backspace=Panic")
+print("[VX] Hotkeys: V/F4=Video | C=Clutch | F1=Status | F2=Telemetry | F3=Diagnostics | F5=Menu | Hold Backspace=Panic")
 
 return VX
