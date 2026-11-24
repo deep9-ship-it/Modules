@@ -1,6 +1,6 @@
 --[[
     VX_Panel.lua — Left-Side GT3 Tuning Panel (All 45 Settings Across 5 Tabs)
-    Version: 3.3.1
+    Version: 3.3.2
 ]]
 
 local VX = _G.VX
@@ -16,7 +16,7 @@ local UserInputService = game:GetService("UserInputService")
 local Module = VX.Framework.Module.new({
     Name = "Panel",
     Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "UI" },
-    Version = "3.3.1",
+    Version = "3.3.2",
 })
 
 local C = {
@@ -162,7 +162,7 @@ end
 function Module:_refreshSystemCard()
     if not self._sysInfoLbl or not self._sysInfoLbl.Parent then return end
     local vs = _G.VX.Modules and _G.VX.Modules.VehicleState
-    local st = vs and vs:getState() or "Unknown"
+    local st = vs and vs:get() or "Unknown"
     local spd, units = self:_getSpeed()
     local prof = self.profiles:current()
     local status = _G.VX.getStatus and _G.VX.getStatus()
@@ -197,7 +197,6 @@ function Module:_createPanel()
     gui.Parent = pg
     self._gui = gui
 
-    -- LEFT-SIDE TOGGLE BUTTON
     local btn = Instance.new("TextButton")
     btn.Name = "ToggleBtn"
     btn.Size = UDim2.new(0, 44, 0, 44)
@@ -215,7 +214,6 @@ function Module:_createPanel()
     self._toggleBtn = btn
     self:_trackConn(btn.MouseButton1Click:Connect(function() self:toggle() end))
 
-    -- LEFT-SIDE SLIDING PANEL
     local panel = Instance.new("Frame")
     panel.Name = "MainPanel"
     panel.Size = UDim2.new(0, 348, 0.84, 0)
@@ -234,7 +232,6 @@ function Module:_createPanel()
     sizeConstraint.MaxSize = Vector2.new(364, 580)
     sizeConstraint.Parent = panel
 
-    -- Header
     local header = Instance.new("Frame")
     header.Size = UDim2.new(1, 0, 0, 42)
     header.BackgroundColor3 = C.panel
@@ -276,7 +273,6 @@ function Module:_createPanel()
     _corner(closeBtn, 6)
     self:_trackConn(closeBtn.MouseButton1Click:Connect(function() self:close() end))
 
-    -- Tab Bar
     local tabBar = Instance.new("Frame")
     tabBar.Size = UDim2.new(1, -16, 0, 30)
     tabBar.Position = UDim2.new(0, 8, 0, 48)
@@ -304,7 +300,6 @@ function Module:_createPanel()
         end))
     end
 
-    -- Content Scroll
     local scroll = Instance.new("ScrollingFrame")
     scroll.Size = UDim2.new(1, -16, 1, -134)
     scroll.Position = UDim2.new(0, 8, 0, 84)
@@ -496,7 +491,6 @@ function Module:_addSettingRow(path)
     lbl.Text = schema.label or path
     lbl.Parent = row
 
-    -- BOOLEAN: Animated toggle switch
     if schema.type == "boolean" then
         local switch = Instance.new("TextButton")
         switch.Size = UDim2.new(0, 48, 0, 22)
@@ -533,7 +527,6 @@ function Module:_addSettingRow(path)
             sync(true)
         end))
 
-    -- SEGMENTED ENUM OR LABELED INT
     elseif isSegmented then
         local holder = Instance.new("Frame")
         holder.Size = UDim2.new(1, -20, 0, 26)
@@ -586,7 +579,6 @@ function Module:_addSettingRow(path)
         sync()
         self._rowUpdaters[path] = sync
 
-    -- FLOAT / INT SLIDER + STEPPER BUTTONS
     elseif isNumeric then
         local minV = schema.min or 0
         local maxV = schema.max or 1
@@ -649,8 +641,6 @@ function Module:_addSettingRow(path)
         local function formatVal(v)
             if schema.type == "int" then
                 return string.format("%d", math.floor(v + 0.5))
-            elseif step < 0.05 then
-                return string.format("%.2f", v)
             end
             return string.format("%.2f", v)
         end
