@@ -1,340 +1,381 @@
 --[[
-    VX_Audio v3.1.3
-    - Turbo spool: reduced max pitch (1.5) and volume (0.35), added threshold gate
-    - Restored OLD engine pitch: pitch = 0.7 + (rpm/maxRPM) * 1.8
+    VX_Profile.lua — 10 Engine Profiles with Real Sound IDs, refRpm, Torque Curves & Shift Strategies
+    Version: 3.0.1
 ]]
 
 local VX = _G.VX
-if not VX or not VX.Framework then error("VX_Audio requires VX_Kernel") end
-
-local Players = game:GetService("Players")
-local Player = Players.LocalPlayer
+if not VX or not VX.Framework then error("VX_Profiles requires VX_Kernel") end
 
 local Module = VX.Framework.Module.new({
-    Name = "Audio",
-    Dependencies = { "Core", "Profiles", "Remote", "Powertrain", "DriveSystem" },
-    Version = "3.1.3",
+    Name = "Profiles",
+    Dependencies = { "Core" },
+    Version = "3.0.1",
 })
 
-local TURBO_SPOOL_ID   = "89818258229795"
-local TURBO_FLUTTER_ID = "18609462234"
-local TURBO_BLOWOFF_ID = "75197887670820"
-local BACKFIRE_DEFAULT = "140562715692021"
+local TORQUE_CURVES = {
+    default = {
+        { 1000, 0.55 }, { 2000, 0.75 }, { 3500, 0.95 },
+        { 4500, 1.00 }, { 5500, 0.98 }, { 7000, 0.90 },
+        { 8000, 0.72 }, { 8500, 0.60 },
+    },
+    turbo_flat = {
+        { 1000, 0.40 }, { 2000, 0.60 }, { 3000, 0.85 },
+        { 4000, 1.05 }, { 5000, 1.10 }, { 6000, 1.05 },
+        { 7000, 0.95 }, { 8000, 0.75 },
+    },
+    na_v12 = {
+        { 1000, 0.45 }, { 2000, 0.65 }, { 3500, 0.85 },
+        { 5000, 0.98 }, { 6000, 1.02 }, { 7000, 1.00 },
+        { 8000, 0.92 }, { 8800, 0.78 },
+    },
+    high_rev = {
+        { 1200, 0.35 }, { 2500, 0.55 }, { 4000, 0.78 },
+        { 5500, 0.95 }, { 7000, 1.05 }, { 8500, 1.05 },
+        { 10000, 0.92 }, { 11000, 0.75 },
+    },
+    na_high = {
+        { 1000, 0.42 }, { 2000, 0.62 }, { 3500, 0.82 },
+        { 5000, 0.95 }, { 6500, 1.05 }, { 7500, 1.00 },
+        { 8200, 0.85 }, { 8600, 0.70 },
+    },
+}
+
+local PROFILES = {
+    {
+        name = "Default",
+        soundId = "128279981806309",
+        refRpm = 3500,
+        idleRPM = 900, maxRPM = 8500, redlineRPM = 8200,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.0,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "default",
+        differential = "open",
+        shiftStrategy = "automatic",
+        revLimiterType = "hard",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3500,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.25, dragCoef = 0.0004,
+        weightKg = 1500,
+        brakeBiasDefault = 0.65,
+    },
+    {
+        name = "McLaren F1",
+        soundId = "89427678123759",
+        refRpm = 3500,
+        idleRPM = 800, maxRPM = 7800, redlineRPM = 7500,
+        volumeMultiplier = 3.0,
+        rpmRiseMultiplier = 1.2,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "na_high",
+        differential = "lsd",
+        shiftStrategy = "sport",
+        revLimiterType = "hard",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3200,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.35, dragCoef = 0.0003,
+        weightKg = 1138,
+        brakeBiasDefault = 0.62,
+    },
+    {
+        name = "Huracan",
+        soundId = "103566671541178",
+        refRpm = 3500,
+        idleRPM = 800, maxRPM = 8500, redlineRPM = 8200,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.3,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "na_v12",
+        differential = "lsd",
+        shiftStrategy = "sport",
+        revLimiterType = "ignition",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3400,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.30, dragCoef = 0.0004,
+        weightKg = 1422,
+        brakeBiasDefault = 0.65,
+    },
+    {
+        name = "Huracan 2",
+        soundId = "80652339555077",
+        refRpm = 3500,
+        idleRPM = 800, maxRPM = 8500, redlineRPM = 8200,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.3,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "na_v12",
+        differential = "lsd",
+        shiftStrategy = "sport",
+        revLimiterType = "ignition",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3400,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.30, dragCoef = 0.0004,
+        weightKg = 1422,
+        brakeBiasDefault = 0.65,
+    },
+    {
+        name = "Aventador",
+        soundId = "80692873028903",
+        refRpm = 3500,
+        idleRPM = 800, maxRPM = 8000, redlineRPM = 7800,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.4,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "na_v12",
+        differential = "lsd",
+        shiftStrategy = "race",
+        revLimiterType = "ignition",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3600,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.32, dragCoef = 0.0004,
+        weightKg = 1575,
+        brakeBiasDefault = 0.66,
+    },
+    {
+        name = "Koenigsegg",
+        soundId = "123655450845901",
+        refRpm = 3500,
+        idleRPM = 800, maxRPM = 8000, redlineRPM = 7500,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.3,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "turbo_flat",
+        differential = "lsd",
+        shiftStrategy = "race",
+        revLimiterType = "soft",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3800,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.38, dragCoef = 0.0003,
+        weightKg = 1360,
+        brakeBiasDefault = 0.68,
+    },
+    {
+        name = "McLaren",
+        soundId = "5856728701",
+        refRpm = 3500,
+        idleRPM = 800, maxRPM = 7800, redlineRPM = 7500,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.3,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "turbo_flat",
+        differential = "lsd",
+        shiftStrategy = "sport",
+        revLimiterType = "hard",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3200,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.35, dragCoef = 0.0003,
+        weightKg = 1300,
+        brakeBiasDefault = 0.62,
+    },
+    {
+        name = "Valkyrie",
+        soundId = "9091845802",
+        refRpm = 5000,
+        idleRPM = 1200, maxRPM = 11100, redlineRPM = 10800,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.7,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {30,60,90,120,150,180,210},
+        torqueCurve = "high_rev",
+        differential = "lsd",
+        shiftStrategy = "race",
+        revLimiterType = "ignition",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = false, turboSpoolRPM = 4000,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.45, dragCoef = 0.0003,
+        weightKg = 1030,
+        brakeBiasDefault = 0.70,
+    },
+    {
+        name = "Zonda",
+        soundId = "110865384780538",
+        refRpm = 7006,
+        idleRPM = 900, maxRPM = 8500, redlineRPM = 8200,
+        volumeMultiplier = 1.0,
+        rpmRiseMultiplier = 1.5,
+        gearRatios = {3.85,2.20,1.55,1.20,0.95,0.80,0.65},
+        speedThresholds = {25,50,75,100,125,150,175},
+        torqueCurve = "na_high",
+        differential = "lsd",
+        shiftStrategy = "sport",
+        revLimiterType = "ignition",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = false, turboSpoolRPM = 4500,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0,
+        downforceCoef = 0.35, dragCoef = 0.0004,
+        weightKg = 1070,
+        brakeBiasDefault = 0.66,
+    },
+    {
+        name = "Race",
+        soundId = "128279981806309",
+        refRpm = 4500,
+        idleRPM = 1000, maxRPM = 9000, redlineRPM = 8700,
+        volumeMultiplier = 1.2,
+        rpmRiseMultiplier = 2.0,
+        gearRatios = {3.60,2.10,1.50,1.15,0.90,0.75,0.62},
+        speedThresholds = {30,55,80,105,130,155,180},
+        torqueCurve = "high_rev",
+        differential = "locked",
+        shiftStrategy = "race",
+        revLimiterType = "ignition",
+        shiftUpSoundId = "18148207645",
+        shiftDownSoundId = "139782180614936",
+        backfireSoundIds = { "140562715692021" },
+        hasTurboSounds = true, turboSpoolRPM = 3000,
+        hasShiftUpSound = true, hasShiftDownSound = true,
+        hasOwnBackfire = false,
+        pitchOffset = 0.10,
+        downforceCoef = 0.55, dragCoef = 0.00035,
+        weightKg = 900,
+        brakeBiasDefault = 0.70,
+    },
+}
 
 function Module:Construct()
-    self.engineSound = nil
-    self.spoolSound = nil
-    self.fastRpm = 900
-    self.slowRpm = 900
-    self.downshiftBoostUntil = 0
-    self.lastShiftTime = 0
-    self.lastBackfireTime = 0
-    self.lastBlowoffTime = 0
-    self.lastLaunchTime = 0
-    self._compressorGain = 1.0
-    self._peakVolume = 0
-    self._loopThread = nil
-    self._running = false
-    self._totalBackfires = 0
-    self._totalShifts = 0
-    self._smoothedSpoolVol = 0
-    self._smoothedSpoolPitch = 0.5
+    self.list = PROFILES
+    self._currentIndex = 1
+    self._conn = nil
 end
 
 function Module:Init(deps)
-    self.core = deps.Core
-    self.profiles = deps.Profiles
-    self.remote = deps.Remote
-    self.powertrain = deps.Powertrain
-    self.drive = deps.DriveSystem
+    local labels = {}
+    for i, p in ipairs(PROFILES) do labels[i] = p.name end
+
+    pcall(function()
+        _G.VX.registry:set("settings", "engineProfile", {
+            type = "number_stepped",
+            default = 1, min = 1, max = #PROFILES, step = 1,
+            category = "Engine",
+            label = "Engine Profile",
+            enumLabels = labels,
+            description = "Changes engine sound, gear ratios, torque curve",
+        }, "Profiles")
+    end)
+
+    local idx = _G.VX.settings.engineProfile or 1
+    if not PROFILES[idx] then
+        idx = 1
+        _G.VX.settings.engineProfile = 1
+    end
+    self._currentIndex = idx
 end
 
 function Module:Start()
-    _G.VX.Audio = self
-    self:_registerSounds()
-    self:_registerDiagnostics()
-    _G.VX.bus:on("vehicle.stateChanged", function(evt) self:_onStateChange(evt) end)
-    _G.VX.bus:on("vehicle.shift", function(evt) self:_onShift(evt) end)
-    _G.VX.bus:on("vehicle.backfire", function(evt) self:_onBackfire(evt) end)
-    _G.VX.bus:on("turbo.blowoff", function(evt) self:_onBlowoff(evt) end)
-    _G.VX.bus:on("vehicle.launchRelease", function(evt) self:_onLaunch(evt) end)
-    _G.VX.bus:on("profiles.changed", function(evt) self:_onProfileChange(evt) end)
-    _G.VX.bus:on("settings.changed", function(evt) self:_onSettingChange(evt) end)
+    _G.VX.Profiles = self
+    self._conn = _G.VX.bus:on("settings.changed", function(evt)
+        if evt and evt.path == "engineProfile" and PROFILES[evt.new] then
+            self._currentIndex = evt.new
+            _G.VX.bus:emit("profiles.changed", {
+                index = evt.new,
+                profile = PROFILES[evt.new],
+            })
+        end
+    end)
+    print("[VX] Profiles loaded: " .. #PROFILES .. " available")
 end
 
 function Module:Stop()
-    self:_detach()
-    if _G.VX.Audio == self then _G.VX.Audio = nil end
-end
-
-function Module:heartbeat()
-    if not self._running then return true end
-    return self.engineSound ~= nil
-end
-
-function Module:_registerSounds()
-    local R = _G.VX.registry
-    local items = {
-        { key = "audio.turbo_spool", id = TURBO_SPOOL_ID, category = "Turbo", type = "loop" },
-        { key = "audio.turbo_flutter", id = TURBO_FLUTTER_ID, category = "Turbo", type = "one_shot" },
-        { key = "audio.turbo_blowoff", id = TURBO_BLOWOFF_ID, category = "Turbo", type = "one_shot" },
-        { key = "audio.backfire", id = BACKFIRE_DEFAULT, category = "Backfire", type = "one_shot" },
-    }
-    for i = 1, #items do
-        local item = items[i]
-        pcall(function() R:set("sounds", item.key, item, "Audio") end)
+    if self._conn and self._conn.Disconnect then
+        self._conn:Disconnect()
+        self._conn = nil
     end
+    if _G.VX.Profiles == self then _G.VX.Profiles = nil end
 end
 
-function Module:_registerDiagnostics()
-    local D = _G.VX.diagnostics
-    pcall(function()
-        D.register("audio.backfires", { fn = function() return { value = self._totalBackfires, unit = "", status = "normal" } end, category = "Audio" }, "Audio")
-        D.register("audio.shifts", { fn = function() return { value = self._totalShifts, unit = "", status = "normal" } end, category = "Audio" }, "Audio")
-    end)
+function Module:heartbeat() return true end
+
+function Module:get(index)
+    return PROFILES[index or self._currentIndex] or PROFILES[1]
 end
 
-function Module:_onStateChange(evt)
-    if evt.to == "Ready" or evt.to == "Idle" then self:_attach()
-    elseif evt.to == "Exiting" or evt.to == "Disabled" then self:_detach() end
+function Module:current()
+    return self:get(self._currentIndex)
 end
 
-function Module:_getSoundParent()
-    local handle = _G.VX.Authority and _G.VX.Authority:getHandle()
-    if not handle then return nil end
-    if handle.emitter then return handle.emitter end
-    if handle.root then return handle.root.PrimaryPart end
-    return nil
+function Module:setCurrent(index)
+    if not PROFILES[index] then return false end
+    _G.VX.setSetting("engineProfile", index)
+    return true
 end
 
-function Module:_attach()
-    if self._running then return end
-    self._running = true
-    local prof = self.profiles:current()
-    self.fastRpm = prof.idleRPM
-    self.slowRpm = prof.idleRPM
-    self._smoothedSpoolVol = 0
-    self._smoothedSpoolPitch = 0.5
-    self:_createEngine(prof)
-    self:_createSpool()
-    self._loopThread = task.spawn(function()
-        while self._running do
-            local dt = task.wait(1/60)
-            if dt > 0.1 then dt = 1/60 end
-            pcall(function() self:_update(dt) end)
-        end
-    end)
-    print("[VX] Audio attached: " .. prof.name)
+function Module:getAll()
+    return PROFILES
 end
 
-function Module:_detach()
-    if not self._running then return end
-    self._running = false
-    if self._loopThread then pcall(function() task.cancel(self._loopThread) end); self._loopThread = nil end
-    if self.engineSound then pcall(function() self.engineSound:Destroy() end); self.engineSound = nil end
-    if self.spoolSound then pcall(function() self.spoolSound:Destroy() end); self.spoolSound = nil end
-    print("[VX] Audio detached")
+function Module:getCurrentIndex()
+    return self._currentIndex
 end
 
-function Module:_createEngine(prof)
-    if self.engineSound then pcall(function() self.engineSound:Destroy() end); self.engineSound = nil end
-    if not prof or not prof.soundId then return end
-    local parent = self:_getSoundParent()
-    if not parent then return end
-    local s = Instance.new("Sound")
-    s.Name = "VX_Engine"
-    s.SoundId = "rbxassetid://" .. tostring(prof.soundId)
-    s.Volume = self:_baseVolume(prof)
-    s.Looped = true
-    s.PlaybackSpeed = 1.0
-    s.RollOffMode = Enum.RollOffMode.Linear
-    s.RollOffMaxDistance = 400
-    s.RollOffMinDistance = 10
-    s.Parent = parent
-    s:Play()
-    self.engineSound = s
+function Module:getTorqueCurveFor(profile)
+    local key = profile and profile.torqueCurve or "default"
+    return TORQUE_CURVES[key] or TORQUE_CURVES.default
 end
 
-function Module:_createSpool()
-    if self.spoolSound then pcall(function() self.spoolSound:Destroy() end); self.spoolSound = nil end
-    if not self.core.settings.turboSpoolEnabled then return end
-    local prof = self.profiles:current()
-    if not prof.hasTurboSounds then return end
-    local parent = self:_getSoundParent()
-    if not parent then return end
-    local s = Instance.new("Sound")
-    s.Name = "VX_TurboSpool"
-    s.SoundId = "rbxassetid://" .. TURBO_SPOOL_ID
-    s.Volume = 0
-    s.Looped = true
-    s.PlaybackSpeed = 0.5
-    s.RollOffMode = Enum.RollOffMode.Linear
-    s.RollOffMaxDistance = 400
-    s.Parent = parent
-    s:Play()
-    self.spoolSound = s
-end
-
-function Module:_baseVolume(prof)
-    local master = self.core.settings.masterVolume or 1.0
-    local boost = self.core.settings.engineBoost or 1.0
-    local profileVol = prof.volumeMultiplier or 1.0
-    return math.clamp(master * boost * profileVol, 0, 1)
-end
-
-function Module:_update(dt)
-    if not self._running then return end
-    local prof = self.profiles:current()
-    if not prof then return end
-
-    local rpm = self.powertrain:getRPM()
-    local fastRate = 40
-    if os.clock() < self.downshiftBoostUntil then fastRate = fastRate + 15 end
-
-    self.fastRpm = self.fastRpm + (rpm - self.fastRpm) * math.min(fastRate * dt, 1)
-    self.slowRpm = self.slowRpm + (self.fastRpm - self.slowRpm) * math.min(15 * dt, 1)
-
-    local smoothRpm = self.slowRpm
-    if self.powertrain:isRevLimiting() then smoothRpm = prof.redlineRPM end
-
-    -- OLD ENGINE PITCH FORMULA
-    if self.engineSound and self.engineSound.Parent then
-        local rpmPercent = smoothRpm / math.max(prof.maxRPM, 1)
-        local pitchOffset = 1 + (prof.pitchOffset or 0) + (self.core.settings.pitchOffset or 0)
-        local targetPitch = (0.7 + rpmPercent * 1.8) * pitchOffset
-        targetPitch = math.clamp(targetPitch, 0.5, 3.0)
-        if math.abs(self.engineSound.PlaybackSpeed - targetPitch) > 0.01 then
-            self.engineSound.PlaybackSpeed = targetPitch
-        end
-        local targetVol = self:_baseVolume(prof) * self._compressorGain
-        if math.abs(self.engineSound.Volume - targetVol) > 0.01 then
-            self.engineSound.Volume = targetVol
+function Module:getTorqueAtRPM(profile, rpm)
+    local curve = self:getTorqueCurveFor(profile)
+    if #curve == 0 then return 0.70 end
+    if rpm <= curve[1][1] then return curve[1][2] end
+    if rpm >= curve[#curve][1] then return curve[#curve][2] end
+    for i = 1, #curve - 1 do
+        local a, b = curve[i], curve[i + 1]
+        if rpm >= a[1] and rpm <= b[1] then
+            local t = (rpm - a[1]) / (b[1] - a[1])
+            return a[2] + (b[2] - a[2]) * t
         end
     end
-
-    -- TURBO SPOOL (smoother, less extreme)
-    if self.spoolSound and self.spoolSound.Parent then
-        local boost = self.drive:getBoost()
-        local stage = self.drive:getTurboStage()
-        local cfg = self.core.config.turboStages[stage]
-        local maxPSI = (cfg and cfg.targetBoostPSI or 78) * (self.core.settings.turboCustomMultiplier or 1.0)
-        local normalized = math.clamp(boost / math.max(maxPSI, 0.01), 0, 1)
-
-        -- Gentler max: 0.35 vol, 1.5 pitch
-        local targetVol = normalized * 0.35
-        local targetPitch = 0.5 + normalized * 1.0
-
-        -- Only audible above 3% boost (gate)
-        if normalized < 0.03 then
-            targetVol = 0
-            targetPitch = 0.5
-        end
-
-        -- Slow smoothing (avoid flutter)
-        self._smoothedSpoolVol = self._smoothedSpoolVol + (targetVol - self._smoothedSpoolVol) * math.min(dt * 6, 1)
-        self._smoothedSpoolPitch = self._smoothedSpoolPitch + (targetPitch - self._smoothedSpoolPitch) * math.min(dt * 6, 1)
-        self.spoolSound.Volume = self._smoothedSpoolVol
-        self.spoolSound.PlaybackSpeed = self._smoothedSpoolPitch
-    end
-
-    self:_updateCompressor(dt)
+    return 0.70
 end
-
-function Module:_updateCompressor(dt)
-    local currentPeak = 0
-    if self.engineSound and self.engineSound.Parent then currentPeak = currentPeak + self.engineSound.Volume end
-    if self.spoolSound and self.spoolSound.Parent then currentPeak = currentPeak + self.spoolSound.Volume end
-    self._peakVolume = self._peakVolume + (currentPeak - self._peakVolume) * math.min(dt * 4, 1)
-    local targetGain = 1.0
-    if self._peakVolume > 1.0 then targetGain = math.clamp(1.0 / self._peakVolume, 0.5, 1.0) end
-    self._compressorGain = self._compressorGain + (targetGain - self._compressorGain) * math.min(dt * 6, 1)
-end
-
-function Module:_onShift(evt)
-    local now = os.clock()
-    if now - self.lastShiftTime < 0.15 then return end
-    self.lastShiftTime = now
-    self._totalShifts = self._totalShifts + 1
-    local prof = self.profiles:current()
-    if not evt.up then self.downshiftBoostUntil = now + 0.3 end
-    local soundId = nil
-    if evt.up and prof.hasShiftUpSound then soundId = prof.shiftUpSoundId
-    elseif not evt.up and prof.hasShiftDownSound then soundId = prof.shiftDownSoundId end
-    if soundId then
-        local vol = 1.0 * self.core.settings.masterVolume * self._compressorGain
-        local pitch = 1.0 + (math.random() * 0.1 - 0.05)
-        local parent = self:_getSoundParent()
-        pcall(function() self.remote:playSound(soundId, vol, pitch, parent) end)
-    end
-end
-
-function Module:_onBackfire(evt)
-    local now = os.clock()
-    if now - self.lastBackfireTime < 0.03 then return end
-    self.lastBackfireTime = now
-    local prof = self.profiles:current()
-    local soundIds = prof.backfireSoundIds
-    if not soundIds or #soundIds == 0 then soundIds = { BACKFIRE_DEFAULT } end
-    local parent = self:_getSoundParent()
-    local count = evt.count or 1
-    if count > 5 then count = 5 end
-    for i = 1, count do
-        local id = soundIds[math.random(1, #soundIds)]
-        local vol = (0.6 + math.random() * 0.4) * self.core.settings.masterVolume * self._compressorGain
-        local pitch = 0.85 + math.random() * 0.3
-        self._totalBackfires = self._totalBackfires + 1
-        pcall(function() self.remote:playSound(id, vol, pitch, parent) end)
-        if i < count then task.wait(math.random(20, 50) / 1000) end
-    end
-end
-
-function Module:_onBlowoff(evt)
-    if not self.core.settings.turboBlowoffEnabled then return end
-    local prof = self.profiles:current()
-    if not prof.hasTurboSounds then return end
-    local now = os.clock()
-    if now - self.lastBlowoffTime < 0.25 then return end
-    self.lastBlowoffTime = now
-    local intensity = evt.intensity or 0.5
-    local vol = (0.5 + intensity * 0.5) * self.core.settings.masterVolume * self._compressorGain
-    local pitch = 1.1 - intensity * 0.2 + math.random() * 0.1
-    local parent = self:_getSoundParent()
-    pcall(function() self.remote:playSound(TURBO_BLOWOFF_ID, vol, pitch, parent) end)
-end
-
-function Module:_onLaunch(evt)
-    local now = os.clock()
-    if now - self.lastLaunchTime < 1.0 then return end
-    self.lastLaunchTime = now
-    local prof = self.profiles:current()
-    local id = prof.launchSoundId
-    if not id then return end
-    local parent = self:_getSoundParent()
-    local vol = 1.0 * self.core.settings.masterVolume
-    pcall(function() self.remote:playSound(id, vol, 1.0, parent) end)
-end
-
-function Module:_onProfileChange(evt)
-    if not evt.profile then return end
-    self:_createEngine(evt.profile)
-    self:_createSpool()
-    print("[VX] Audio: profile -> " .. evt.profile.name)
-end
-
-function Module:_onSettingChange(evt)
-    if not evt then return end
-    if evt.path == "turboSpoolEnabled" then
-        if evt.new then self:_createSpool()
-        elseif self.spoolSound then pcall(function() self.spoolSound:Destroy() end); self.spoolSound = nil end
-    end
-end
-
-function Module:playBackfire(count) self:_onBackfire({ count = count or 1 }) end
-function Module:playLaunch() self:_onLaunch({}) end
-function Module:getEnginePitch()
-    if not self.engineSound then return 0 end
-    return self.engineSound.PlaybackSpeed
-end
-function Module:getMasterGain() return self._compressorGain end
 
 return Module
