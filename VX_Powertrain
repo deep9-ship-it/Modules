@@ -1,6 +1,6 @@
 --[[
     VX_Powertrain.lua — RPM, Gear Shifting, Rev Limiter, Cold Start, Idle Hunting, Launch Control & 2-Step
-    Version: 3.2.1
+    Version: 3.2.2
 ]]
 
 local VX = _G.VX
@@ -13,7 +13,7 @@ local RunService = game:GetService("RunService")
 local Module = VX.Framework.Module.new({
     Name = "Powertrain",
     Dependencies = { "Core", "Profiles", "Input", "VehicleState" },
-    Version = "3.2.1",
+    Version = "3.2.2",
 })
 
 local function _getSetting(path)
@@ -194,7 +194,10 @@ function Module:_beginShift(targetGear, up, prof)
         self.clutchOpen = true
         self._shiftTimer = delay
         self._pendingGear = targetGear
-        self.state:transition("Shifting", up and "upshift" or "downshift")
+        local st = self.state:get()
+        if st == "Idle" or st == "Driving" then
+            self.state:transition("Shifting", up and "upshift" or "downshift")
+        end
     else
         self.gear = targetGear
         self.isShifting = false
@@ -219,7 +222,7 @@ function Module:_beginShift(targetGear, up, prof)
 end
 
 function Module:_update(dt)
-    local st = self.state:getState()
+    local st = self.state:get()
     if st == "Disabled" or st == "Exiting" or _getSetting("enabled") == false then
         self.rpm = 0
         self.throttle = 0
@@ -243,14 +246,12 @@ function Module:_update(dt)
         speed = h.root.PrimaryPart.AssemblyLinearVelocity.Magnitude * 0.626
     end
 
-    -- Slope load
     self.slopeLoadFactor = 1.0
     if _getSetting("physics.slopeLoad") and _G.VX.Chassis then
         local slope = _G.VX.Chassis.slopeAngle or 0
         self.slopeLoadFactor = math.clamp(1.0 + slope * 0.015, 0.75, 1.45)
     end
 
-    -- Reverse / Forward auto-direction at low speed
     if not self.isShifting then
         if self.gear >= 1 and rawBrk > 0.6 and rawThr < 0.1 and speed < 3 then
             self.gear = -1
@@ -261,7 +262,6 @@ function Module:_update(dt)
         end
     end
 
-    -- Handle ongoing clutch shift
     if self.isShifting then
         self._shiftTimer -= dt
         if self._shiftTimer <= 0 then
@@ -278,7 +278,6 @@ function Module:_update(dt)
         end
     end
 
-    -- Cold start + idle hunting
     local coldAdd = self:_updateColdStart(dt, prof)
     local huntAdd = 0
     if _getSetting("physics.idleHunting") and speed < 3 and self.throttle < 0.08 then
@@ -286,7 +285,6 @@ function Module:_update(dt)
         huntAdd = math.sin(self._idleHuntPhase) * 35 + math.sin(self._idleHuntPhase * 1.7) * 18
     end
 
-    -- Launch control / 2-step override
     local launchRpm = self:_updateLaunchControl(dt, prof, rawThr, rawBrk, speed)
     local twostepRpm = self:_updateTwoStep(dt, prof, rawThr, speed)
 
@@ -319,7 +317,6 @@ function Module:_update(dt)
         self.rpm = math.max(targetRpm, self.rpm - fallRate * dt)
     end
 
-    -- Rev Limiter
     if _getSetting("physics.revLimiter") and self.rpm >= prof.redline and self.throttle > 0.4 then
         if not self.isRevLimiting then
             self.isRevLimiting = true
@@ -340,7 +337,6 @@ function Module:_update(dt)
 
     self.rpm = math.clamp(self.rpm, prof.idleRPM * 0.85, prof.maxRPM)
 
-    -- Auto Shifting
     if not self.isShifting and self.gear >= 1 and self.launchState == "Idle" then
         local upRpm = prof.redline * 0.94
         local downRpm = prof.idleRPM + (prof.redline - prof.idleRPM) * 0.34
