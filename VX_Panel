@@ -1,6 +1,6 @@
 --[[
-    VX_Panel.lua — Left-Side GT3 Tuning Panel (All 58 Live Settings Across 5 Tabs)
-    Version: 3.3.3
+    VX_Panel.lua — GT3 Carbon Left-Side Tuning Menu (All 65 VX_Core v3.1.0 + DriveSystem Settings)
+    Version: 3.4.0
 ]]
 
 local VX = _G.VX
@@ -8,6 +8,7 @@ if not VX or not VX.Framework then
     error("[VX_Panel] Requires VX_Kernel")
 end
 
+local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
@@ -16,24 +17,30 @@ local UserInputService = game:GetService("UserInputService")
 local Module = VX.Framework.Module.new({
     Name = "Panel",
     Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "UI" },
-    Version = "3.3.3",
+    Version = "3.4.0",
 })
 
-local C = {
-    bg = Color3.fromRGB(13, 15, 21),
-    panel = Color3.fromRGB(20, 24, 34),
-    row = Color3.fromRGB(27, 32, 45),
-    rowAlt = Color3.fromRGB(34, 40, 56),
-    accent = Color3.fromRGB(0, 190, 255),
-    green = Color3.fromRGB(68, 222, 122),
-    amber = Color3.fromRGB(255, 185, 48),
-    red = Color3.fromRGB(255, 72, 72),
-    text = Color3.fromRGB(242, 246, 252),
-    muted = Color3.fromRGB(135, 146, 168),
-    border = Color3.fromRGB(48, 56, 76),
+local GT3 = {
+    carbonDeep = Color3.fromRGB(10, 11, 14),
+    carbon     = Color3.fromRGB(18, 20, 26),
+    carbonCard = Color3.fromRGB(26, 29, 38),
+    carbonLine = Color3.fromRGB(44, 49, 64),
+    amber      = Color3.fromRGB(255, 180, 0),
+    cyan       = Color3.fromRGB(0, 212, 255),
+    green      = Color3.fromRGB(34, 229, 138),
+    crimson    = Color3.fromRGB(255, 42, 60),
+    text       = Color3.fromRGB(244, 246, 250),
+    muted      = Color3.fromRGB(140, 148, 168),
 }
 
-local TABS = { "Dynamics", "Engine", "Audio", "Visuals", "System" }
+local TABS = { "Dynamics", "Engine", "Controls", "AudioFX", "System" }
+local TAB_LABELS = {
+    Dynamics = "Dynamics",
+    Engine   = "Engine",
+    Controls = "Controls",
+    AudioFX  = "Audio & FX",
+    System   = "System",
+}
 
 local function _corner(parent, r)
     local c = Instance.new("UICorner")
@@ -44,17 +51,35 @@ end
 
 local function _stroke(parent, col, trans, thickness)
     local s = Instance.new("UIStroke")
-    s.Color = col or C.border
-    s.Transparency = trans or 0.55
+    s.Color = col or GT3.carbonLine
+    s.Transparency = trans or 0.38
     s.Thickness = thickness or 1
     s.Parent = parent
     return s
 end
 
-function Module:_trackConn(conn)
-    if conn then
-        table.insert(self._conns, conn)
+local function _deepCopy(t)
+    if type(t) ~= "table" then return t end
+    local c = {}
+    for k, v in pairs(t) do c[k] = _deepCopy(v) end
+    return c
+end
+
+local function _applySettingsTable(tbl, prefix)
+    for k, v in pairs(tbl) do
+        if k:sub(1, 1) ~= "_" then
+            local path = prefix and (prefix .. "." .. k) or k
+            if type(v) == "table" then
+                _applySettingsTable(v, path)
+            elseif _G.VX and type(_G.VX.setSetting) == "function" then
+                pcall(_G.VX.setSetting, path, v)
+            end
+        end
     end
+end
+
+function Module:_trackConn(conn)
+    if conn then table.insert(self._conns, conn) end
     return conn
 end
 
@@ -69,17 +94,14 @@ function Module:_clearConns()
     self._conns = {}
 end
 
-function Module:_getSpeed()
+function Module:_getSpeedMPH()
     local auth = _G.VX.Authority
     local handle = auth and auth:getHandle()
-    local root = auth and auth:getRoot()
-    local velPart = (root and root.PrimaryPart) or (handle and handle.chassis)
-    local units = (_G.VX.getSetting and _G.VX.getSetting("ui.units")) or "KMH"
+    local velPart = handle and ((handle.root and handle.root.PrimaryPart) or handle.chassis)
     if velPart then
-        local raw = velPart.AssemblyLinearVelocity.Magnitude
-        return (units == "MPH") and (raw * 0.389) or (raw * 0.626), units
+        return velPart.AssemblyLinearVelocity.Magnitude * 0.626
     end
-    return 0, units
+    return 0
 end
 
 function Module:Construct()
@@ -94,6 +116,7 @@ function Module:Construct()
     self._tabBtns = {}
     self._profileCards = {}
     self._rowUpdaters = {}
+    self._presets = {}
     self._lastSysUpdate = 0
 end
 
@@ -110,7 +133,7 @@ end
 function Module:Start()
     self:_createPanel()
 
-    if _G.VX.getSetting and _G.VX.getSetting("ui.videoMode") == true then
+    if _G.VX.getSetting and _G.VX.getSetting("videoMode") == true then
         self:setHidden(true)
     end
 
@@ -160,9 +183,9 @@ function Module:_refreshProfileCards()
     for idx, card in pairs(self._profileCards) do
         if card and card.btn and card.btn.Parent then
             local sel = (idx == activeIdx)
-            card.btn.BackgroundColor3 = sel and C.accent or C.row
-            card.nameLbl.TextColor3 = sel and C.bg or C.text
-            card.subLbl.TextColor3 = sel and C.bg or C.muted
+            card.btn.BackgroundColor3 = sel and GT3.amber or GT3.carbonCard
+            card.nameLbl.TextColor3 = sel and GT3.carbonDeep or GT3.text
+            card.subLbl.TextColor3 = sel and GT3.carbonDeep or GT3.muted
         end
     end
 end
@@ -171,25 +194,52 @@ function Module:_refreshSystemCard()
     if not self._sysInfoLbl or not self._sysInfoLbl.Parent then return end
     local vs = _G.VX.Modules and _G.VX.Modules.VehicleState
     local st = vs and vs:getVehicleState() or "Unknown"
-    local spd, units = self:_getSpeed()
+    local spd = self:_getSpeedMPH()
     local prof = self.profiles:current()
     local status = _G.VX.getStatus and _G.VX.getStatus()
     local modCount = (status and status.modules) and #status.modules or 0
-    local rpm = self.powertrain.getRPM and self.powertrain:getRPM() or (self.powertrain.rpm or 0)
-    local gear = self.powertrain.getGear and self.powertrain:getGear() or (self.powertrain.gear or 1)
+    local rpm = self.powertrain:getRPM() or 0
+    local gear = self.powertrain:getGear() or 1
     local gearStr = (gear == -1) and "R" or ((gear == 0) and "N" or tostring(gear))
 
     self._sysInfoLbl.Text = string.format(
-        "Kernel v%s  |  Modules: %d\nState: %s  |  Speed: %.0f %s\nRPM: %d  |  Gear: %s\nActive Profile: %s",
+        "Kernel v%s  |  Modules: %d\nState: %s  |  Speed: %.0f MPH\nRPM: %d  |  Gear: %s\nProfile: %s",
         tostring(_G.VX.Version),
         modCount,
         st,
         spd,
-        units,
         math.floor(rpm),
         gearStr,
         prof and prof.name or "Default"
     )
+end
+
+function Module:_savePreset(name)
+    if type(_G.VX.settings) ~= "table" then return false end
+    local copy = _deepCopy(_G.VX.settings)
+    self._presets[name] = copy
+    if type(writefile) == "function" then
+        pcall(function()
+            writefile("VX_GT3_Preset_" .. name .. ".json", HttpService:JSONEncode(copy))
+        end)
+    end
+    return true
+end
+
+function Module:_loadPreset(name)
+    local data = self._presets[name]
+    if not data and type(readfile) == "function" and type(isfile) == "function" then
+        pcall(function()
+            local file = "VX_GT3_Preset_" .. name .. ".json"
+            if isfile(file) then
+                data = HttpService:JSONDecode(readfile(file))
+                self._presets[name] = data
+            end
+        end)
+    end
+    if type(data) ~= "table" then return false end
+    _applySettingsTable(data, nil)
+    return true
 end
 
 function Module:_createPanel()
@@ -209,50 +259,57 @@ function Module:_createPanel()
     gui.Parent = pg
     self._gui = gui
 
-    -- LEFT-SIDE TOGGLE BUTTON
+    -- LEFT-SIDE GT3 TOGGLE BUTTON
     local btn = Instance.new("TextButton")
-    btn.Name = "ToggleBtn"
+    btn.Name = "GT3_Toggle"
     btn.Size = UDim2.new(0, 44, 0, 44)
     btn.AnchorPoint = Vector2.new(0, 0.5)
     btn.Position = UDim2.new(0, 14, 0.5, 0)
-    btn.BackgroundColor3 = C.bg
-    btn.BackgroundTransparency = 0.08
+    btn.BackgroundColor3 = GT3.carbonDeep
+    btn.BackgroundTransparency = 0.06
     btn.Font = Enum.Font.GothamBlack
-    btn.TextSize = 14
-    btn.TextColor3 = C.accent
-    btn.Text = "VX"
+    btn.TextSize = 13
+    btn.TextColor3 = GT3.amber
+    btn.Text = "GT3"
     btn.Parent = gui
     _corner(btn, 10)
-    _stroke(btn, C.accent, 0.35, 1.2)
+    _stroke(btn, GT3.amber, 0.3, 1.4)
     self._toggleBtn = btn
     self:_trackConn(btn.MouseButton1Click:Connect(function() self:toggle() end))
 
     -- LEFT-SIDE SLIDING PANEL
     local panel = Instance.new("Frame")
-    panel.Name = "MainPanel"
-    panel.Size = UDim2.new(0, 348, 0.84, 0)
+    panel.Name = "GT3_Menu"
+    panel.Size = UDim2.new(0, 356, 0.84, 0)
     panel.AnchorPoint = Vector2.new(0, 0.5)
-    panel.Position = UDim2.new(0, -368, 0.5, 0)
-    panel.BackgroundColor3 = C.bg
-    panel.BackgroundTransparency = 0.05
+    panel.Position = UDim2.new(0, -376, 0.5, 0)
+    panel.BackgroundColor3 = GT3.carbonDeep
+    panel.BackgroundTransparency = 0.04
     panel.Visible = false
     panel.Parent = gui
-    _corner(panel, 12)
-    _stroke(panel, C.accent, 0.45, 1.2)
+    _corner(panel, 10)
+    _stroke(panel, GT3.carbonLine, 0.2, 1.4)
     self._panel = panel
 
     local sizeConstraint = Instance.new("UISizeConstraint")
-    sizeConstraint.MinSize = Vector2.new(320, 360)
-    sizeConstraint.MaxSize = Vector2.new(364, 580)
+    sizeConstraint.MinSize = Vector2.new(330, 360)
+    sizeConstraint.MaxSize = Vector2.new(372, 600)
     sizeConstraint.Parent = panel
 
     -- Header
     local header = Instance.new("Frame")
     header.Size = UDim2.new(1, 0, 0, 42)
-    header.BackgroundColor3 = C.panel
+    header.BackgroundColor3 = GT3.carbon
     header.BorderSizePixel = 0
     header.Parent = panel
-    _corner(header, 12)
+    _corner(header, 10)
+
+    local trim = Instance.new("Frame")
+    trim.Size = UDim2.new(1, -24, 0, 2)
+    trim.Position = UDim2.new(0, 12, 0, 0)
+    trim.BackgroundColor3 = GT3.amber
+    trim.BorderSizePixel = 0
+    trim.Parent = header
 
     local title = Instance.new("TextLabel")
     title.Size = UDim2.new(1, -90, 1, 0)
@@ -261,17 +318,17 @@ function Module:_createPanel()
     title.Font = Enum.Font.GothamBlack
     title.TextSize = 13
     title.TextXAlignment = Enum.TextXAlignment.Left
-    title.TextColor3 = C.text
-    title.Text = "VX // GT3 TUNING"
+    title.TextColor3 = GT3.text
+    title.Text = "VX // GT3 CARBON"
     title.Parent = header
 
     local hint = Instance.new("TextLabel")
-    hint.Size = UDim2.new(0, 36, 0, 20)
-    hint.Position = UDim2.new(1, -76, 0, 11)
-    hint.BackgroundColor3 = C.row
+    hint.Size = UDim2.new(0, 34, 0, 20)
+    hint.Position = UDim2.new(1, -74, 0, 11)
+    hint.BackgroundColor3 = GT3.carbonCard
     hint.Font = Enum.Font.GothamBold
     hint.TextSize = 10
-    hint.TextColor3 = C.muted
+    hint.TextColor3 = GT3.amber
     hint.Text = "F5"
     hint.Parent = header
     _corner(hint, 4)
@@ -279,10 +336,10 @@ function Module:_createPanel()
     local closeBtn = Instance.new("TextButton")
     closeBtn.Size = UDim2.new(0, 28, 0, 28)
     closeBtn.Position = UDim2.new(1, -34, 0, 7)
-    closeBtn.BackgroundColor3 = C.row
+    closeBtn.BackgroundColor3 = GT3.carbonCard
     closeBtn.Font = Enum.Font.GothamBold
     closeBtn.TextSize = 13
-    closeBtn.TextColor3 = C.muted
+    closeBtn.TextColor3 = GT3.muted
     closeBtn.Text = "X"
     closeBtn.Parent = header
     _corner(closeBtn, 6)
@@ -300,19 +357,20 @@ function Module:_createPanel()
     tabLayout.Padding = UDim.new(0, 4)
     tabLayout.Parent = tabBar
 
-    for _, tabName in ipairs(TABS) do
+    for _, tabKey in ipairs(TABS) do
         local tBtn = Instance.new("TextButton")
         tBtn.Size = UDim2.new(1 / #TABS, -4, 1, 0)
-        tBtn.BackgroundColor3 = C.row
+        tBtn.BackgroundColor3 = GT3.carbonCard
         tBtn.Font = Enum.Font.GothamBold
-        tBtn.TextSize = 11
-        tBtn.TextColor3 = C.muted
-        tBtn.Text = tabName
+        tBtn.TextSize = 10
+        tBtn.TextColor3 = GT3.muted
+        tBtn.Text = TAB_LABELS[tabKey]
+        tBtn.TextTruncate = Enum.TextTruncate.AtEnd
         tBtn.Parent = tabBar
         _corner(tBtn, 6)
-        self._tabBtns[tabName] = tBtn
+        self._tabBtns[tabKey] = tBtn
         self:_trackConn(tBtn.MouseButton1Click:Connect(function()
-            self:_switchTab(tabName)
+            self:_switchTab(tabKey)
         end))
     end
 
@@ -322,7 +380,7 @@ function Module:_createPanel()
     scroll.Position = UDim2.new(0, 8, 0, 84)
     scroll.BackgroundTransparency = 1
     scroll.ScrollBarThickness = 4
-    scroll.ScrollBarImageColor3 = C.accent
+    scroll.ScrollBarImageColor3 = GT3.amber
     scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
     scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
     scroll.Parent = panel
@@ -356,33 +414,33 @@ function Module:_createFooter(panel)
     local function footerBtn(text, col, fn)
         local b = Instance.new("TextButton")
         b.Size = UDim2.new(1 / 3, -4, 1, 0)
-        b.BackgroundColor3 = C.panel
+        b.BackgroundColor3 = GT3.carbon
         b.Font = Enum.Font.GothamBold
         b.TextSize = 11
         b.TextColor3 = col
         b.Text = text
         b.Parent = footer
-        _corner(b, 7)
-        _stroke(b, col, 0.5)
+        _corner(b, 6)
+        _stroke(b, col, 0.45)
         self:_trackConn(b.MouseButton1Click:Connect(fn))
     end
 
-    footerBtn("Save", C.green, function()
-        if self.profiles:savePreset("Custom1") then
-            self.ui:notify("Preset", "Saved Custom1", C.green, 2)
+    footerBtn("Save", GT3.green, function()
+        if self:_savePreset("Custom1") then
+            self.ui:notify("PRESET", "Saved Custom1", GT3.green, 2)
         end
     end)
-    footerBtn("Load", C.accent, function()
-        if self.profiles:loadPreset("Custom1") then
-            self.ui:notify("Preset", "Loaded Custom1", C.accent, 2)
+    footerBtn("Load", GT3.cyan, function()
+        if self:_loadPreset("Custom1") then
+            self.ui:notify("PRESET", "Loaded Custom1", GT3.cyan, 2)
             self:_refreshAllRows()
         else
-            self.ui:notify("Preset", "No Custom1 preset saved", C.amber, 2)
+            self.ui:notify("PRESET", "No Custom1 saved", GT3.amber, 2)
         end
     end)
-    footerBtn("Reset All", C.amber, function()
+    footerBtn("Reset All", GT3.amber, function()
         _G.VX.resetAll()
-        self.ui:notify("System", "All settings reset to defaults", C.amber, 2)
+        self.ui:notify("SYSTEM", "All settings reset", GT3.amber, 2)
         self:_refreshAllRows()
     end)
 end
@@ -396,7 +454,7 @@ function Module:open()
     }):Play()
     if self._toggleBtn then
         TweenService:Create(self._toggleBtn, TweenInfo.new(0.24, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-            Position = UDim2.new(0, 368, 0.5, 0),
+            Position = UDim2.new(0, 376, 0.5, 0),
         }):Play()
     end
 end
@@ -405,7 +463,7 @@ function Module:close()
     if not self._panel then return end
     self._isOpen = false
     local tw = TweenService:Create(self._panel, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
-        Position = UDim2.new(0, -368, 0.5, 0),
+        Position = UDim2.new(0, -376, 0.5, 0),
     })
     tw:Play()
     if self._toggleBtn then
@@ -424,16 +482,16 @@ function Module:toggle()
     if self._isOpen then self:close() else self:open() end
 end
 
-function Module:_switchTab(tabName)
-    self._activeTab = tabName
+function Module:_switchTab(tabKey)
+    self._activeTab = tabKey
     self._rowUpdaters = {}
     self._profileCards = {}
     self._sysInfoLbl = nil
 
-    for name, b in pairs(self._tabBtns) do
-        local sel = (name == tabName)
-        b.BackgroundColor3 = sel and C.accent or C.row
-        b.TextColor3 = sel and C.bg or C.muted
+    for key, b in pairs(self._tabBtns) do
+        local sel = (key == tabKey)
+        b.BackgroundColor3 = sel and GT3.amber or GT3.carbonCard
+        b.TextColor3 = sel and GT3.carbonDeep or GT3.muted
     end
 
     for _, child in ipairs(self._scroll:GetChildren()) do
@@ -443,43 +501,29 @@ function Module:_switchTab(tabName)
     end
     self._scroll.CanvasPosition = Vector2.new(0, 0)
 
-    if tabName == "Dynamics" then
+    if tabKey == "Dynamics" then
         self:_buildDynamics()
-    elseif tabName == "Engine" then
+    elseif tabKey == "Engine" then
         self:_buildEngine()
-    elseif tabName == "Audio" then
-        self:_buildAudio()
-    elseif tabName == "Visuals" then
-        self:_buildVisuals()
-    elseif tabName == "System" then
+    elseif tabKey == "Controls" then
+        self:_buildControls()
+    elseif tabKey == "AudioFX" then
+        self:_buildAudioFX()
+    elseif tabKey == "System" then
         self:_buildSystem()
     end
 end
 
 function Module:_addSection(title)
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, 0, 0, 22)
+    lbl.Size = UDim2.new(1, 0, 0, 20)
     lbl.BackgroundTransparency = 1
     lbl.Font = Enum.Font.GothamBlack
-    lbl.TextSize = 11
+    lbl.TextSize = 10
     lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.TextColor3 = C.accent
+    lbl.TextColor3 = GT3.amber
     lbl.Text = "  " .. string.upper(title)
     lbl.Parent = self._scroll
-end
-
-function Module:_addButtonRow(text, col, fn)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, 0, 0, 34)
-    btn.BackgroundColor3 = C.row
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 12
-    btn.TextColor3 = col or C.accent
-    btn.Text = text
-    btn.Parent = self._scroll
-    _corner(btn, 7)
-    _stroke(btn, col or C.accent, 0.55)
-    self:_trackConn(btn.MouseButton1Click:Connect(fn))
 end
 
 function Module:_addSettingRow(path)
@@ -487,33 +531,38 @@ function Module:_addSettingRow(path)
     local schema = reg and reg.schema or reg
     if not schema then return end
 
-    local isNumeric = (schema.type == "float" or schema.type == "int") and not schema.enumLabels
-    local isSegmented = (schema.type == "enum" and schema.options) or (schema.type == "int" and schema.enumLabels)
+    local t = schema.type
+    local isBool = (t == "boolean")
+    local hasOptions = (t == "enum" and type(schema.options) == "table")
+    local hasLabels = (type(schema.enumLabels) == "table")
+    local isShortCycler = hasOptions and (#schema.options > 5)
+    local isSegmented = (hasOptions and #schema.options <= 5) or (hasLabels and #schema.enumLabels <= 5)
+    local isSlider = (t == "number_range" or t == "number_stepped" or t == "float" or t == "int") and not isSegmented
 
     local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, isNumeric and 58 or (isSegmented and 60 or 38))
-    row.BackgroundColor3 = C.row
+    row.Size = UDim2.new(1, 0, 0, isSlider and 56 or (isSegmented and 58 or 38))
+    row.BackgroundColor3 = GT3.carbonCard
     row.Parent = self._scroll
     _corner(row, 7)
-    _stroke(row, C.border, 0.72)
+    _stroke(row, GT3.carbonLine, 0.55)
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(isNumeric and 0.65 or (isSegmented and 1 or 0.72), -14, 0, 22)
-    lbl.Position = UDim2.new(0, 10, 0, (schema.type == "boolean") and 8 or 4)
+    lbl.Size = UDim2.new(isSlider and 0.65 or (isSegmented and 1 or 0.62), -14, 0, 22)
+    lbl.Position = UDim2.new(0, 10, 0, (isBool or isShortCycler) and 8 or 4)
     lbl.BackgroundTransparency = 1
     lbl.Font = Enum.Font.GothamSemibold
     lbl.TextSize = 12
     lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.TextColor3 = C.text
+    lbl.TextColor3 = GT3.text
     lbl.TextTruncate = Enum.TextTruncate.AtEnd
     lbl.Text = schema.label or path
     lbl.Parent = row
 
-    if schema.type == "boolean" then
+    if isBool then
         local switch = Instance.new("TextButton")
         switch.Size = UDim2.new(0, 48, 0, 22)
         switch.Position = UDim2.new(1, -58, 0, 8)
-        switch.BackgroundColor3 = C.panel
+        switch.BackgroundColor3 = GT3.carbon
         switch.Text = ""
         switch.Parent = row
         _corner(switch, 11)
@@ -521,13 +570,13 @@ function Module:_addSettingRow(path)
         local knob = Instance.new("Frame")
         knob.Size = UDim2.new(0, 16, 0, 16)
         knob.Position = UDim2.new(0, 3, 0, 3)
-        knob.BackgroundColor3 = C.text
+        knob.BackgroundColor3 = GT3.text
         knob.Parent = switch
         _corner(knob, 8)
 
         local function sync(animate)
             local v = _G.VX.getSetting(path) == true
-            local targetBg = v and C.green or C.panel
+            local targetBg = v and GT3.green or GT3.carbon
             local targetPos = v and UDim2.new(1, -19, 0, 3) or UDim2.new(0, 3, 0, 3)
             if animate then
                 TweenService:Create(switch, TweenInfo.new(0.14), { BackgroundColor3 = targetBg }):Play()
@@ -545,9 +594,67 @@ function Module:_addSettingRow(path)
             sync(true)
         end))
 
+    elseif isShortCycler then
+        local opts = schema.options
+        local holder = Instance.new("Frame")
+        holder.Size = UDim2.new(0, 138, 0, 24)
+        holder.Position = UDim2.new(1, -148, 0, 7)
+        holder.BackgroundColor3 = GT3.carbon
+        holder.Parent = row
+        _corner(holder, 6)
+
+        local prevBtn = Instance.new("TextButton")
+        prevBtn.Size = UDim2.new(0, 24, 1, 0)
+        prevBtn.BackgroundTransparency = 1
+        prevBtn.Font = Enum.Font.GothamBold
+        prevBtn.TextSize = 12
+        prevBtn.TextColor3 = GT3.amber
+        prevBtn.Text = "<"
+        prevBtn.Parent = holder
+
+        local valLbl = Instance.new("TextLabel")
+        valLbl.Size = UDim2.new(1, -48, 1, 0)
+        valLbl.Position = UDim2.new(0, 24, 0, 0)
+        valLbl.BackgroundTransparency = 1
+        valLbl.Font = Enum.Font.GothamBold
+        valLbl.TextSize = 10
+        valLbl.TextColor3 = GT3.text
+        valLbl.TextTruncate = Enum.TextTruncate.AtEnd
+        valLbl.Parent = holder
+
+        local nextBtn = Instance.new("TextButton")
+        nextBtn.Size = UDim2.new(0, 24, 1, 0)
+        nextBtn.Position = UDim2.new(1, -24, 0, 0)
+        nextBtn.BackgroundTransparency = 1
+        nextBtn.Font = Enum.Font.GothamBold
+        nextBtn.TextSize = 12
+        nextBtn.TextColor3 = GT3.amber
+        nextBtn.Text = ">"
+        nextBtn.Parent = holder
+
+        local function sync()
+            local v = _G.VX.getSetting(path) or schema.default
+            valLbl.Text = tostring(v)
+        end
+        sync()
+        self._rowUpdaters[path] = sync
+
+        local function stepOpt(dir)
+            local cur = _G.VX.getSetting(path) or schema.default
+            local idx = 1
+            for i, opt in ipairs(opts) do
+                if opt == cur then idx = i; break end
+            end
+            idx = ((idx - 1 + dir) % #opts) + 1
+            _G.VX.setSetting(path, opts[idx])
+            sync()
+        end
+        self:_trackConn(prevBtn.MouseButton1Click:Connect(function() stepOpt(-1) end))
+        self:_trackConn(nextBtn.MouseButton1Click:Connect(function() stepOpt(1) end))
+
     elseif isSegmented then
         local holder = Instance.new("Frame")
-        holder.Size = UDim2.new(1, -20, 0, 26)
+        holder.Size = UDim2.new(1, -20, 0, 24)
         holder.Position = UDim2.new(0, 10, 0, 28)
         holder.BackgroundTransparency = 1
         holder.Parent = row
@@ -558,12 +665,12 @@ function Module:_addSettingRow(path)
         hl.Parent = holder
 
         local items = {}
-        if schema.options then
+        if hasOptions then
             for _, opt in ipairs(schema.options) do
                 table.insert(items, { val = opt, label = tostring(opt) })
             end
         else
-            local minV = schema.min or 0
+            local minV = schema.min or 1
             for idx, txt in ipairs(schema.enumLabels) do
                 table.insert(items, { val = minV + idx - 1, label = txt })
             end
@@ -590,60 +697,60 @@ function Module:_addSettingRow(path)
             if v == nil then v = schema.default end
             for val, b in pairs(btns) do
                 local active = (v == val)
-                b.BackgroundColor3 = active and C.accent or C.panel
-                b.TextColor3 = active and C.bg or C.muted
+                b.BackgroundColor3 = active and GT3.amber or GT3.carbon
+                b.TextColor3 = active and GT3.carbonDeep or GT3.muted
             end
         end
         sync()
         self._rowUpdaters[path] = sync
 
-    elseif isNumeric then
+    elseif isSlider then
         local minV = schema.min or 0
         local maxV = schema.max or 1
-        local step = schema.step or (schema.type == "int" and 1 or 0.05)
+        local step = schema.step or 0.05
         local invStep = 1 / step
 
         local valLbl = Instance.new("TextLabel")
         valLbl.Size = UDim2.new(0.35, -10, 0, 20)
         valLbl.Position = UDim2.new(0.65, 0, 0, 4)
         valLbl.BackgroundTransparency = 1
-        valLbl.Font = Enum.Font.GothamBold
-        valLbl.TextSize = 11
+        valLbl.Font = Enum.Font.Code
+        valLbl.TextSize = 12
         valLbl.TextXAlignment = Enum.TextXAlignment.Right
-        valLbl.TextColor3 = C.accent
+        valLbl.TextColor3 = GT3.amber
         valLbl.Parent = row
 
         local minusBtn = Instance.new("TextButton")
         minusBtn.Size = UDim2.new(0, 22, 0, 20)
-        minusBtn.Position = UDim2.new(0, 10, 0, 30)
-        minusBtn.BackgroundColor3 = C.panel
+        minusBtn.Position = UDim2.new(0, 10, 0, 29)
+        minusBtn.BackgroundColor3 = GT3.carbon
         minusBtn.Font = Enum.Font.GothamBold
         minusBtn.TextSize = 13
-        minusBtn.TextColor3 = C.muted
+        minusBtn.TextColor3 = GT3.muted
         minusBtn.Text = "-"
         minusBtn.Parent = row
         _corner(minusBtn, 5)
 
         local plusBtn = Instance.new("TextButton")
         plusBtn.Size = UDim2.new(0, 22, 0, 20)
-        plusBtn.Position = UDim2.new(1, -32, 0, 30)
-        plusBtn.BackgroundColor3 = C.panel
+        plusBtn.Position = UDim2.new(1, -32, 0, 29)
+        plusBtn.BackgroundColor3 = GT3.carbon
         plusBtn.Font = Enum.Font.GothamBold
         plusBtn.TextSize = 13
-        plusBtn.TextColor3 = C.muted
+        plusBtn.TextColor3 = GT3.muted
         plusBtn.Text = "+"
         plusBtn.Parent = row
         _corner(plusBtn, 5)
 
         local track = Instance.new("Frame")
         track.Size = UDim2.new(1, -76, 0, 8)
-        track.Position = UDim2.new(0, 38, 0, 36)
-        track.BackgroundColor3 = C.panel
+        track.Position = UDim2.new(0, 38, 0, 35)
+        track.BackgroundColor3 = GT3.carbon
         track.Parent = row
         _corner(track, 4)
 
         local fill = Instance.new("Frame")
-        fill.BackgroundColor3 = C.accent
+        fill.BackgroundColor3 = GT3.amber
         fill.Size = UDim2.new(0, 0, 1, 0)
         fill.Parent = track
         _corner(fill, 4)
@@ -652,16 +759,14 @@ function Module:_addSettingRow(path)
         knob.Size = UDim2.new(0, 14, 0, 14)
         knob.AnchorPoint = Vector2.new(0.5, 0.5)
         knob.Position = UDim2.new(0, 0, 0.5, 0)
-        knob.BackgroundColor3 = C.text
+        knob.BackgroundColor3 = GT3.text
         knob.ZIndex = 3
         knob.Parent = track
         _corner(knob, 7)
 
         local function formatVal(v)
-            if schema.type == "int" or step >= 1 then
+            if step >= 1 then
                 return string.format("%d", math.floor(v + 0.5))
-            elseif step < 0.001 then
-                return string.format("%.4f", v)
             elseif step < 0.01 then
                 return string.format("%.3f", v)
             end
@@ -681,9 +786,7 @@ function Module:_addSettingRow(path)
 
         local function snapValue(raw)
             local snapped = math.clamp(math.floor(raw * invStep + 0.5) / invStep, minV, maxV)
-            if schema.type == "int" then
-                snapped = math.floor(snapped + 0.5)
-            end
+            if step >= 1 then snapped = math.floor(snapped + 0.5) end
             return snapped
         end
 
@@ -729,31 +832,26 @@ function Module:_buildDynamics()
     self:_addSettingRow("weightTransferIntensity")
     self:_addSettingRow("physics.weightTransfer")
 
-    self:_addSection("Grip, Aero & Top Speed")
+    self:_addSection("Grip, Aero & Braking")
     self:_addSettingRow("frontGrip")
     self:_addSettingRow("rearGrip")
+    self:_addSettingRow("brakingPower")
+    self:_addSettingRow("brakeSpeed")
     self:_addSettingRow("physics.aeroDownforce")
     self:_addSettingRow("physics.downforceCoefficient")
     self:_addSettingRow("physics.aeroDrag")
-    self:_addSettingRow("topSpeed")
-
-    self:_addSection("Steering & Braking")
-    self:_addSettingRow("steeringSensitivity")
-    self:_addSettingRow("physics.turnSpeed")
-    self:_addSettingRow("physics.maxSteerAngle")
-    self:_addSettingRow("physics.steeringDecay")
-    self:_addSettingRow("brakingPower")
-    self:_addSettingRow("coastAssist")
+    self:_addSettingRow("throttleUltra")
 
     self:_addSection("Assists & Chassis Simulation")
     self:_addSettingRow("physics.tractionControl")
     self:_addSettingRow("physics.tractionControlSensitivity")
     self:_addSettingRow("physics.absEnabled")
-    self:_addSettingRow("physics.tireTempEnabled")
     self:_addSettingRow("physics.brakeFadeEnabled")
+    self:_addSettingRow("physics.tireTempEnabled")
     self:_addSettingRow("physics.engineBraking")
     self:_addSettingRow("physics.engineBrakingStrength")
-    self:_addSettingRow("physics.slopeLoad")
+    self:_addSettingRow("physics.engineLoad")
+    self:_addSettingRow("physics.engineLoadSensitivity")
 end
 
 function Module:_buildEngine()
@@ -774,7 +872,7 @@ function Module:_buildEngine()
         b.Text = ""
         b.Parent = grid
         _corner(b, 6)
-        _stroke(b, C.border, 0.7)
+        _stroke(b, GT3.carbonLine, 0.5)
 
         local nameLbl = Instance.new("TextLabel")
         nameLbl.Size = UDim2.new(1, -10, 0, 18)
@@ -793,7 +891,7 @@ function Module:_buildEngine()
         subLbl.Font = Enum.Font.Code
         subLbl.TextSize = 10
         subLbl.TextXAlignment = Enum.TextXAlignment.Left
-        subLbl.Text = string.format("%d RPM | %dG", prof.redlineRPM or prof.redline, #prof.gearRatios)
+        subLbl.Text = string.format("%d RPM | %dG", prof.redlineRPM or 7500, #prof.gearRatios)
         subLbl.Parent = b
 
         self._profileCards[i] = { btn = b, nameLbl = nameLbl, subLbl = subLbl }
@@ -803,71 +901,78 @@ function Module:_buildEngine()
     end
     self:_refreshProfileCards()
 
-    self:_addSection("Forced Induction")
+    self:_addSection("Forced Induction & Backfire")
     self:_addSettingRow("turboStage")
     self:_addSettingRow("turboCustomMultiplier")
+    self:_addSettingRow("realisticTurboEnabled")
+    self:_addSettingRow("turboSpoolEnabled")
+    self:_addSettingRow("turboFlutterEnabled")
+    self:_addSettingRow("turboBlowoffEnabled")
+    self:_addSettingRow("backfireEnabled")
 
-    self:_addSection("Torque & Transmission")
+    self:_addSection("Launch & Engine Behavior")
+    self:_addSettingRow("launchControlEnabled")
+    self:_addSettingRow("physics.launchWindow")
+    self:_addSettingRow("physics.antiLagEnabled")
     self:_addSettingRow("physics.torqueCurve")
-    self:_addSettingRow("physics.realisticShifting")
-    self:_addSettingRow("physics.shiftDelay")
-    self:_addSettingRow("physics.revLimiter")
-
-    self:_addSection("Launch & Idle")
-    self:_addSettingRow("physics.launchControl")
-    self:_addSettingRow("physics.launchTargetRPM")
-    self:_addSettingRow("physics.twostep")
+    self:_addSettingRow("physics.fuelCutLimiter")
     self:_addSettingRow("physics.coldStart")
+    self:_addSettingRow("physics.coldStartDuration")
     self:_addSettingRow("physics.idleHunting")
-    self:_addButtonRow("Trigger Cold Start", C.amber, function()
-        self.powertrain:triggerColdStart()
-    end)
+    self:_addSettingRow("physics.engineBog")
 end
 
-function Module:_buildAudio()
-    self:_addSection("Gain & Pitch")
+function Module:_buildControls()
+    self:_addSection("Speed & Steering")
+    self:_addSettingRow("topSpeed")
+    self:_addSettingRow("steeringSensitivity")
+    self:_addSettingRow("physics.turnSpeed")
+    self:_addSettingRow("physics.maxSteerAngle")
+    self:_addSettingRow("physics.steeringDecay")
+    self:_addSettingRow("highSpeedSteerReduction")
+    self:_addSettingRow("reductionFactor")
+
+    self:_addSection("Transmission & Mode")
+    self:_addSettingRow("realisticShifting")
+    self:_addSettingRow("shiftDelay")
+    self:_addSettingRow("shiftingJolt")
+    self:_addSettingRow("physics.clutchSimulation")
+    self:_addSettingRow("physics.clutchDuration")
+    self:_addSettingRow("physics.virtualClutch")
+    self:_addSettingRow("ghostModeEnabled")
+end
+
+function Module:_buildAudioFX()
+    self:_addSection("Audio Mix")
     self:_addSettingRow("masterVolume")
     self:_addSettingRow("engineBoost")
-    self:_addSettingRow("audio.volumeBoost")
     self:_addSettingRow("pitchOffset")
 
-    self:_addSection("Turbo & Sound Effects")
-    self:_addSettingRow("turboSpoolEnabled")
-    self:_addSettingRow("turboBlowoffEnabled")
-    self:_addSettingRow("audio.compressor")
-    self:_addSettingRow("audio.shiftSounds")
-    self:_addSettingRow("audio.backfires")
-    self:_addSettingRow("audio.exhaustPops")
-end
-
-function Module:_buildVisuals()
-    self:_addSection("Camera & Body Motion")
+    self:_addSection("Camera & Visuals")
     self:_addSettingRow("physicsTiltLevel")
     self:_addSettingRow("fovDynamicsEnabled")
     self:_addSettingRow("vehicleShaking")
-    self:_addSettingRow("shiftingJolt")
+    self:_addSettingRow("physics.telemetryHud")
+    self:_addSettingRow("videoMode")
 
-    self:_addSection("HUD Overlays")
-    self:_addSettingRow("visuals.telemetry")
-    self:_addSettingRow("visuals.notifications")
+    self:_addSection("Lights")
+    self:_addSettingRow("lightPattern")
+    self:_addSettingRow("lightSpeed")
+    self:_addSettingRow("headlightsEnabled")
+    self:_addSettingRow("hazardEnabled")
 end
 
 function Module:_buildSystem()
-    self:_addSection("Core & Interface")
-    self:_addSettingRow("enabled")
+    self:_addSection("Performance")
     self:_addSettingRow("performanceMode")
-    self:_addSettingRow("ui.units")
-    self:_addSettingRow("ui.scale")
-    self:_addSettingRow("ui.videoMode")
-    self:_addSettingRow("ui.diagnostics")
 
-    self:_addSection("Live Status")
+    self:_addSection("GT3 Live Status")
     local card = Instance.new("Frame")
-    card.Size = UDim2.new(1, 0, 0, 72)
-    card.BackgroundColor3 = C.row
+    card.Size = UDim2.new(1, 0, 0, 74)
+    card.BackgroundColor3 = GT3.carbonCard
     card.Parent = self._scroll
     _corner(card, 7)
-    _stroke(card, C.border, 0.72)
+    _stroke(card, GT3.carbonLine, 0.55)
 
     local info = Instance.new("TextLabel")
     info.Size = UDim2.new(1, -16, 1, -10)
@@ -877,7 +982,7 @@ function Module:_buildSystem()
     info.TextSize = 11
     info.TextXAlignment = Enum.TextXAlignment.Left
     info.TextYAlignment = Enum.TextYAlignment.Top
-    info.TextColor3 = C.text
+    info.TextColor3 = GT3.text
     info.Parent = card
     self._sysInfoLbl = info
     self:_refreshSystemCard()
