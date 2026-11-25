@@ -59,7 +59,6 @@ function Module:Construct()
     self._loadFactor = 1.0
     self._effectiveTopSpeed = 100
 
-    -- Adaptive TCU state
     self._prevBodySpeed = 0
     self._smoothAccel = 0
     self._struggleTimer = 0
@@ -213,7 +212,6 @@ function Module:_update(dt)
     self:_updateLaunch(dt)
     self:_updateThrottleSmoother(dt)
 
-    -- Track driver pedal intent (corner-entry lift-off hold & fast throttle stab)
     local now = os.clock()
     local posThr = math.max(0, self.smoothedThrottle)
     local dThr = (posThr - self._prevPosThrottle) / math.max(dt, 0.001)
@@ -356,7 +354,6 @@ function Module:_updateRPM(dt, prof)
     local posThr = math.max(0, self.smoothedThrottle)
     local riseMult = prof.rpmRiseMultiplier or 1.0
 
-    -- Reverse gear RPM
     if self.gear == -1 then
         local revMax = math.max(self:_getGearMaxMPH(prof, -1), 1)
         local revFrac = math.clamp(wheelSpeed / revMax, 0, 1)
@@ -366,7 +363,6 @@ function Module:_updateRPM(dt, prof)
         return
     end
 
-    -- Uncoupled crankshaft (manual clutch held)
     if clutchHeld then
         local target = prof.idleRPM + posThr * (effectiveRedline - prof.idleRPM)
         local rate = (target > self.rpm) and (6.0 * riseMult) or 3.5
@@ -375,7 +371,6 @@ function Module:_updateRPM(dt, prof)
         return
     end
 
-    -- Mid-shift clutch open: rev-match blip on downshift, smooth drop on upshift
     if self.shiftState == "open" and self.core.settings.realisticShifting then
         if self._revMatchTarget then
             self.rpm = self.rpm + (self._revMatchTarget - self.rpm) * math.min(18 * dt, 1)
@@ -385,7 +380,6 @@ function Module:_updateRPM(dt, prof)
         return
     end
 
-    -- Coupled Gear-Stage RPM + Stall-Speed Torque Converter Launch
     local gearMaxMPH = math.max(self:_getGearMaxMPH(prof, self.gear), 1)
     local stageRPM = prof.idleRPM + math.clamp(wheelSpeed / gearMaxMPH, 0, 1.04) * (effectiveRedline - prof.idleRPM)
 
@@ -457,7 +451,6 @@ function Module:_updateGear(dt, prof)
     local stallThreshold = self.core.config.stallThreshold or DEFAULT_STALL_THRESHOLD
     local posThr = math.max(0, self.smoothedThrottle)
 
-    -- Reverse exit gate
     if self.gear == -1 then
         if self.smoothedThrottle > 0.1 then
             self:_clearPendingUpshift()
@@ -466,14 +459,12 @@ function Module:_updateGear(dt, prof)
         return
     end
 
-    -- Enter reverse when stationary/slow and holding brake/reverse throttle
     if self.smoothedThrottle < -0.1 and bodySpeed < 5 then
         self:_clearPendingUpshift()
         self:_doShift(-1, "down", false)
         return
     end
 
-    -- Drop to gear 1 when coming to a stop
     if bodySpeed < 4 and wheelSpeed < 4 then
         self:_clearPendingUpshift()
         self._struggleTimer = 0
@@ -483,7 +474,6 @@ function Module:_updateGear(dt, prof)
         return
     end
 
-    -- Pending upshift execution
     if self.pendingUpshift.active then
         if now >= self.pendingUpshift.shiftTime then
             local targetGear = self.pendingUpshift.targetGear
@@ -495,7 +485,6 @@ function Module:_updateGear(dt, prof)
         return
     end
 
-    -- Upshift trigger: RPM >= effectiveRedline * 0.98 (respecting corner-entry hold & anti-hunt lockout)
     if self.rpm >= effectiveRedline * 0.98 and self.gear < maxGear and effectiveSpeed >= 4 then
         local newGear = self.gear + 1
         local cornerHeld = (now < self._cornerHoldUntil) and (posThr < 0.35)
@@ -513,7 +502,6 @@ function Module:_updateGear(dt, prof)
         end
     end
 
-    -- Downshift logics (Gear > 1)
     if self.gear > 1 then
         local lowerGear = self.gear - 1
         local lowerRatio = prof.gearRatios[lowerGear]
@@ -531,14 +519,12 @@ function Module:_updateGear(dt, prof)
             return
         end
 
-        -- 1. Emergency stall downshift
         if self.rpm < stallThreshold then
             self._struggleTimer = 0
             self:_doShift(lowerGear, "down", true)
             return
         end
 
-        -- 2. Braking downshift
         if self.smoothedThrottle < -0.35 and self.rpm < (lowRpmDownshift + 600) and predictedRPM < (effectiveRedline * 0.85) then
             self._struggleTimer = 0
             self:_doShift(lowerGear, "down", false)
@@ -546,14 +532,12 @@ function Module:_updateGear(dt, prof)
             return
         end
 
-        -- 3. Normal low-RPM downshift
         if self.rpm < lowRpmDownshift then
             self._struggleTimer = 0
             self:_doShift(lowerGear, "down", false)
             return
         end
 
-        -- 4. UPOD direct multi-gear kickdown
         local wantKickdown = (posThr > 0.85) or (now < self._sportStabUntil and posThr > 0.75)
         if wantKickdown and self.rpm < effectiveRedline * 0.58 then
             local optGear = self:_findOptimalKickdownGear(prof, effectiveRedline)
@@ -565,7 +549,6 @@ function Module:_updateGear(dt, prof)
             end
         end
 
-        -- 5. Adaptive struggle / hill-climb detection
         local gearMaxMPH = self:_getGearMaxMPH(prof, self.gear)
         if posThr > 0.55 and self.rpm < effectiveRedline * 0.72 and bodySpeed < gearMaxMPH * 0.88 then
             local expectedMin = math.max(1.0, posThr * (currentRatio or 1.0) * 0.9)
@@ -816,12 +799,6 @@ function Module:getRPM() return self.rpm end
 function Module:getGear() return self.gear end
 function Module:getSmoothedThrottle() return self.smoothedThrottle end
 function Module:isRevLimiting() return self.revLimiterActive end
-function Module:getShiftState() return self.shiftState end
-function Module:getLaunchState() return self.launch.state end
-function Module:isTwostepActive() return self.launch.twostepActive end
-function Module:getSlopeLoadFactor() return self._loadFactor end
-
-return Modulern self.revLimiterActive end
 function Module:getShiftState() return self.shiftState end
 function Module:getLaunchState() return self.launch.state end
 function Module:isTwostepActive() return self.launch.twostepActive end
