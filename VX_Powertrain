@@ -1,8 +1,9 @@
 --[[
-    VX_Powertrain v3.4.0
-    - Wheel-Coupled Gear-Stage RPM + Torque Converter Launch (realistic climb pace)
+    VX_Powertrain v3.5.0
+    - Wheel-Coupled Gear-Stage RPM + Stall-Speed Torque Converter Launch
     - Unified gearRatios[maxGear] / gearRatios[gear] speed & ratio-conserving shifts
-    - Adaptive TCU: Struggle/Hill Downshift, Anti-Hunt Hysteresis, UPOD Multi-Gear Kickdown, Corner Lift-Off Hold, Braking Downshifts & Rev-Match Blip
+    - Adaptive TCU: Struggle/Hill Downshift, Anti-Hunt Hysteresis, UPOD Multi-Gear Kickdown,
+      Corner-Entry Lift-Off Hold, Braking Downshifts & Rev-Match Blip
     - Upshift trigger: RPM >= effectiveRedline * 0.98
 ]]
 
@@ -15,7 +16,7 @@ local Player = Players.LocalPlayer
 local Module = VX.Framework.Module.new({
     Name = "Powertrain",
     Dependencies = { "Core", "Profiles", "Input", "VehicleState" },
-    Version = "3.4.0",
+    Version = "3.5.0",
 })
 
 local TICK_NORMAL = 60
@@ -397,7 +398,7 @@ function Module:_updateRPM(dt, prof)
     end
 
     local targetRPM = math.min(effectiveRedline + 100, stageRPM + converterSlip)
-    local trackRate = (targetRPM > self.rpm) and (9.5 * riseMult) or 6.5
+    local trackRate = (targetRPM > self.rpm) and (9.0 * riseMult) or 6.5
     self.rpm = self.rpm + (targetRPM - self.rpm) * math.min(trackRate * self._loadFactor * dt, 1)
 
     if os.clock() < self._bogUntil then
@@ -456,7 +457,7 @@ function Module:_updateGear(dt, prof)
     local stallThreshold = self.core.config.stallThreshold or DEFAULT_STALL_THRESHOLD
     local posThr = math.max(0, self.smoothedThrottle)
 
-    -- Reverse exit gate: applying gas exits reverse cleanly
+    -- Reverse exit gate
     if self.gear == -1 then
         if self.smoothedThrottle > 0.1 then
             self:_clearPendingUpshift()
@@ -498,7 +499,7 @@ function Module:_updateGear(dt, prof)
     if self.rpm >= effectiveRedline * 0.98 and self.gear < maxGear and effectiveSpeed >= 4 then
         local newGear = self.gear + 1
         local cornerHeld = (now < self._cornerHoldUntil) and (posThr < 0.35)
-        local antiHuntBlocked = (self._antiHuntGear == newGear) and (now < self._antiHuntUntil) and (self._smoothAccel < 3.0)
+        local antiHuntBlocked = (self._antiHuntGear == newGear) and (now < self._antiHuntUntil) and (self._smoothAccel < 2.0)
 
         if not cornerHeld and not antiHuntBlocked then
             if self.core.settings.shiftDelay and newGear >= 2 and newGear <= 4 then
@@ -537,7 +538,7 @@ function Module:_updateGear(dt, prof)
             return
         end
 
-        -- 2. Braking downshift (aggressive decel rev-match for corner exit)
+        -- 2. Braking downshift
         if self.smoothedThrottle < -0.35 and self.rpm < (lowRpmDownshift + 600) and predictedRPM < (effectiveRedline * 0.85) then
             self._struggleTimer = 0
             self:_doShift(lowerGear, "down", false)
@@ -552,7 +553,7 @@ function Module:_updateGear(dt, prof)
             return
         end
 
-        -- 4. UPOD direct multi-gear kickdown (throttle floor/stab or mid-drive topSpeed raise)
+        -- 4. UPOD direct multi-gear kickdown
         local wantKickdown = (posThr > 0.85) or (now < self._sportStabUntil and posThr > 0.75)
         if wantKickdown and self.rpm < effectiveRedline * 0.58 then
             local optGear = self:_findOptimalKickdownGear(prof, effectiveRedline)
@@ -567,10 +568,10 @@ function Module:_updateGear(dt, prof)
         -- 5. Adaptive struggle / hill-climb detection
         local gearMaxMPH = self:_getGearMaxMPH(prof, self.gear)
         if posThr > 0.55 and self.rpm < effectiveRedline * 0.72 and bodySpeed < gearMaxMPH * 0.88 then
-            local expectedMin = math.max(1.2, posThr * (currentRatio or 1.0) * 1.1)
+            local expectedMin = math.max(1.0, posThr * (currentRatio or 1.0) * 0.9)
             if self._smoothAccel < expectedMin * 0.35 then
                 self._struggleTimer = self._struggleTimer + dt
-                if self._struggleTimer >= 0.50 then
+                if self._struggleTimer >= 0.55 then
                     local oldGear = self.gear
                     self._struggleTimer = 0
                     self:_doShift(lowerGear, "down", false)
@@ -815,6 +816,12 @@ function Module:getRPM() return self.rpm end
 function Module:getGear() return self.gear end
 function Module:getSmoothedThrottle() return self.smoothedThrottle end
 function Module:isRevLimiting() return self.revLimiterActive end
+function Module:getShiftState() return self.shiftState end
+function Module:getLaunchState() return self.launch.state end
+function Module:isTwostepActive() return self.launch.twostepActive end
+function Module:getSlopeLoadFactor() return self._loadFactor end
+
+return Modulern self.revLimiterActive end
 function Module:getShiftState() return self.shiftState end
 function Module:getLaunchState() return self.launch.state end
 function Module:isTwostepActive() return self.launch.twostepActive end
