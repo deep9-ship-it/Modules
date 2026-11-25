@@ -1,6 +1,6 @@
 --[[
-    VX_Audio.lua — Engine Sound (Profile refRpm), Turbo Spool/Blowoff, Shift Sounds, Backfires & Compressor
-    Version: 3.0.1
+    VX_Audio.lua — Engine Sound (Profile refRpm), Turbo Spool/Blowoff/Flutter, Shift Sounds, Backfires & Compressor
+    Version: 3.0.2
 ]]
 
 local VX = _G.VX
@@ -13,7 +13,7 @@ local Player = Players.LocalPlayer
 local Module = VX.Framework.Module.new({
     Name = "Audio",
     Dependencies = { "Core", "Profiles", "Remote", "Powertrain", "DriveSystem" },
-    Version = "3.0.1",
+    Version = "3.0.2",
 })
 
 local TURBO_SPOOL_ID   = "89818258229795"
@@ -63,6 +63,7 @@ function Module:Construct()
     self._totalBackfires = 0
     self._totalShifts = 0
     self._totalBlowoffs = 0
+    self._totalFlutters = 0
 end
 
 function Module:Init(deps)
@@ -88,6 +89,7 @@ function Module:Start()
     self:_trackConn(_G.VX.bus:on("vehicle.backfire", function(evt) self:_onBackfire(evt) end))
     self:_trackConn(_G.VX.bus:on("turbo.spool", function(evt) self:_onSpool(evt) end))
     self:_trackConn(_G.VX.bus:on("turbo.blowoff", function(evt) self:_onBlowoff(evt) end))
+    self:_trackConn(_G.VX.bus:on("turbo.flutter", function(evt) self:_onFlutter(evt) end))
     self:_trackConn(_G.VX.bus:on("vehicle.launchRelease", function(evt) self:_onLaunch(evt) end))
     self:_trackConn(_G.VX.bus:on("profiles.changed", function(evt) self:_onProfileChange(evt) end))
     self:_trackConn(_G.VX.bus:on("settings.changed", function(evt) self:_onSettingChange(evt) end))
@@ -148,6 +150,10 @@ function Module:_registerDiagnostics()
         }, "Audio")
         D.register("audio.blowoffs", {
             fn = function() return { value = self._totalBlowoffs, unit = "", status = "normal" } end,
+            category = "Audio",
+        }, "Audio")
+        D.register("audio.flutters", {
+            fn = function() return { value = self._totalFlutters, unit = "", status = "normal" } end,
             category = "Audio",
         }, "Audio")
         D.register("audio.compressor", {
@@ -426,6 +432,25 @@ function Module:_onBlowoff(evt)
     local parent = self:_getSoundParent()
     pcall(function()
         self.remote:playSound(TURBO_BLOWOFF_ID, vol, pitch, parent)
+    end)
+end
+
+function Module:_onFlutter(evt)
+    if not self.core.settings.turboFlutterEnabled then return end
+    local prof = self.profiles:current()
+    if not prof or not prof.hasTurboSounds then return end
+
+    local now = os.clock()
+    if now - self.lastFlutterTime < self._cooldowns.flutter then return end
+    self.lastFlutterTime = now
+    self._totalFlutters = self._totalFlutters + 1
+
+    local intensity = (evt and evt.intensity) or 0.4
+    local vol = (0.4 + intensity * 0.45) * (self.core.settings.masterVolume or 1.0) * self._compressorGain
+    local pitch = 0.95 + intensity * 0.15 + math.random() * 0.08
+    local parent = self:_getSoundParent()
+    pcall(function()
+        self.remote:playSound(TURBO_FLUTTER_ID, vol, pitch, parent)
     end)
 end
 
