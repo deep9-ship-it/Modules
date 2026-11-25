@@ -1,10 +1,9 @@
 --[[
-    VX_Core v3.1.0
-    Settings removed: brakeBias*, driftStrength
-    Settings added: frontGrip, rearGrip, brakeSpeed, shiftingJolt,
-                    realisticShifting, shiftDelay, vehicleShaking,
-                    launchControlEnabled, turboCustomMultiplier
-    Turbo: 3 stages (1/2/3) → seat.Turbo = "21"/"42"/"78"
+    VX_Core v3.2.0
+    - Preserves all v3.1.0 settings, config, migration, and schemas
+    - Added: customHorsepower (auto/manual toggle) & horsepower (100..2500 HP)
+    - Updated: realistic turboStages (spoolRate, spoolRpmOffset, hpBonus) + turbo.flutter event
+    - Turbo: 3 stages (1/2/3) -> seat.Turbo = "21"/"42"/"78"
 ]]
 
 local VX = _G.VX
@@ -13,11 +12,11 @@ if not VX or not VX.Framework then error("VX_Core requires VX_Kernel") end
 local Module = VX.Framework.Module.new({
     Name = "Core",
     Dependencies = {},
-    Version = "3.1.0",
+    Version = "3.2.0",
 })
 
 function Module:Construct()
-    self._moduleVersion = "20.1.0"
+    self._moduleVersion = "20.2.0"
     self.settings = self:_defaultSettings()
     self.config   = self:_defaultConfig()
     self:_migrateLegacy()
@@ -25,11 +24,13 @@ end
 
 function Module:_defaultSettings()
     return {
-        _version = "20.1.0",
-        _schemaVersion = 4,
+        _version = "20.2.0",
+        _schemaVersion = 5,
 
         masterVolume = 1.0,
         topSpeed = 100,
+        customHorsepower = false,
+        horsepower = 500,
         brakingPower = 0.75,
         brakeSpeed = 5.0,
 
@@ -190,10 +191,11 @@ function Module:_defaultConfig()
             minSpeed = 5,
         },
 
+        -- Stage 1: fast/early spool; Stage 2: balanced; Stage 3: higher lag + huge top-end punch
         turboStages = {
-            [1] = { seatValue = "21", targetBoostPSI = 21, spoolRate = 1.2, blowoffThreshold = 6.3 },
-            [2] = { seatValue = "42", targetBoostPSI = 42, spoolRate = 1.5, blowoffThreshold = 12.6 },
-            [3] = { seatValue = "78", targetBoostPSI = 78, spoolRate = 2.0, blowoffThreshold = 23.4 },
+            [1] = { seatValue = "21", targetBoostPSI = 21, spoolRate = 1.80, spoolRpmOffset = -600, hpBonus = 0.12, blowoffThreshold = 6.3 },
+            [2] = { seatValue = "42", targetBoostPSI = 42, spoolRate = 1.25, spoolRpmOffset = 0,    hpBonus = 0.25, blowoffThreshold = 12.6 },
+            [3] = { seatValue = "78", targetBoostPSI = 78, spoolRate = 0.85, spoolRpmOffset = 600,  hpBonus = 0.45, blowoffThreshold = 23.4 },
         },
 
         tiltLevels = {
@@ -224,7 +226,6 @@ function Module:_migrateLegacy()
     local existing = _G.VX and _G.VX.settings
     if type(existing) == "table" then
         self:_deepMerge(self.settings, existing)
-        -- Drop deprecated keys
         self.settings.brakeBiasEnabled = nil
         self.settings.brakeBias = nil
         self.settings.brakeBiasIntensity = nil
@@ -295,8 +296,13 @@ function Module:Init(deps)
         local parts = {}
         for p in path:gmatch("[^%.]+") do table.insert(parts, p) end
         local cur = defaults
-        for _, p in ipairs(parts) do cur = cur[p] end
+        for _, p in ipairs(parts) do
+            if type(cur) ~= "table" then return false end
+            cur = cur[p]
+        end
+        if cur == nil then return false end
         _G.VX.setSetting(path, cur)
+        return true
     end
 
     self:_registerCoreSchema()
@@ -311,6 +317,8 @@ function Module:_registerCoreSchema()
 
     reg("masterVolume",             { type="number_range",   default=1.0, min=0, max=1, step=0.05, category="Audio",     label="Master Volume" })
     reg("topSpeed",                 { type="number_stepped", default=100, min=10, max=500, step=10,   category="Controls",  label="Top Speed" })
+    reg("customHorsepower",         { type="boolean",        default=false, category="Engine",       label="Custom Horsepower" })
+    reg("horsepower",               { type="number_range",   default=500, min=100, max=2500, step=25, category="Engine",    label="Horsepower (HP)", requires={"customHorsepower"} })
     reg("brakingPower",             { type="number_range",   default=0.75, min=0.2, max=1.5, step=0.05, category="Dynamics", label="Braking Power" })
     reg("brakeSpeed",               { type="number_range",   default=5.0, min=0.5, max=10.0, step=0.5, category="Dynamics", label="Brake Speed" })
     reg("frontGrip",                { type="number_range",   default=1.0, min=0.1, max=2.5, step=0.05, category="Dynamics", label="Front Grip" })
@@ -342,7 +350,7 @@ function Module:_registerCoreSchema()
     reg("lightPattern",             { type="enum",           default="Off", options={"Off","Strobe","Double Strobe","Triple Strobe","Pulse","Slow Pulse","Heartbeat","Police","Fast Police","Random"}, category="Lights", label="Light Pattern" })
     reg("lightSpeed",               { type="number_stepped", default=1, min=1, max=10, step=1,        category="Lights",    label="Light Speed" })
     reg("hazardEnabled",            { type="boolean",        default=true,  category="Lights",      label="Hazards in Light Show" })
-    reg("headlightsEnabled",        { type="boolean",        default=true,  category="Lights",      label="Headlights in Light Show" })
+    reg("headlightsEnabled",        { type="boolean",        default=true,  category="Lights",      label="Headlights in Show" })
     reg("ghostModeEnabled",         { type="boolean",        default=false, category="Controls",    label="Ghost Mode" })
     reg("performanceMode",          { type="enum",           default="auto", options={"auto","low","normal","high"}, category="Controls", label="Performance Mode" })
 
@@ -406,7 +414,7 @@ function Module:Start()
         "input.throttle","input.brake","input.steer","input.clutch",
         "settings.changed",
         "authority.lost","authority.verified",
-        "turbo.blowoff","turbo.spool",
+        "turbo.blowoff","turbo.flutter","turbo.spool",
     }
     for _, name in ipairs(events) do _G.VX.bus:on(name, function() end) end
     print("[VX] " .. #events .. " event names registered")
