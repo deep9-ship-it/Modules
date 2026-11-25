@@ -1,6 +1,6 @@
 --[[
-    VX_DriveSystem.lua — Engine-First Wheel Motor Drive, Fixed Steering, Dynamic Radius, Turbo, TCS, ABS & Governor
-    Version: 3.3.0
+    VX_DriveSystem.lua — Adaptive Wheel-Speed & Torque Control, Fixed Steering + Ackermann, Dynamic Radius, Turbo, TCS, ABS & Governor
+    Version: 3.4.0
 ]]
 
 local VX = _G.VX
@@ -11,7 +11,7 @@ end
 local Module = VX.Framework.Module.new({
     Name = "DriveSystem",
     Dependencies = { "Core", "Profiles", "Authority", "Powertrain", "VehicleState" },
-    Version = "3.3.0",
+    Version = "3.4.0",
 })
 
 local TICK_NORMAL = 60
@@ -19,7 +19,7 @@ local TICK_LOW = 30
 local STUDS_TO_MPH = 0.626
 local MPH_TO_STUDS = 1 / 0.626
 local DEFAULT_WHEEL_RADIUS = 1.65
-local BASE_DRIVE_TORQUE = 95000
+local BASE_DRIVE_TORQUE = 30000
 local BASE_BRAKE_TORQUE = 150000
 
 function Module:Construct()
@@ -323,17 +323,28 @@ function Module:_updateSteering(dt, handle, speed)
         maxAngle = maxAngle * math.max(0.35, decay)
     end
 
-    -- VX_Input Left=-1, Right=+1; Roblox Attachment Y+ rotates Left, Y- rotates Right
+    -- Polarity fix: Left=-1 -> +Y (Left), Right=+1 -> -Y (Right)
     local targetAngle = -math.clamp(rawSteer * maxAngle * sens, -maxAngle, maxAngle)
     self.steerAngle = self.steerAngle + (targetAngle - self.steerAngle) * math.min(turnSpeed * dt, 1)
 
+    -- Low-speed Ackermann geometry blending to parallel above 80 MPH
+    local ackermannFade = 1 - math.clamp((speed - 45) / 35, 0, 1)
+
     for _, w in ipairs(handle.wheels or {}) do
         if w.isFront and w.attach then
+            local wheelAngle = self.steerAngle
+            if ackermannFade > 0.01 and math.abs(wheelAngle) > 0.5 then
+                local turningLeft = wheelAngle > 0
+                local isInside = (turningLeft and w.isLeft) or ((not turningLeft) and (not w.isLeft))
+                local mult = isInside and (1 + 0.12 * ackermannFade) or (1 - 0.06 * ackermannFade)
+                wheelAngle = wheelAngle * mult
+            end
+
             local invert = false
             pcall(function()
                 invert = w.model and w.model:GetAttribute("Invert") == true
             end)
-            local angle = invert and -self.steerAngle or self.steerAngle
+            local angle = invert and -wheelAngle or wheelAngle
             pcall(function()
                 w.attach.Orientation = Vector3.new(0, angle, -90)
             end)
@@ -416,7 +427,7 @@ function Module:_update(dt)
     local bodySpeed = self:_getBodySpeedMPH(handle)
     self.wheelSpeed = self:_getDrivenWheelMPH(handle, drivetrain)
 
-    -- Smoothly slew effectiveTopSpeed when topSpeed setting changes mid-drive
+    -- Smoothly slew effectiveTopSpeed when topSpeed changes mid-drive
     local targetTop = math.max(settings.topSpeed or 100, 10)
     if bodySpeed < 3 then
         self._effectiveTopSpeed = targetTop
@@ -435,68 +446,56 @@ function Module:_update(dt)
     local twostepActive = self.powertrain:isTwostepActive()
     local slopeLoad = self.powertrain:getSlopeLoadFactor()
 
-    self:_updateTurbo(dt, prof, rpm, math.max(0, throttle))
+    local posThr = math.max(0, throttle)
+    self:_updateTurbo(dt, prof, rpm, posThr)
 
     local braking = math.max(0, -throttle)
     local brakeMult = self:_updateBrakes(dt, braking, bodySpeed)
 
-    -- Gear ratios define wheel speed ceiling directly from Engine RPM
+    -- Gear ratios control BOTH speed ceiling and torque multiplication
     local ratios = prof.gearRatios or { 3.85, 2.20, 1.55, 1.20, 0.95, 0.80, 0.65 }
     local maxGear = #ratios
     local topRatio = ratios[maxGear] or 0.65
     local curRatio = ratios[math.clamp(math.abs(gear), 1, maxGear)] or topRatio
-
-    local idleRPM = prof.idleRPM or 900
-    local redlineRPM = prof.redlineRPM or 8200
-    local rpmFrac = math.clamp((rpm - idleRPM) / math.max(redlineRPM - idleRPM, 1), 0, 1)
 
     local gearAngular = 0
     local governorBrake = 0
 
     if gear == -1 then
         local revTopMPH = math.min(effTop * 0.28, 40)
-        local revFrac = math.max(rpmFrac, math.min(math.abs(throttle), 1) * 0.35)
-        local revTargetMPH = revTopMPH * revFrac
-        gearAngular = -((revTargetMPH * MPH_TO_STUDS) / self._wheelRadius)
+        gearAngular = -((revTopMPH * MPH_TO_STUDS) / self._wheelRadius)
     elseif gear >= 1 then
         local gearMaxMPH = effTop * (topRatio / math.max(curRatio, 0.01))
-        local posThr = math.max(0, throttle)
-        -- Converter floor off idle so 0 MPH starts rolling immediately; slip headroom at high RPM/top gear
-        local driveFrac = (posThr > 0.05 and bodySpeed < 10) and math.max(rpmFrac, posThr * 0.30) or math.max(rpmFrac, (posThr > 0.05) and 0.14 or 0)
-        local targetMPH = gearMaxMPH * driveFrac
-
+        local targetMPH
         if gear == maxGear then
-            -- 7th gear: +5% slip headroom below effTop so tire slip never caps before 100% topSpeed
-            if posThr > 0.1 and bodySpeed < effTop * 0.995 then
-                targetMPH = math.max(targetMPH, math.min(effTop * 1.05, targetMPH * 1.05))
-            else
-                targetMPH = math.min(targetMPH, effTop)
-            end
+            -- 7th gear: +5% slip headroom below topSpeed so tire slip doesn't stall before 100%
+            targetMPH = (posThr > 0.1 and bodySpeed < effTop * 0.995) and (effTop * 1.05) or effTop
         else
-            -- Lower gears: +5% headroom near redline so RPM cleanly crosses 0.98 * effectiveRedline
-            if posThr > 0.1 and rpm >= redlineRPM * 0.90 then
-                targetMPH = math.min(gearMaxMPH * 1.05, targetMPH * 1.05)
-            else
-                targetMPH = math.min(targetMPH, gearMaxMPH * 1.05)
-            end
+            -- Gears 1..6: +4% headroom so wheel speed reaches gearMaxMPH and triggers 0.98 upshift cleanly
+            targetMPH = gearMaxMPH * 1.04
         end
-
         gearAngular = (targetMPH * MPH_TO_STUDS) / self._wheelRadius
 
-        -- Soft governor braking if topSpeed was lowered below current bodySpeed
         if bodySpeed > effTop * 1.02 then
             governorBrake = math.clamp((bodySpeed - effTop) / 15, 0, 1)
         end
     end
 
-    -- Scale power with topSpeed^1.75 so 7th gear overcomes v^2 aero drag at any topSpeed (60..500)
-    local topPowerScale = (math.max(effTop, 40) / 100) ^ 1.75
+    -- Realistic torque: 1st gear = high torque / low speed; 7th gear = low base torque + high-speed drag reserve
+    local topBaseScale = (math.max(effTop, 50) / 100) ^ 0.65
     local torqueCurve = 1.0
     if phys.torqueCurve then
         torqueCurve = self.profiles:getTorqueAtRPM(prof, rpm)
     end
 
-    local boostBonus = 1.0 + (self.boostPressure / 100) * 0.65
+    local rwdEfficiency = (drivetrain == "RWD") and 1.06 or 1.0
+    local dragReserve = 0
+    if gear >= 4 and bodySpeed > 40 then
+        local tallFactor = (gear - 3) / math.max(maxGear - 3, 1)
+        dragReserve = ((bodySpeed / 100) ^ 2) * 18000 * tallFactor
+    end
+
+    local boostBonus = 1.0 + (self.boostPressure / 100) * 0.55
     local launchBonus = (os.clock() < self._launchBurstUntil) and self._launchBurstMult or 1.0
 
     local tcsMult = 1.0
@@ -507,8 +506,10 @@ function Module:_update(dt)
         end
     end
 
-    local driveTorque = BASE_DRIVE_TORQUE * torqueCurve * curRatio * topPowerScale * boostBonus * launchBonus * tcsMult * slopeLoad
+    local driveTorque = (BASE_DRIVE_TORQUE * torqueCurve * curRatio * topBaseScale * rwdEfficiency + dragReserve)
+        * boostBonus * launchBonus * tcsMult * slopeLoad
     local brakeTorque = BASE_BRAKE_TORQUE * (settings.brakingPower or 0.75) * brakeMult
+    local motorAngAccel = math.max(15, 45 * (curRatio / 1.5) * math.max(0.25, posThr))
 
     for _, w in ipairs(handle.wheels or {}) do
         local isDriven = (drivetrain == "AWD")
@@ -518,17 +519,20 @@ function Module:_update(dt)
         local mode = "coast"
         local angular = 0
         local torque = 0
+        local angAccel = motorAngAccel
 
         if launchState == "holding" or twostepActive then
             mode = "brake"
             angular = 0
             torque = BASE_BRAKE_TORQUE
+            angAccel = 120
         elseif shiftState == "open" and settings.realisticShifting then
             mode = "coast"
         elseif governorBrake > 0.05 and throttle >= 0 then
             mode = "drive"
             angular = (effTop * MPH_TO_STUDS) / self._wheelRadius
             torque = brakeTorque * 0.4 * governorBrake
+            angAccel = 80
         elseif gear == -1 then
             if throttle < -0.05 and isDriven then
                 mode = "drive"
@@ -538,9 +542,10 @@ function Module:_update(dt)
                 mode = "brake"
                 angular = 0
                 torque = brakeTorque * math.min(throttle, 1)
+                angAccel = 120
             end
         else
-            -- Throttle controls torque ONLY; AngularVelocity holds mechanical gear speed
+            -- Throttle controls MotorMaxTorque ONLY; AngularVelocity holds the gear's mechanical speed ceiling
             if throttle > 0.05 and isDriven then
                 mode = "drive"
                 angular = gearAngular
@@ -549,6 +554,7 @@ function Module:_update(dt)
                 mode = "brake"
                 angular = 0
                 torque = brakeTorque * math.min(braking, 1)
+                angAccel = 120
             end
         end
 
@@ -558,6 +564,7 @@ function Module:_update(dt)
                     w.cylinder.AngularActuatorType = Enum.ActuatorType.None
                 else
                     w.cylinder.AngularActuatorType = Enum.ActuatorType.Motor
+                    w.cylinder.MotorMaxAngularAcceleration = angAccel
                     w.cylinder.AngularVelocity = angular
                     w.cylinder.MotorMaxTorque = torque
                 end
