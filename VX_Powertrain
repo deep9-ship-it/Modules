@@ -1,520 +1,738 @@
 --[[
-    VX_Authority v3.0.0
-    Takeover of game's VehicleSteering + VehicleControls.
-    Caches vehicle parts with aliasing. Restores on exit.
+    VX_Powertrain v3.0.0
+    RPM, gears, clutch, launch RPM control, throttle smoothing.
 
-    Depends on: Core
+    Depends on: Core, Profiles, Input, VehicleState
     Exposes:
-      takeControl()       → bool, handle
-      releaseControl()    → void
-      getHandle()         → handle or nil
-      isHealthy()         → bool
-      verify()            → re-kill if needed
+      getRPM()               → number
+      getGear()              → number (-1..7)
+      getSmoothedThrottle()  → number (-brakingPower..1)
+      isRevLimiting()        → bool
+      getShiftState()        → "closed" | "open"
+      getLaunchState()       → "idle" | "arming" | "holding" | "releasing" | "cooled"
+      getSlopeLoadFactor()   → number (0..1) for DriveSystem
 
     Emits:
-      authority.taken    → { handle }
-      authority.lost     → { reason }
-      authority.verified → { recovered = bool }
+      vehicle.shift        { up, from, to, rpmBefore, rpmAfter, emergency }
+      engine.revLimit      { active }
+      vehicle.launchStart  { rpm }
+      vehicle.launchRelease{ quality, rpm }
+
+    Responsibilities:
+      - Frame-rate independent updates
+      - Torque curve, engine load, cold start, idle hunting, bog
+      - Predictive gear shifts with hysteresis
+      - Clutch simulation with shift cut
+      - 3 rev limiter types (soft / hard / ignition)
+      - Full launch state machine (arming → holding → releasing → idle)
+      - Fuel cut pattern during limit
+      - Triggers backfire burst on launch release via bus event
 ]]
 
 local VX = _G.VX
-if not VX or not VX.Framework then error("VX_Authority requires VX_Kernel") end
+if not VX or not VX.Framework then error("VX_Powertrain requires VX_Kernel") end
 
-local CS = game:GetService("CollectionService")
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local Player = Players.LocalPlayer
 
 local Module = VX.Framework.Module.new({
-    Name = "Authority",
-    Dependencies = { "Core" },
+    Name = "Powertrain",
+    Dependencies = { "Core", "Profiles", "Input", "VehicleState" },
     Version = "3.0.0",
 })
 
--- ==================== PART ALIASES ====================
-local ALIASES = {
-    FrontLeft  = { "WheelFL", "FrontLeft", "FrontLeftWheel", "FLWheel", "FL" },
-    FrontRight = { "WheelFR", "FrontRight", "FrontRightWheel", "FRWheel", "FR" },
-    BackLeft   = { "WheelBL", "BackLeft", "RearLeft", "BackLeftWheel", "BLWheel", "BL", "RL" },
-    BackRight  = { "WheelBR", "BackRight", "RearRight", "BackRightWheel", "BRWheel", "BR", "RR" },
-    Chassis    = { "Chassis" },
-    Platform   = { "Platform", "ChassisPlatform", "Base" },
-    Mass       = { "Mass", "MassPart", "ChassisMass", "Weight" },
-    Wheels     = { "Wheels", "WheelContainer", "WheelGroup" },
-    Seats      = { "Seats", "SeatGroup" },
-    Body       = { "Body", "CarBody" },
-    Emitter    = { "SoundEmmiter", "SoundEmitter" },
-    Nitrous    = { "NitrousPoint", "ExhaustPoint", "FlamePoint" },
-    VfxAttach  = { "VfxAttachmentPoint", "Attachment" },
+-- ==================== CONSTANTS ====================
+local TICK_RATE_NORMAL = 60
+local TICK_RATE_LOW    = 30
+
+local LAUNCH_STATES = {
+    IDLE      = "idle",
+    ARMING    = "arming",     -- both pedals, waiting for confirmation
+    HOLDING   = "holding",    -- RPM ramping, throttle forced 0
+    RELEASING = "releasing",  -- brake released, throttle burst
+    COOLED    = "cooled",     -- aftermath, brief period before normal
 }
 
--- ==================== LIFECYCLE ====================
+-- ==================== STATE ====================
 function Module:Construct()
-    self._handle = nil
-    self._active = false
-    self._verifyThread = nil
-    self._getConnections = getconnections
-    self._getUpvalues = getupvalues
-    self._debugInfo = debug and debug.getinfo
+    self.rpm            = 900
+    self.gear           = 1
+    self.shiftCooldown  = 0
+    self.shiftState     = "closed"
+
+    self.smoothedThrottle = 0
+    self.targetThrottle   = 0
+
+    self.revLimiterActive = false
+    self.revLimiterPhase  = 0
+    self.revLimiterLastToggle = 0
+
+    self.launch = {
+        state       = LAUNCH_STATES.IDLE,
+        startTime   = 0,
+        releaseTime = 0,
+        rpmTarget   = 6500,
+        rpm         = 900,
+        cooldownEnd = 0,
+    }
+
+    self._loopThread = nil
+    self._running    = false
+
+    -- Diagnostic accumulators
+    self._fuelCutEvents   = 0
+    self._shiftEvents     = 0
+    self._lastShiftTime   = 0
+    self._upshiftFlicker  = 0  -- detects rapid up/down flutter
+    self._downshiftFlicker= 0
+
+    -- Cold start
+    self._coldStartEndTime = 0
+
+    -- Bog
+    self._bogUntil    = 0
+    self._bogMagnitude = 0
+    self._lastSmoothed = 0
+
+    -- Idle hunt
+    self._idleHuntPhase = 0
+
+    -- Cache for diagnostics
+    self._loadFactor = 1.0
 end
 
 function Module:Init(deps)
-    self.core = deps.Core
+    self.core     = deps.Core
+    self.profiles = deps.Profiles
+    self.input    = deps.Input
+    self.state    = deps.VehicleState
 end
 
 function Module:Start()
-    _G.VX.Authority = self
+    _G.VX.Powertrain = self
+
+    _G.VX.bus:on("vehicle.stateChanged", function(evt)
+        if evt.to == "Ready" or evt.to == "Idle" then
+            self:_start()
+        elseif evt.to == "Exiting" or evt.to == "Disabled" then
+            self:_stop()
+        end
+    end)
+
+    -- Register diagnostics
+    self:_registerDiagnostics()
 end
 
 function Module:Stop()
-    if self._active then
-        pcall(function() self:releaseControl() end)
-    end
-    if self._verifyThread then
-        pcall(function() task.cancel(self._verifyThread) end)
-        self._verifyThread = nil
-    end
-    if _G.VX.Authority == self then _G.VX.Authority = nil end
+    self:_stop()
+    if _G.VX.Powertrain == self then _G.VX.Powertrain = nil end
 end
 
 function Module:heartbeat()
-    if not self._active then return true end
-    return self._handle ~= nil
-end
-
--- ==================== PUBLIC API ====================
-function Module:getHandle()
-    return self._handle
-end
-
-function Module:isHealthy()
-    if not self._handle then return false end
-    return self._handle.root and self._handle.root.Parent ~= nil
-end
-
-function Module:takeControl()
-    if self._active then return true, self._handle end
-
-    local handle, reason = self:_discover()
-    if not handle then
-        warn("[VX] Authority discover failed: " .. tostring(reason))
-        return false, reason
-    end
-
-    local killed, killReason = self:_killGameModules(handle)
-    if not killed then
-        warn("[VX] Authority kill failed: " .. tostring(killReason))
-        return false, killReason
-    end
-
-    self:_setupTiltWeld(handle)
-    self:_adjustMassSize(handle)
-    self:_cacheOriginals(handle)
-
-    self._handle = handle
-    self._active = true
-
-    -- Start verify loop
-    self:_startVerify()
-
-    _G.VX.bus:emit("authority.taken", { handle = handle })
-    print("[VX] Authority: takeover complete")
-    return true, handle
-end
-
-function Module:releaseControl()
-    if not self._active then return end
-
-    if self._verifyThread then
-        pcall(function() task.cancel(self._verifyThread) end)
-        self._verifyThread = nil
-    end
-
-    local handle = self._handle
-    if handle then
-        pcall(function() self:_restoreAll(handle) end)
-    end
-
-    self._handle = nil
-    self._active = false
-    _G.VX.bus:emit("authority.lost", { reason = "release" })
-    print("[VX] Authority: released")
-end
-
--- ==================== DISCOVERY ====================
-function Module:_discover()
-    local char = Player.Character
-    if not char then return nil, "no character" end
-
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum or not hum.Sit or not hum.SeatPart then
-        return nil, "not seated"
-    end
-
-    local seat = hum.SeatPart
-    if not seat:IsA("VehicleSeat") then
-        return nil, "not a VehicleSeat"
-    end
-
-    -- Find root
-    local root = self:_findAncestorWithChassis(seat)
-    if not root then return nil, "no root with Chassis" end
-
-    -- Find chassis
-    local chassis = self:_findPart(root, "Chassis")
-    if not chassis then return nil, "no Chassis" end
-
-    -- Find platform
-    local platform = self:_findPart(chassis, "Platform")
-    if not platform then return nil, "no Platform" end
-
-    -- Find mass
-    local mass = self:_findPart(chassis, "Mass")
-    if not mass then return nil, "no Mass" end
-
-    -- Find wheels folder
-    local wheelsFolder = self:_findPart(chassis, "Wheels")
-    if not wheelsFolder then return nil, "no Wheels folder" end
-
-    -- Enumerate wheels with aliasing
-    local wheels = self:_enumerateWheels(wheelsFolder)
-    if #wheels ~= 4 then
-        return nil, "expected 4 wheels, found " .. #wheels
-    end
-
-    -- Locate emitter / nitrous for audio/vfx
-    local body = self:_findPart(root, "Body")
-    local emitter = body and self:_findPart(body, "Emitter") or nil
-    local nitrous = body and self:_findPart(body, "Nitrous") or nil
-    local vfxAttach = nitrous and self:_findPart(nitrous, "VfxAttach") or nil
-
-    return {
-        root     = root,
-        seat     = seat,
-        chassis  = chassis,
-        platform = platform,
-        mass     = mass,
-        wheels   = wheels,
-        body     = body,
-        emitter  = emitter,
-        nitrous  = nitrous,
-        vfxAttach = vfxAttach,
-    }
-end
-
-function Module:_findAncestorWithChassis(inst)
-    local cur = inst
-    while cur and cur ~= workspace do
-        if cur:IsA("Model") and cur:FindFirstChild("Chassis") then
-            return cur
-        end
-        cur = cur.Parent
-    end
-    return nil
-end
-
-function Module:_findPart(parent, aliasKey)
-    local aliases = ALIASES[aliasKey]
-    if not aliases then return nil end
-    for _, name in ipairs(aliases) do
-        local found = parent:FindFirstChild(name)
-        if found then return found end
-    end
-    return nil
-end
-
-function Module:_enumerateWheels(folder)
-    local out = {}
-    local found = {
-        FrontLeft  = false,
-        FrontRight = false,
-        BackLeft   = false,
-        BackRight  = false,
-    }
-    for _, child in ipairs(folder:GetChildren()) do
-        if not child:IsA("Model") then continue end
-        for slot, aliases in pairs({
-            FrontLeft  = ALIASES.FrontLeft,
-            FrontRight = ALIASES.FrontRight,
-            BackLeft   = ALIASES.BackLeft,
-            BackRight  = ALIASES.BackRight,
-        }) do
-            for _, name in ipairs(aliases) do
-                if child.Name == name and not found[slot] then
-                    local physical = child:FindFirstChild("PhysicalWheel")
-                    local spring   = child:FindFirstChild("Spring")
-                    local cylinder = child:FindFirstChild("Cylindrical")
-                    local attach   = child:FindFirstChild("AttachmentHolder")
-                        and child.AttachmentHolder:FindFirstChild("Attachment")
-                    if physical and spring and cylinder then
-                        table.insert(out, {
-                            name       = slot,
-                            model      = child,
-                            physical   = physical,
-                            spring     = spring,
-                            cylinder   = cylinder,
-                            attach     = attach,
-                            isFront    = (slot == "FrontLeft" or slot == "FrontRight"),
-                            isLeft     = (slot == "FrontLeft" or slot == "BackLeft"),
-                        })
-                        found[slot] = true
-                    end
-                    break
-                end
-            end
-        end
-    end
-    return out
-end
-
--- ==================== KILL GAME MODULES ====================
-function Module:_killGameModules(handle)
-    local root = handle.root
-
-    -- 1. Remove tags
-    pcall(function()
-        CS:RemoveTag(root, "VehicleSteering")
-        CS:RemoveTag(root, "VehicleControls")
-    end)
-
-    -- 2. Remove tag from MainGUIHandler.VehicleControls too
-    pcall(function()
-        local gui = Player:WaitForChild("PlayerGui", 3)
-        if gui then
-            local handler = gui:FindFirstChild("MainGUIHandler")
-            if handler then
-                local controls = handler:FindFirstChild("VehicleControls")
-                if controls then
-                    CS:RemoveTag(controls, "VehicleControls")
-                end
-            end
-        end
-    end)
-
-    -- 3. Kill matching Heartbeat connections
-    local killed = 0
-    if self._getConnections and self._debugInfo then
-        local conns = self._getConnections(RunService.Heartbeat)
-        if conns then
-            for _, conn in ipairs(conns) do
-                local fn = nil
-                pcall(function() fn = conn.Function end)
-                if fn then
-                    local info = nil
-                    pcall(function() info = self._debugInfo(fn) end)
-                    if info and info.source then
-                        local src = tostring(info.source)
-                        if src:find("VehicleSteering") or src:find("VehicleControls") then
-                            pcall(function() conn:Disconnect() end)
-                            killed = killed + 1
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    -- 4. Neutralize attributes to prevent game fallback
-    pcall(function()
-        if root:GetAttribute("ThrottleFloat") ~= nil then
-            root:SetAttribute("ThrottleFloat", 0)
-        end
-        if root:GetAttribute("SteerFloat") ~= nil then
-            root:SetAttribute("SteerFloat", 0)
-        end
-    end)
-
-    if killed == 0 and not self._getConnections then
-        warn("[VX] getconnections unavailable — tag removal is the only kill method")
-    end
-
-    print("[VX] Authority: killed " .. killed .. " connections")
+    if not self._running then return true end
     return true
 end
 
--- ==================== TILT WELD ====================
-function Module:_setupTiltWeld(handle)
-    local mass = handle.mass
-    local platform = handle.platform
-    if not mass or not platform then return end
-
-    local wc = mass:FindFirstChildOfClass("WeldConstraint")
-    if wc then
-        handle.originalWC = {
-            part0 = wc.Part0,
-            part1 = wc.Part1,
-            name  = wc.Name,
-        }
-        wc:Destroy()
-    end
-
-    local offset = platform.CFrame:Inverse() * mass.CFrame
-    local weld = Instance.new("Weld")
-    weld.Name = "VX_MassTiltWeld"
-    weld.Part0 = platform
-    weld.Part1 = mass
-    weld.C0 = offset
-    weld.C1 = CFrame.new()
-    weld.Parent = mass
-
-    handle.tiltWeld   = weld
-    handle.neutralC0  = offset
-end
-
-function Module:_restoreTiltWeld(handle)
-    if handle.tiltWeld then
-        pcall(function() handle.tiltWeld:Destroy() end)
-        handle.tiltWeld = nil
-    end
-    if handle.originalWC and handle.mass and handle.mass.Parent then
-        local wc = Instance.new("WeldConstraint")
-        wc.Name  = handle.originalWC.name or "WeldConstraint"
-        wc.Part0 = handle.originalWC.part0
-        wc.Part1 = handle.originalWC.part1
-        wc.Parent = handle.mass
-    end
-    handle.originalWC = nil
-    handle.neutralC0 = nil
-end
-
--- ==================== MASS ADJUST ====================
-function Module:_adjustMassSize(handle)
-    if not handle.mass then return end
-    handle.originalMassSize = handle.mass.Size
+function Module:_registerDiagnostics()
+    local D = _G.VX.diagnostics
     pcall(function()
-        handle.mass.Size = Vector3.new(4, 4, 10)
+        D.register("powertrain.rpm", {
+            fn = function() return { value = math.floor(self.rpm), unit = "rpm", status = "normal" } end,
+            category = "Powertrain",
+        }, "Powertrain")
+        D.register("powertrain.gear", {
+            fn = function() return { value = self.gear, unit = "", status = "normal" } end,
+            category = "Powertrain",
+        }, "Powertrain")
+        D.register("powertrain.throttle", {
+            fn = function() return { value = string.format("%.2f", self.smoothedThrottle), unit = "", status = "normal" } end,
+            category = "Powertrain",
+        }, "Powertrain")
+        D.register("powertrain.shift", {
+            fn = function()
+                return {
+                    value = self.shiftState,
+                    unit = "",
+                    status = self.shiftState == "open" and "warning" or "normal",
+                }
+            end,
+            category = "Powertrain",
+        }, "Powertrain")
+        D.register("powertrain.launch", {
+            fn = function() return { value = self.launch.state, unit = "", status = "normal" } end,
+            category = "Powertrain",
+        }, "Powertrain")
+        D.register("powertrain.revLimiter", {
+            fn = function()
+                return {
+                    value = self.revLimiterActive and "ON" or "off",
+                    unit = "",
+                    status = self.revLimiterActive and "warning" or "normal",
+                }
+            end,
+            category = "Powertrain",
+        }, "Powertrain")
+        D.register("powertrain.load", {
+            fn = function() return { value = string.format("%.2f", self._loadFactor), unit = "", status = "normal" } end,
+            category = "Powertrain",
+        }, "Powertrain")
     end)
 end
 
-function Module:_restoreMassSize(handle)
-    if handle.originalMassSize and handle.mass and handle.mass.Parent then
-        pcall(function() handle.mass.Size = handle.originalMassSize end)
-    end
-end
+-- ==================== MAIN LOOP ====================
+function Module:_start()
+    if self._running then return end
+    self._running = true
 
--- ==================== CACHE ORIGINALS ====================
-function Module:_cacheOriginals(handle)
-    handle.originalFriction = {}
-    handle.originalSpring   = {}
-    for _, w in ipairs(handle.wheels) do
-        local props = w.physical.CustomPhysicalProperties
-        handle.originalFriction[w.name] = props and props.Friction or 1.0
-        handle.originalSpring[w.name] = {
-            stiffness = w.spring.Stiffness,
-            damping   = w.spring.Damping,
-            freeLength = w.spring.FreeLength,
-        }
-    end
-end
+    local prof = self.profiles:current()
+    self.rpm  = prof.idleRPM
+    self.gear = 1
+    self.shiftState = "closed"
+    self.shiftCooldown = 0
+    self.revLimiterActive = false
+    self.revLimiterPhase = 0
+    self.launch.state = LAUNCH_STATES.IDLE
 
--- ==================== RESTORE ====================
-function Module:_restoreAll(handle)
-    self:_restoreTiltWeld(handle)
-    self:_restoreMassSize(handle)
+    self._loopThread = task.spawn(function()
+        local perf = self.core.settings._effectivePerformance
+        local tickRate = (perf == "low") and TICK_RATE_LOW or TICK_RATE_NORMAL
+        local tickInterval = 1 / tickRate
+        local lastTick = os.clock()
 
-    for _, w in ipairs(handle.wheels or {}) do
-        pcall(function()
-            if w.cylinder then
-                w.cylinder.AngularActuatorType = Enum.ActuatorType.None
-                w.cylinder.AngularVelocity = 0
-                w.cylinder.MotorMaxTorque = 0
-            end
-        end)
-        pcall(function()
-            local origF = handle.originalFriction[w.name]
-            if origF and w.physical and w.physical.Parent then
-                local props = w.physical.CustomPhysicalProperties
-                local d = props and props.Density or 0.7
-                local e = props and props.Elasticity or 0.5
-                local fw = props and props.FrictionWeight or 2
-                local ew = props and props.ElasticityWeight or 1
-                w.physical.CustomPhysicalProperties = PhysicalProperties.new(d, origF, e, fw, ew)
-            end
-        end)
-        pcall(function()
-            local origS = handle.originalSpring[w.name]
-            if origS and w.spring and w.spring.Parent then
-                w.spring.Stiffness  = origS.stiffness
-                w.spring.Damping    = origS.damping
-                w.spring.FreeLength = origS.freeLength
-            end
-        end)
-    end
+        while self._running do
+            local now = os.clock()
+            local dt = now - lastTick
+            lastTick = now
 
-    -- Restore seat values
-    pcall(function()
-        if handle.seat then
-            if handle.seat:FindFirstChild("MaxSpeed") then
-                -- Don't touch; game tracks this
+            -- Clamp dt for stability
+            if dt <= 0 or dt > 0.1 then dt = tickInterval end
+
+            pcall(self._update, self, dt)
+
+            -- Sleep to maintain tick rate
+            local elapsed = os.clock() - now
+            local toSleep = tickInterval - elapsed
+            if toSleep > 0 then
+                task.wait(toSleep)
             end
         end
     end)
+
+    print("[VX] Powertrain started (" .. (self.core.settings._effectivePerformance or "normal") .. ")")
 end
 
--- ==================== VERIFY LOOP ====================
-function Module:_startVerify()
-    if self._verifyThread then
-        pcall(function() task.cancel(self._verifyThread) end)
+function Module:_stop()
+    if not self._running then return end
+    self._running = false
+    if self._loopThread then
+        pcall(function() task.cancel(self._loopThread) end)
+        self._loopThread = nil
     end
-    self._verifyThread = task.spawn(function()
-        while self._active do
-            task.wait(1.5)
-            if not self._active then break end
-            self:verify()
-        end
-    end)
+    self.launch.state = LAUNCH_STATES.IDLE
+    print("[VX] Powertrain stopped")
 end
 
-function Module:verify()
-    if not self._active or not self._handle then return end
-    local root = self._handle.root
-    if not root or not root.Parent then
-        -- Vehicle removed
-        self:releaseControl()
+function Module:_update(dt)
+    local prof = self.profiles:current()
+    local settings = self.core.settings
+    local config = self.core.config
+
+    -- 1. Update launch state machine (may override throttle)
+    self:_updateLaunch(dt)
+
+    -- 2. Update throttle smoother (respects launch override)
+    self:_updateThrottleSmoother(dt)
+
+    -- 3. Update RPM
+    self:_updateRPM(dt, prof)
+
+    -- 4. Update gear
+    if self.shiftCooldown > 0 then
+        self.shiftCooldown = self.shiftCooldown - dt
+    end
+    self:_updateGear(dt, prof)
+
+    -- 5. Clutch state
+    if self.shiftState == "open" and self.shiftCooldown <= 0 then
+        -- Shift completed
+        self.shiftState = "closed"
+    end
+
+    -- 6. Rev limiter
+    self:_updateRevLimiter(dt, prof)
+
+    -- 7. Cold start
+    self:_updateColdStart(dt, prof)
+
+    -- 8. Idle hunting
+    self:_updateIdleHunt(dt, prof)
+
+    -- 9. Engine load (for chassis)
+    self._loadFactor = self:_computeLoadFactor(prof)
+
+    -- 10. Flicker detection
+    self._upshiftFlicker   = math.max(0, self._upshiftFlicker - dt)
+    self._downshiftFlicker = math.max(0, self._downshiftFlicker - dt)
+end
+
+-- ==================== THROTTLE SMOOTHER ====================
+function Module:_updateThrottleSmoother(dt)
+    local settings = self.core.settings
+    local tiltLevel = settings.physicsTiltLevel
+    local smoothingOn = (tiltLevel == "Medium" or tiltLevel == "High" or tiltLevel == "Extreme")
+
+    -- Launch overrides everything
+    if self.launch.state == LAUNCH_STATES.HOLDING then
+        self.smoothedThrottle = 0
+        self.targetThrottle = 0
+        return
+    elseif self.launch.state == LAUNCH_STATES.RELEASING then
+        self.smoothedThrottle = 1.0
+        self.targetThrottle = 1.0
         return
     end
 
-    -- Check tags still removed
-    local tagConflict = false
-    if CS:HasTag(root, "VehicleSteering") then tagConflict = true end
-    if CS:HasTag(root, "VehicleControls") then tagConflict = true end
-
-    if tagConflict then
-        pcall(function()
-            CS:RemoveTag(root, "VehicleSteering")
-            CS:RemoveTag(root, "VehicleControls")
-        end)
-        _G.VX.bus:emit("authority.verified", { recovered = true })
-        warn("[VX] Authority: tags reappeared, re-killed")
+    -- Clutch cuts throttle
+    if self.shiftState == "open" then
+        self.smoothedThrottle = 0
+        self.targetThrottle = 0
+        return
     end
 
-    -- Check heartbeat connections still gone
-    local found = 0
-    if self._getConnections and self._debugInfo then
-        pcall(function()
-            local conns = self._getConnections(RunService.Heartbeat)
-            if conns then
-                for _, conn in ipairs(conns) do
-                    local fn = nil
-                    pcall(function() fn = conn.Function end)
-                    if fn then
-                        local info = nil
-                        pcall(function() info = self._debugInfo(fn) end)
-                        if info and info.source then
-                            local src = tostring(info.source)
-                            if src:find("VehicleSteering") or src:find("VehicleControls") then
-                                found = found + 1
-                                pcall(function() conn:Disconnect() end)
-                            end
-                        end
-                    end
-                end
-            end
-        end)
+    local raw = self.input:getRawThrottle()
+    self.targetThrottle = raw
+
+    if not smoothingOn then
+        self.smoothedThrottle = raw
+        return
     end
-    if found > 0 then
-        _G.VX.bus:emit("authority.verified", { recovered = true, count = found })
+
+    local cur = self.smoothedThrottle
+    local target = raw
+    local rate
+
+    -- Determine rate
+    if target < -0.05 then
+        rate = 5.0  -- brake: snap on
+    elseif cur < -0.05 and target > -0.05 then
+        rate = 5.0  -- brake release: snap off
+    elseif target > cur + 0.05 then
+        -- Accelerating
+        if settings.throttleUltra then
+            rate = 100
+        elseif self.rpm >= self.core.config.launch.rpmTarget * 0.6 then
+            rate = 2.0  -- fast when already in powerband
+        elseif cur < 0.05 then
+            rate = 0.4  -- slow from rest
+        else
+            rate = 3.0  -- fast once moving
+        end
+    elseif target < cur - 0.05 then
+        rate = 0.4  -- coast down slowly
+    else
+        rate = 5.0  -- small corrections
+    end
+
+    local new = cur + (target - cur) * math.min(rate * dt, 1)
+    self.smoothedThrottle = new
+
+    -- Apply bog (interrupts on rapid throttle stomp)
+    if settings.physics.engineBog then
+        local delta = new - self._lastSmoothed
+        if delta > 0.5 and self.rpm < 2500 then
+            self._bogUntil = os.clock() + 0.12
+            self._bogMagnitude = delta * 200
+        end
+        self._lastSmoothed = new
     end
 end
+
+-- ==================== RPM ====================
+function Module:_updateRPM(dt, prof)
+    local settings = self.core.settings
+    local config = self.core.config
+
+    -- Launch overrides RPM
+    if self.launch.state == LAUNCH_STATES.HOLDING then
+        local target = self.launch.rpmTarget
+        local diff = target - self.rpm
+        self.rpm = self.rpm + diff * config.launch.rpmBuildRate * dt
+        self.rpm = math.min(self.rpm, prof.redlineRPM)
+        return
+    end
+
+    -- Reverse gear has fixed RPM
+    if self.gear == -1 then
+        local throttleAbs = math.abs(self.smoothedThrottle)
+        self.rpm = prof.idleRPM + throttleAbs * (prof.maxRPM - prof.idleRPM) * 0.4
+        return
+    end
+
+    -- Cold start redline cap
+    local effectiveRedline = prof.redlineRPM
+    if settings.physics.coldStart and os.clock() < self._coldStartEndTime then
+        local remain = (self._coldStartEndTime - os.clock()) / settings.physics.coldStartDuration
+        effectiveRedline = prof.redlineRPM - config.coldStartRedlineDrop * remain
+    end
+
+    -- Stationary vs moving
+    local speed = self:_getSpeed()
+    if speed < 5 then
+        if self.smoothedThrottle > 0 then
+            local target = prof.idleRPM + self.smoothedThrottle * 2000
+            self.rpm = self.rpm + (target - self.rpm) * 6.0 * dt
+        else
+            self.rpm = self.rpm + (prof.idleRPM - self.rpm) * 5.0 * dt
+        end
+        self.revLimiterActive = false
+        return
+    end
+
+    -- Moving: use target from throttle
+    local target = prof.idleRPM + self.smoothedThrottle * (prof.maxRPM - prof.idleRPM)
+    local diff = target - self.rpm
+
+    if diff > 0 then
+        local rate = self:_rpmRiseRate(prof)
+        local load = prof.gearRatios[1] / math.max(prof.gearRatios[self.gear] or prof.gearRatios[1], 0.01)
+        self.rpm = self.rpm + (diff * rate / math.sqrt(load)) * 10 * dt
+    else
+        self.rpm = self.rpm + diff * config.rpmFallRate * 10 * dt
+    end
+
+    -- Apply bog
+    if os.clock() < self._bogUntil then
+        local remain = (self._bogUntil - os.clock()) / 0.12
+        self.rpm = self.rpm - self._bogMagnitude * remain * dt * 10
+    end
+
+    -- Clamp
+    self.rpm = math.max(prof.idleRPM * 0.9, math.min(effectiveRedline + 100, self.rpm))
+end
+
+function Module:_rpmRiseRate(prof)
+    local base = self.core.config.rpmRiseRates[self.gear] or 0.1
+    return base * (prof.rpmRiseMultiplier or 1.0)
+end
+
+-- ==================== GEAR ====================
+function Module:_updateGear(dt, prof)
+    if self.shiftCooldown > 0 then return end
+    if self.launch.state == LAUNCH_STATES.HOLDING then return end
+
+    local speed = self:_getSpeed()
+
+    -- Reverse detection
+    if self.smoothedThrottle < -0.1 and speed < 5 and self.gear ~= -1 then
+        self:_doShift(-1, "down", false)
+        return
+    end
+    if self.gear == -1 and self.smoothedThrottle > 0.1 then
+        self:_doShift(1, "up", false)
+        return
+    end
+
+    if speed < 5 then
+        if self.gear > 1 then
+            self:_doShift(1, "down", false)
+        end
+        return
+    end
+
+    local ratios = prof.gearRatios
+    local thresholds = prof.speedThresholds
+    local strategy = prof.shiftStrategy or "automatic"
+
+    -- Determine shift points based on strategy
+    local upShiftRPM = prof.redlineRPM
+    if strategy == "sport" then
+        upShiftRPM = prof.redlineRPM - 200
+    elseif strategy == "eco" then
+        upShiftRPM = prof.redlineRPM - 500
+    elseif strategy == "race" then
+        upShiftRPM = prof.redlineRPM
+    end
+
+    -- Upshift
+    if self.gear < 7 and self.rpm >= upShiftRPM then
+        if self.gear < #ratios then
+            self:_doShift(self.gear + 1, "up", false)
+            self._upshiftFlicker = 1.0
+            return
+        end
+    end
+
+    -- Downshift conditions
+    if self.gear > 1 and self.gear <= #ratios then
+        local shouldDownshift = false
+        local emergency = false
+
+        -- Speed too low for current gear
+        local prevThreshold = thresholds[self.gear - 1]
+        if prevThreshold and speed < prevThreshold - 8 then
+            shouldDownshift = true
+        end
+
+        -- RPM below lug-protect threshold
+        if self.rpm < 2800 then
+            local ratio = ratios[self.gear] / ratios[self.gear - 1]
+            local predicted = self.rpm * ratio
+            if predicted < prof.maxRPM - 400 then
+                shouldDownshift = true
+            end
+        end
+
+        -- Emergency stall protection
+        if self.rpm < 1050 then
+            shouldDownshift = true
+            emergency = true
+        end
+
+        -- Hysteresis: don't flicker
+        if shouldDownshift and self._downshiftFlicker > 0.3 then
+            shouldDownshift = false
+        end
+
+        if shouldDownshift then
+            local ratio = ratios[self.gear] / ratios[self.gear - 1]
+            local predicted = self.rpm * ratio
+            if predicted > prof.maxRPM - 400 and not emergency then
+                return
+            end
+            self:_doShift(self.gear - 1, "down", emergency)
+            self._downshiftFlicker = 1.0
+        end
+    end
+end
+
+function Module:_doShift(newGear, direction, emergency)
+    if newGear == self.gear then return end
+    local oldGear = self.gear
+    local rpmBefore = self.rpm
+    local prof = self.profiles:current()
+
+    self.gear = newGear
+
+    -- RPM adjustment
+    if newGear > 0 and oldGear > 0 then
+        local ratio = prof.gearRatios[newGear] / prof.gearRatios[oldGear]
+        self.rpm = self.rpm * ratio * (1 - self.core.config.upshiftRpmDrop * 0.5)
+    elseif newGear == 1 then
+        self.rpm = prof.idleRPM
+    end
+
+    -- Cooldown
+    self.shiftCooldown = self.core.config.shiftCooldown
+    self._shiftEvents = self._shiftEvents + 1
+    self._lastShiftTime = os.clock()
+
+    -- Clutch simulation
+    if self.core.settings.physics.clutchSimulation then
+        self.shiftState = "open"
+        self.shiftCooldown = math.max(self.shiftCooldown, self.core.settings.physics.clutchDuration)
+        -- At end of clutch, RPM drops from slip
+        self.rpm = self.rpm * (1 - self.core.config.downshiftSlip * 0.5)
+    end
+
+    -- Emit
+    _G.VX.bus:emit("vehicle.shift", {
+        up        = direction == "up",
+        from      = oldGear,
+        to        = newGear,
+        rpmBefore = rpmBefore,
+        rpmAfter  = self.rpm,
+        emergency = emergency or false,
+    })
+end
+
+-- ==================== REV LIMITER ====================
+function Module:_updateRevLimiter(dt, prof)
+    local throttle = self.smoothedThrottle
+    local redline = prof.redlineRPM
+
+    if throttle > 0.7 and self.rpm >= redline then
+        if not self.revLimiterActive then
+            self.revLimiterActive = true
+            self.revLimiterPhase = 0
+            _G.VX.bus:emit("engine.revLimit", { active = true })
+        end
+        self.revLimiterPhase = self.revLimiterPhase + dt
+
+        -- Per-profile limiter type
+        local limiterType = prof.revLimiterType or "hard"
+        if limiterType == "soft" then
+            -- Gentle throttle cut
+            self.smoothedThrottle = self.smoothedThrottle * 0.7
+        elseif limiterType == "hard" then
+            -- Fuel cut pattern
+            local phase = self.revLimiterPhase % 0.16
+            if phase < 0.08 then
+                self.rpm = math.max(redline - 100, self.rpm - 800 * dt)
+                self._fuelCutEvents = self._fuelCutEvents + 1
+            end
+        elseif limiterType == "ignition" then
+            -- Hard cut + backfire burst
+            local phase = self.revLimiterPhase % 0.20
+            if phase < 0.06 then
+                self.rpm = redline - 200
+                self.smoothedThrottle = 0
+                -- Trigger backfire via bus (DriveSystem/Visuals/Audio react)
+                _G.VX.bus:emit("vehicle.backfire", { source = "limiter", count = 1 })
+            end
+        end
+    else
+        if self.revLimiterActive then
+            self.revLimiterActive = false
+            _G.VX.bus:emit("engine.revLimit", { active = false })
+        end
+    end
+
+    -- Clamp to sane range
+    self.rpm = math.max(prof.idleRPM * 0.9, math.min(prof.maxRPM + 100, self.rpm))
+end
+
+-- ==================== COLD START ====================
+function Module:_updateColdStart(dt, prof)
+    if not self.core.settings.physics.coldStart then return end
+    local now = os.clock()
+    if self._coldStartEndTime == 0 then
+        -- First tick: start cold period
+        self._coldStartEndTime = now + self.core.settings.physics.coldStartDuration
+        _G.VX.bus:emit("engine.coldStartBegin", {})
+    end
+    if now >= self._coldStartEndTime then
+        self._coldStartEndTime = 0
+        _G.VX.bus:emit("engine.coldStartEnd", {})
+    end
+end
+
+-- ==================== IDLE HUNT ====================
+function Module:_updateIdleHunt(dt, prof)
+    if not self.core.settings.physics.idleHunting then return end
+    if self.smoothedThrottle > 0.1 then return end
+    if self.rpm > prof.idleRPM * 1.4 then return end
+    self._idleHuntPhase = self._idleHuntPhase + dt
+    local wobble = math.sin(self._idleHuntPhase * 3) * 20
+    self.rpm = self.rpm + wobble * dt * 4
+end
+
+-- ==================== ENGINE LOAD ====================
+function Module:_computeLoadFactor(prof)
+    if not self.core.settings.physics.engineLoad then return 1.0 end
+    local authority = _G.VX.Authority
+    local handle = authority and authority:getHandle()
+    if not handle or not handle.root or not handle.root.PrimaryPart then return 1.0 end
+    local upY = handle.root.PrimaryPart.CFrame.UpVector.Y
+    if upY >= 0.999 then return 1.0 end
+    local slope = 1 - upY
+    local sens = self.core.settings.physics.engineLoadSensitivity
+    return math.max(0.3, 1 - slope * sens * 5)
+end
+
+-- ==================== LAUNCH STATE MACHINE ====================
+function Module:_updateLaunch(dt)
+    local cfg = self.core.config.launch
+    local bothPedals = self.input:isBothPedalsHeld()
+    local speed = self:_getSpeed()
+
+    local launch = self.launch
+
+    if launch.state == LAUNCH_STATES.IDLE then
+        -- Check launch start conditions
+        if bothPedals and speed < cfg.minSpeed and self.gear == 1 then
+            if os.clock() >= launch.cooldownEnd then
+                launch.state = LAUNCH_STATES.ARMING
+                launch.startTime = os.clock()
+                launch.rpmTarget = math.min(cfg.rpmTarget, self.profiles:current().redlineRPM - 100)
+            end
+        end
+    elseif launch.state == LAUNCH_STATES.ARMING then
+        -- Need both held for 0.15s to activate
+        if not bothPedals then
+            launch.state = LAUNCH_STATES.IDLE
+            return
+        end
+        if os.clock() - launch.startTime >= 0.15 then
+            launch.state = LAUNCH_STATES.HOLDING
+            launch.rpm = self.rpm
+            _G.VX.bus:emit("vehicle.launchStart", { rpm = self.rpm, target = launch.rpmTarget })
+        end
+    elseif launch.state == LAUNCH_STATES.HOLDING then
+        -- During hold, we force attributes to 0 for defensive purposes
+        local authority = _G.VX.Authority
+        local handle = authority and authority:getHandle()
+        if handle and handle.root then
+            pcall(function()
+                if handle.root:GetAttribute("ThrottleFloat") ~= nil then
+                    handle.root:SetAttribute("ThrottleFloat", 0)
+                end
+            end)
+        end
+
+        -- Check for release
+        if not bothPedals then
+            local accelHeld = self.input:isAccelHeld()
+            local brakeHeld = self.input:isBrakeHeld()
+
+            if accelHeld and not brakeHeld then
+                -- Brake released, gas held → release
+                launch.state = LAUNCH_STATES.RELEASING
+                launch.releaseTime = os.clock()
+
+                -- Compute launch quality
+                local ratio = self.rpm / launch.rpmTarget
+                local quality = "miss"
+                if ratio >= cfg.windowPerfectMin and ratio <= cfg.windowPerfectMax then
+                    quality = "perfect"
+                elseif ratio >= cfg.windowGoodMin and ratio <= cfg.windowGoodMax then
+                    quality = "good"
+                end
+
+                -- Emit release event
+                _G.VX.bus:emit("vehicle.launchRelease", {
+                    quality = quality,
+                    rpm = self.rpm,
+                    ratio = ratio,
+                })
+                print("[VX] Launch released: " .. quality .. " (rpm " .. math.floor(self.rpm) .. "/" .. launch.rpmTarget .. ")")
+            else
+                -- Gas released or neither held → cancel
+                launch.state = LAUNCH_STATES.IDLE
+                launch.cooldownEnd = os.clock() + 0.5
+            end
+        elseif os.clock() - launch.startTime > cfg.maxTime then
+            -- Timeout
+            launch.state = LAUNCH_STATES.IDLE
+            launch.cooldownEnd = os.clock() + 0.5
+        end
+    elseif launch.state == LAUNCH_STATES.RELEASING then
+        if os.clock() - launch.releaseTime > cfg.releaseDuration then
+            launch.state = LAUNCH_STATES.COOLED
+            launch.cooldownEnd = os.clock() + 0.3
+        end
+    elseif launch.state == LAUNCH_STATES.COOLED then
+        if os.clock() >= launch.cooldownEnd then
+            launch.state = LAUNCH_STATES.IDLE
+        end
+    end
+end
+
+-- ==================== HELPERS ====================
+function Module:_getSpeed()
+    local authority = _G.VX.Authority
+    local handle = authority and authority:getHandle()
+    if not handle or not handle.root or not handle.root.PrimaryPart then return 0 end
+    local v = handle.root.PrimaryPart.AssemblyLinearVelocity
+    return Vector3.new(v.X, 0, v.Z).Magnitude * 0.626
+end
+
+-- ==================== PUBLIC API ====================
+function Module:getRPM() return self.rpm end
+function Module:getGear() return self.gear end
+function Module:getSmoothedThrottle() return self.smoothedThrottle end
+function Module:isRevLimiting() return self.revLimiterActive end
+function Module:getShiftState() return self.shiftState end
+function Module:getLaunchState() return self.launch.state end
+function Module:getSlopeLoadFactor() return self._loadFactor end
 
 return Module
