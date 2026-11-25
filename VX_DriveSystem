@@ -1,6 +1,7 @@
 --[[
-    VX_DriveSystem.lua — Adaptive Wheel-Speed & Torque Control, Fixed Steering + Ackermann, Dynamic Radius, Turbo, TCS, ABS & Governor
-    Version: 3.4.0
+    VX_DriveSystem.lua — Mass-Calibrated HP/RPM Tractive Force, Second-Half-Gear Drag Resistance,
+                         Auto/Custom HP, Realistic Turbo Lag/Flutter/Blowoff & Ackermann Steering
+    Version: 3.5.0
 ]]
 
 local VX = _G.VX
@@ -11,15 +12,16 @@ end
 local Module = VX.Framework.Module.new({
     Name = "DriveSystem",
     Dependencies = { "Core", "Profiles", "Authority", "Powertrain", "VehicleState" },
-    Version = "3.4.0",
+    Version = "3.5.0",
 })
 
 local TICK_NORMAL = 60
 local TICK_LOW = 30
 local STUDS_TO_MPH = 0.626
 local MPH_TO_STUDS = 1 / 0.626
+local G_STUDS = 35.05
 local DEFAULT_WHEEL_RADIUS = 1.65
-local BASE_DRIVE_TORQUE = 30000
+local DEFAULT_VEHICLE_MASS = 150
 local BASE_BRAKE_TORQUE = 150000
 
 function Module:Construct()
@@ -30,7 +32,9 @@ function Module:Construct()
     self.wheelSpeed = 0
 
     self._wheelRadius = DEFAULT_WHEEL_RADIUS
+    self._vehicleMass = DEFAULT_VEHICLE_MASS
     self._effectiveTopSpeed = 100
+    self._currentHP = 145
     self._absActivations = 0
     self._absPulsePhase = 0
     self._prevThrottle = 0
@@ -122,6 +126,10 @@ end
 function Module:_registerDiagnostics()
     local D = _G.VX.diagnostics
     pcall(function()
+        D.register("drive.horsepower", {
+            fn = function() return { value = math.floor(self._currentHP + 0.5), unit = "HP", status = "normal" } end,
+            category = "DriveSystem",
+        }, "DriveSystem")
         D.register("drive.boost", {
             fn = function() return { value = string.format("%.1f", self.boostPressure), unit = "psi", status = "normal" } end,
             category = "DriveSystem",
@@ -145,22 +153,33 @@ function Module:_registerDiagnostics()
     end)
 end
 
-function Module:_measureWheelRadius(handle)
-    local sum, count = 0, 0
+function Module:_measureVehicle(handle)
+    local sumR, countR = 0, 0
     for _, w in ipairs((handle and handle.wheels) or {}) do
         if w.physical and w.physical:IsA("BasePart") then
             local sz = w.physical.Size
             local r = math.max(sz.Y, sz.Z) * 0.5
             if r > 0.2 then
-                sum = sum + r
-                count = count + 1
+                sumR = sumR + r
+                countR = countR + 1
             end
         end
     end
-    if count > 0 then
-        return sum / count
+    local radius = (countR > 0) and (sumR / countR) or DEFAULT_WHEEL_RADIUS
+
+    local mass = 0
+    if handle and handle.root then
+        for _, desc in ipairs(handle.root:GetDescendants()) do
+            if desc:IsA("BasePart") then
+                mass = mass + desc:GetMass()
+            end
+        end
     end
-    return DEFAULT_WHEEL_RADIUS
+    if mass < 20 then
+        mass = DEFAULT_VEHICLE_MASS
+    end
+
+    return radius, math.clamp(mass, 30, 5000)
 end
 
 function Module:_start()
@@ -174,7 +193,7 @@ function Module:_start()
     self._effectiveTopSpeed = self.core.settings.topSpeed or 100
 
     local handle = self.authority and self.authority:getHandle()
-    self._wheelRadius = self:_measureWheelRadius(handle)
+    self._wheelRadius, self._vehicleMass = self:_measureVehicle(handle)
 
     self._loopThread = task.spawn(function()
         local perf = self.core.settings._effectivePerformance
@@ -191,7 +210,7 @@ function Module:_start()
             if toSleep > 0 then task.wait(toSleep) end
         end
     end)
-    print(string.format("[VX] DriveSystem started (wheelRadius=%.2f)", self._wheelRadius))
+    print(string.format("[VX] DriveSystem started (mass=%.0f, wheelR=%.2f)", self._vehicleMass, self._wheelRadius))
 end
 
 function Module:_stop()
@@ -297,8 +316,29 @@ function Module:_getDrivenWheelMPH(handle, drivetrain)
     if count == 0 then
         return self:_getBodySpeedMPH(handle)
     end
-    local avgOmega = sumOmega / count
-    return avgOmega * self._wheelRadius * STUDS_TO_MPH
+    return (sumOmega / count) * self._wheelRadius * STUDS_TO_MPH
+end
+
+function Module:_computeEffectiveHP(effTop, prof, stageCfg)
+    local settings = self.core.settings
+    local baseHP
+    if settings.customHorsepower then
+        baseHP = math.clamp(tonumber(settings.horsepower) or 500, 100, 2500)
+    else
+        -- Auto-adapt HP from topSpeed via cubic aero-drag power curve (~145 HP @ 100, ~644 HP @ 200, ~1040 HP @ 250)
+        baseHP = 145 * ((math.max(effTop, 40) / 100) ^ 2.15)
+    end
+
+    local hasTurbo = (prof and prof.hasTurboSounds ~= false)
+    local boostHPBonus = 0
+    if hasTurbo and stageCfg then
+        local mult = settings.turboCustomMultiplier or 1.0
+        local maxPSI = math.max((stageCfg.targetBoostPSI or 21) * mult, 1)
+        local boostFrac = math.clamp(self.boostPressure / maxPSI, 0, 1.5)
+        boostHPBonus = (stageCfg.hpBonus or 0.12) * boostFrac * mult
+    end
+
+    return baseHP * (1 + boostHPBonus)
 end
 
 function Module:_updateSteering(dt, handle, speed)
@@ -327,7 +367,6 @@ function Module:_updateSteering(dt, handle, speed)
     local targetAngle = -math.clamp(rawSteer * maxAngle * sens, -maxAngle, maxAngle)
     self.steerAngle = self.steerAngle + (targetAngle - self.steerAngle) * math.min(turnSpeed * dt, 1)
 
-    -- Low-speed Ackermann geometry blending to parallel above 80 MPH
     local ackermannFade = 1 - math.clamp((speed - 45) / 35, 0, 1)
 
     for _, w in ipairs(handle.wheels or {}) do
@@ -356,32 +395,45 @@ function Module:_updateTurbo(dt, prof, rpm, throttle)
     local stage = math.clamp(math.floor(self.core.settings.turboStage or 1), 1, 3)
     self.turboStage = stage
     local cfg = self.core.config.turboStages[stage]
-    if not cfg then return end
+    if not cfg then return cfg end
 
-    local mult = self.core.settings.turboCustomMultiplier or 1.0
-    local spoolRPM = prof.turboSpoolRPM or 3500
+    local settings = self.core.settings
+    local mult = settings.turboCustomMultiplier or 1.0
+    local baseSpoolRPM = prof.turboSpoolRPM or 3500
+    local boostThreshold = math.max(1200, baseSpoolRPM + (cfg.spoolRpmOffset or 0))
     local redline = prof.redlineRPM or 8200
-    local rpmFactor = math.clamp((rpm - spoolRPM) / math.max(redline - spoolRPM, 1), 0, 1)
+    local rpmFactor = math.clamp((rpm - boostThreshold) / math.max(redline - boostThreshold, 1), 0, 1)
 
     local targetBoost = 0
-    if throttle > 0.1 then
+    if throttle > 0.1 and prof.hasTurboSounds ~= false then
         targetBoost = cfg.targetBoostPSI * mult * rpmFactor * math.clamp(throttle, 0, 1)
     end
 
-    local rate = cfg.spoolRate or 1.2
-    if self.core.settings.realisticTurboEnabled then
+    local rate = cfg.spoolRate or 1.25
+    if settings.realisticTurboEnabled then
         rate = rate * 0.65
     end
     self.boostPressure = self.boostPressure + (targetBoost - self.boostPressure) * math.min(rate * dt, 1)
 
-    if self._prevThrottle > 0.5 and throttle < 0.15 and self.boostPressure >= (cfg.blowoffThreshold or 6) then
-        local intensity = math.clamp(self.boostPressure / math.max(cfg.targetBoostPSI * mult, 1), 0.2, 1.0)
-        _G.VX.bus:emit("turbo.blowoff", { boost = self.boostPressure, intensity = intensity })
-        self.boostPressure = self.boostPressure * 0.45
+    -- Distinguish Blow-Off Valve (high boost lift) vs Compressor Surge / Flutter (partial boost lift or BOV disabled)
+    if self._prevThrottle > 0.30 and throttle < 0.12 and prof.hasTurboSounds ~= false then
+        local thresh = (cfg.blowoffThreshold or 6.3) * mult
+        local maxPSI = math.max(cfg.targetBoostPSI * mult, 1)
+
+        if self.boostPressure >= thresh * 1.35 and settings.turboBlowoffEnabled then
+            local intensity = math.clamp(self.boostPressure / maxPSI, 0.3, 1.0)
+            _G.VX.bus:emit("turbo.blowoff", { boost = self.boostPressure, intensity = intensity })
+            self.boostPressure = self.boostPressure * 0.40
+        elseif self.boostPressure >= math.max(2.0, thresh * 0.40) and settings.turboFlutterEnabled then
+            local intensity = math.clamp(self.boostPressure / maxPSI, 0.2, 0.85)
+            _G.VX.bus:emit("turbo.flutter", { boost = self.boostPressure, intensity = intensity })
+            self.boostPressure = self.boostPressure * 0.65
+        end
     end
 
     self._prevBoost = self.boostPressure
     self._prevThrottle = throttle
+    return cfg
 end
 
 function Module:_updateBrakes(dt, braking, speed)
@@ -427,7 +479,6 @@ function Module:_update(dt)
     local bodySpeed = self:_getBodySpeedMPH(handle)
     self.wheelSpeed = self:_getDrivenWheelMPH(handle, drivetrain)
 
-    -- Smoothly slew effectiveTopSpeed when topSpeed changes mid-drive
     local targetTop = math.max(settings.topSpeed or 100, 10)
     if bodySpeed < 3 then
         self._effectiveTopSpeed = targetTop
@@ -447,10 +498,14 @@ function Module:_update(dt)
     local slopeLoad = self.powertrain:getSlopeLoadFactor()
 
     local posThr = math.max(0, throttle)
-    self:_updateTurbo(dt, prof, rpm, posThr)
+    local stageCfg = self:_updateTurbo(dt, prof, rpm, posThr)
 
     local braking = math.max(0, -throttle)
     local brakeMult = self:_updateBrakes(dt, braking, bodySpeed)
+
+    -- Compute effective HP (Auto or Custom + Turbo Boost)
+    local effHP = self:_computeEffectiveHP(effTop, prof, stageCfg)
+    self._currentHP = effHP
 
     -- Gear ratios control BOTH speed ceiling and torque multiplication
     local ratios = prof.gearRatios or { 3.85, 2.20, 1.55, 1.20, 0.95, 0.80, 0.65 }
@@ -468,10 +523,8 @@ function Module:_update(dt)
         local gearMaxMPH = effTop * (topRatio / math.max(curRatio, 0.01))
         local targetMPH
         if gear == maxGear then
-            -- 7th gear: +5% slip headroom below topSpeed so tire slip doesn't stall before 100%
             targetMPH = (posThr > 0.1 and bodySpeed < effTop * 0.995) and (effTop * 1.05) or effTop
         else
-            -- Gears 1..6: +4% headroom so wheel speed reaches gearMaxMPH and triggers 0.98 upshift cleanly
             targetMPH = gearMaxMPH * 1.04
         end
         gearAngular = (targetMPH * MPH_TO_STUDS) / self._wheelRadius
@@ -481,35 +534,55 @@ function Module:_update(dt)
         end
     end
 
-    -- Realistic torque: 1st gear = high torque / low speed; 7th gear = low base torque + high-speed drag reserve
-    local topBaseScale = (math.max(effTop, 50) / 100) ^ 0.65
+    -- Real HP / RPM * GearRatio Tractive Physics minus Quadratic Aero Drag
     local torqueCurve = 1.0
     if phys.torqueCurve then
         torqueCurve = self.profiles:getTorqueAtRPM(prof, rpm)
     end
 
     local rwdEfficiency = (drivetrain == "RWD") and 1.06 or 1.0
-    local dragReserve = 0
-    if gear >= 4 and bodySpeed > 40 then
-        local tallFactor = (gear - 3) / math.max(maxGear - 3, 1)
-        dragReserve = ((bodySpeed / 100) ^ 2) * 18000 * tallFactor
-    end
-
-    local boostBonus = 1.0 + (self.boostPressure / 100) * 0.55
     local launchBonus = (os.clock() < self._launchBurstUntil) and self._launchBurstMult or 1.0
+
+    -- Tractive acceleration in G's before traction limit: drops as RPM climbs into upper half of gear
+    local rpmDenom = math.max(rpm / 4500, 0.55)
+    local rawDriveG = 0.0025 * effHP * torqueCurve * curRatio * rwdEfficiency * launchBonus * slopeLoad / rpmDenom
+
+    -- Tire grip traction cap (limits low-gear rocket launches realistically)
+    local avgGrip = ((settings.frontGrip or 1.0) + (settings.rearGrip or 0.9)) * 0.5
+    local dtTraction = (drivetrain == "AWD") and 1.10 or ((drivetrain == "RWD") and 0.92 or 0.80)
+    local tractionCapG = dtTraction * math.clamp(avgGrip, 0.5, 2.5)
 
     local tcsMult = 1.0
     if phys.tractionControl then
         local chassis = _G.VX.Chassis
         if chassis and chassis.spinActive then
-            tcsMult = math.max(0.2, 1.0 - (phys.tractionControlSensitivity or 0.25))
+            tcsMult = math.max(0.25, 1.0 - (phys.tractionControlSensitivity or 0.25))
         end
     end
 
-    local driveTorque = (BASE_DRIVE_TORQUE * torqueCurve * curRatio * topBaseScale * rwdEfficiency + dragReserve)
-        * boostBonus * launchBonus * tcsMult * slopeLoad
-    local brakeTorque = BASE_BRAKE_TORQUE * (settings.brakingPower or 0.75) * brakeMult
-    local motorAngAccel = math.max(15, 45 * (curRatio / 1.5) * math.max(0.25, posThr))
+    -- Quadratic aero + rolling resistance opposing acceleration (creates second-half-of-gear resistance!)
+    local dragG = 0.0000075 * (bodySpeed * bodySpeed) + 0.012
+    local cappedDriveG = math.min(rawDriveG, tractionCapG) * tcsMult * math.min(posThr, 1)
+    local netG = math.max(0, cappedDriveG - dragG)
+
+    -- Convert netG to per-wheel Roblox torque calibrated to vehicleMass & driven wheel count
+    local drivenCount = 0
+    for _, w in ipairs(handle.wheels or {}) do
+        local isDriven = (drivetrain == "AWD")
+            or (drivetrain == "FWD" and w.isFront)
+            or (drivetrain == "RWD" and not w.isFront)
+        if isDriven then drivenCount = drivenCount + 1 end
+    end
+    drivenCount = math.max(drivenCount, 1)
+
+    -- Include a small baseline overcoming Roblox constraint/tire rolling friction when netG > 0
+    local totalForce = self._vehicleMass * G_STUDS * (netG + (netG > 0.005 and 0.14 or 0))
+    local perWheelDriveTorque = (totalForce * self._wheelRadius) / drivenCount
+    local brakeTorque = (self._vehicleMass * G_STUDS * 2.2 * (settings.brakingPower or 0.75) * brakeMult * self._wheelRadius) / 4
+    brakeTorque = math.max(brakeTorque, BASE_BRAKE_TORQUE * 0.35 * (settings.brakingPower or 0.75) * brakeMult)
+
+    -- Angular acceleration cap proportional to netG so wheels accelerate cleanly without snapping
+    local motorAngAccel = math.max(6, (netG * G_STUDS / self._wheelRadius) * 2.4)
 
     for _, w in ipairs(handle.wheels or {}) do
         local isDriven = (drivetrain == "AWD")
@@ -524,20 +597,22 @@ function Module:_update(dt)
         if launchState == "holding" or twostepActive then
             mode = "brake"
             angular = 0
-            torque = BASE_BRAKE_TORQUE
+            torque = brakeTorque * 1.5
             angAccel = 120
         elseif shiftState == "open" and settings.realisticShifting then
             mode = "coast"
         elseif governorBrake > 0.05 and throttle >= 0 then
             mode = "drive"
             angular = (effTop * MPH_TO_STUDS) / self._wheelRadius
-            torque = brakeTorque * 0.4 * governorBrake
-            angAccel = 80
+            torque = brakeTorque * 0.45 * governorBrake
+            angAccel = 40
         elseif gear == -1 then
             if throttle < -0.05 and isDriven then
                 mode = "drive"
                 angular = gearAngular
-                torque = driveTorque * math.min(math.abs(throttle), 1)
+                local revForce = self._vehicleMass * G_STUDS * math.min(0.65, tractionCapG) * math.min(math.abs(throttle), 1)
+                torque = (revForce * self._wheelRadius) / drivenCount
+                angAccel = 22
             elseif throttle > 0.05 then
                 mode = "brake"
                 angular = 0
@@ -545,11 +620,15 @@ function Module:_update(dt)
                 angAccel = 120
             end
         else
-            -- Throttle controls MotorMaxTorque ONLY; AngularVelocity holds the gear's mechanical speed ceiling
-            if throttle > 0.05 and isDriven then
-                mode = "drive"
-                angular = gearAngular
-                torque = driveTorque * math.min(throttle, 1)
+            if posThr > 0.05 and isDriven then
+                if netG <= 0.002 and bodySpeed > 8 then
+                    -- Out of horsepower against aero drag: coast rather than artificially braking
+                    mode = "coast"
+                else
+                    mode = "drive"
+                    angular = gearAngular
+                    torque = perWheelDriveTorque
+                end
             elseif throttle < -0.05 then
                 mode = "brake"
                 angular = 0
@@ -573,6 +652,7 @@ function Module:_update(dt)
     end
 end
 
+function Module:getHorsepower() return self._currentHP end
 function Module:getBoost() return self.boostPressure end
 function Module:getTurboStage() return self.turboStage end
 function Module:getBrakeTemp() return self.brakeTemp end
@@ -580,6 +660,7 @@ function Module:getABSActivations() return self._absActivations end
 function Module:getSteerAngle() return self.steerAngle end
 function Module:getWheelSpeed() return self.wheelSpeed end
 function Module:getWheelRadius() return self._wheelRadius end
+function Module:getVehicleMass() return self._vehicleMass end
 function Module:getEffectiveTopSpeed() return self._effectiveTopSpeed end
 
 return Module
