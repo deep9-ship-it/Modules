@@ -1,6 +1,6 @@
 --[[
     VX_UI.lua — GT3 Carbon Middle-Bottom Dashboard, Telemetry (F2), Diagnostics (F3) & Video Mode (F4)
-    Version: 3.4.0 (Aligned to VX_Core v3.1.0 + VX_Authority v3.0.2 + VX_Powertrain v3.2.0)
+    Version: 3.4.1 (Aligned to VX_Core v3.2.0 + VX_Authority v3.0.2 + VX_Powertrain v3.5.0 + VX_DriveSystem v3.5.1)
 ]]
 
 local VX = _G.VX
@@ -16,7 +16,7 @@ local UserInputService = game:GetService("UserInputService")
 local Module = VX.Framework.Module.new({
     Name = "UI",
     Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "VehicleState" },
-    Version = "3.4.0",
+    Version = "3.4.1",
 })
 
 local GT3 = {
@@ -197,6 +197,7 @@ function Module:_createGui()
     gui.DisplayOrder = 5
     gui.Parent = pg
     self._gui = gui
+    self.gui = gui
 
     self:_createDashboard(gui)
     self:_createNotifications(gui)
@@ -209,7 +210,6 @@ function Module:_createGui()
 end
 
 function Module:_createDashboard(gui)
-    -- GT3 CARBON MIDDLE-BOTTOM DASHBOARD
     local dash = Instance.new("Frame")
     dash.Name = "GT3_Dashboard"
     dash.Size = UDim2.new(0, 366, 0, 162)
@@ -224,7 +224,6 @@ function Module:_createDashboard(gui)
     _stroke(dash, GT3.carbonLine, 0.2, 1.4)
     self._dash = dash
 
-    -- Top Amber GT3 Carbon Trim
     local trim = Instance.new("Frame")
     trim.Size = UDim2.new(1, -24, 0, 2)
     trim.Position = UDim2.new(0, 12, 0, 0)
@@ -232,7 +231,6 @@ function Module:_createDashboard(gui)
     trim.BorderSizePixel = 0
     trim.Parent = dash
 
-    -- 12-Segment LED Shift Light Strip
     local ledBar = Instance.new("Frame")
     ledBar.Size = UDim2.new(1, -28, 0, 7)
     ledBar.Position = UDim2.new(0, 14, 0, 8)
@@ -255,7 +253,6 @@ function Module:_createDashboard(gui)
         self._shiftLeds[i] = led
     end
 
-    -- Left: Speed Readout
     local speedLbl = Instance.new("TextLabel")
     speedLbl.Size = UDim2.new(0, 128, 0, 48)
     speedLbl.Position = UDim2.new(0, 14, 0, 20)
@@ -279,7 +276,6 @@ function Module:_createDashboard(gui)
     unitLbl.Text = "MPH"
     unitLbl.Parent = dash
 
-    -- Center: GT3 Gear Indicator
     local gearBox = Instance.new("Frame")
     gearBox.Size = UDim2.new(0, 56, 0, 56)
     gearBox.Position = UDim2.new(0.5, -28, 0, 22)
@@ -300,7 +296,6 @@ function Module:_createDashboard(gui)
     gearLbl.Parent = gearBox
     self._gearLbl = gearLbl
 
-    -- Right: Boost PSI + Boost Bar + RPM
     local boostLbl = Instance.new("TextLabel")
     boostLbl.Size = UDim2.new(0, 124, 0, 18)
     boostLbl.Position = UDim2.new(1, -138, 0, 22)
@@ -341,7 +336,6 @@ function Module:_createDashboard(gui)
     rpmLbl.Parent = dash
     self._rpmLbl = rpmLbl
 
-    -- RPM Progress Bar + Redline Marker
     local rpmBg = Instance.new("Frame")
     rpmBg.Size = UDim2.new(1, -28, 0, 10)
     rpmBg.Position = UDim2.new(0, 14, 0, 86)
@@ -367,7 +361,6 @@ function Module:_createDashboard(gui)
     redMark.Parent = rpmBg
     self._redMark = redMark
 
-    -- Throttle (Green) & Brake (Crimson) Input Bars
     local thrBg = Instance.new("Frame")
     thrBg.Size = UDim2.new(0.5, -18, 0, 5)
     thrBg.Position = UDim2.new(0, 14, 0, 102)
@@ -400,7 +393,6 @@ function Module:_createDashboard(gui)
     _corner(brkFill, 2)
     self._brkFill = brkFill
 
-    -- Meta & Flags Footer
     local metaLbl = Instance.new("TextLabel")
     metaLbl.Size = UDim2.new(1, -28, 0, 18)
     metaLbl.Position = UDim2.new(0, 14, 0, 114)
@@ -453,10 +445,22 @@ function Module:_createNotifications(gui)
     self._notifContainer = nc
 end
 
-function Module:notify(title, msg, color, duration)
+function Module:notify(titleOrMsg, msgOrDuration, color, duration)
     if not self._notifContainer or self._videoMode then return end
 
-    local accent = color or GT3.amber
+    local title, msg, accent, dur
+    if msgOrDuration == nil or type(msgOrDuration) == "number" then
+        title = "GT3"
+        msg = tostring(titleOrMsg)
+        accent = GT3.amber
+        dur = msgOrDuration or 2.4
+    else
+        title = tostring(titleOrMsg)
+        msg = tostring(msgOrDuration)
+        accent = color or GT3.amber
+        dur = duration or 2.4
+    end
+
     local toast = Instance.new("Frame")
     toast.Size = UDim2.new(1, 0, 0, 44)
     toast.BackgroundColor3 = GT3.carbonDeep
@@ -482,7 +486,7 @@ function Module:notify(title, msg, color, duration)
     titleLbl.TextSize = 10
     titleLbl.TextXAlignment = Enum.TextXAlignment.Left
     titleLbl.TextColor3 = accent
-    titleLbl.Text = string.upper(tostring(title))
+    titleLbl.Text = string.upper(title)
     titleLbl.Parent = toast
 
     local msgLbl = Instance.new("TextLabel")
@@ -493,10 +497,10 @@ function Module:notify(title, msg, color, duration)
     msgLbl.TextSize = 12
     msgLbl.TextXAlignment = Enum.TextXAlignment.Left
     msgLbl.TextColor3 = GT3.text
-    msgLbl.Text = tostring(msg)
+    msgLbl.Text = msg
     msgLbl.Parent = toast
 
-    task.delay(duration or 2.4, function()
+    task.delay(dur, function()
         if toast and toast.Parent then
             TweenService:Create(toast, TweenInfo.new(0.25), { BackgroundTransparency = 1 }):Play()
             TweenService:Create(bar, TweenInfo.new(0.25), { BackgroundTransparency = 1 }):Play()
@@ -511,7 +515,7 @@ end
 function Module:_createTelemetry(gui)
     local f = Instance.new("Frame")
     f.Name = "GT3_Telemetry"
-    f.Size = UDim2.new(0, 260, 0, 268)
+    f.Size = UDim2.new(0, 260, 0, 288)
     f.Position = UDim2.new(0, 16, 0, 16)
     f.BackgroundColor3 = GT3.carbonDeep
     f.BackgroundTransparency = 0.1
@@ -532,7 +536,7 @@ function Module:_createTelemetry(gui)
     title.Text = "GT3 TELEMETRY (F2)"
     title.Parent = f
 
-    local keys = { "State", "Speed", "RPM", "Gear", "Boost", "Throttle", "Slip", "Slope", "Grip", "Tires", "Brakes" }
+    local keys = { "State", "Speed", "Power", "RPM", "Gear", "Boost", "Throttle", "Slip", "Slope", "Grip", "Tires", "Brakes" }
     for i, k in ipairs(keys) do
         local lbl = Instance.new("TextLabel")
         lbl.Size = UDim2.new(1, -20, 0, 18)
@@ -694,7 +698,7 @@ function Module:_update()
 
     local auth = _G.VX.Authority
     local handle = auth and auth:getHandle()
-    local velPart = handle and ((handle.root and handle.root.PrimaryPart) or handle.chassis)
+    local velPart = handle and ((handle.root and handle.root.PrimaryPart) or handle.platform or handle.chassis or handle.seat)
     local rawSpeed = velPart and velPart.AssemblyLinearVelocity.Magnitude or 0
     local speedMph = rawSpeed * 0.626
     self._speedLbl.Text = tostring(math.floor(speedMph + 0.5))
@@ -714,7 +718,6 @@ function Module:_update()
     self._rpmFill.BackgroundColor3 = (rpm >= redline * 0.96) and GT3.crimson or ((rpm >= redline * 0.82) and GT3.amber or GT3.green)
     self._redMark.Position = UDim2.new(redPct, 0, 0, -1)
 
-    -- 12-LED GT3 Shift Strip
     local ledPct = math.clamp((rpm - prof.idleRPM) / math.max(1, redline - prof.idleRPM), 0, 1)
     local litCount = math.floor(ledPct * 12 + 0.3)
     local flashRed = (rpm >= redline * 0.96) and ((os.clock() * 14) % 1 > 0.5)
@@ -745,7 +748,8 @@ function Module:_update()
 
     local dt = _getSetting("drivetrain", "AWD")
     local dm = string.upper(tostring(_getSetting("weightTransferMode", "Normal")))
-    self._metaLbl.Text = string.format("%s  |  %s  |  STG %d  |  %s", dt, dm, stg, prof and prof.name or "Default")
+    local hp = (self.drive.getHorsepower and self.drive:getHorsepower()) or 0
+    self._metaLbl.Text = string.format("%s | %s | STG %d | %dHP | %s", dt, dm, stg, math.floor(hp + 0.5), prof and prof.name or "Default")
 
     local absCount = self.drive._absActivations or 0
     if absCount > self._lastAbsCount then
@@ -774,8 +778,10 @@ function Module:_update()
     if self._telFrame and self._telFrame.Visible then
         local fTemp = 40 + (self.chassis:getTireTemp("front") or 0) * 90
         local rTemp = 40 + (self.chassis:getTireTemp("rear") or 0) * 90
+        local hpMode = _getSetting("customHorsepower", false) and "Custom" or "Auto"
         self._telLabels.State.Text = string.format("State:    %s", st)
         self._telLabels.Speed.Text = string.format("Speed:    %.1f MPH", speedMph)
+        self._telLabels.Power.Text = string.format("Power:    %d HP (%s)", math.floor(hp + 0.5), hpMode)
         self._telLabels.RPM.Text = string.format("RPM:      %d / %d", math.floor(rpm), maxRpm)
         self._telLabels.Gear.Text = string.format("Gear:     %s", self._gearLbl.Text)
         self._telLabels.Boost.Text = string.format("Boost:    %.1f / %.0f PSI", psi, maxPsi)
@@ -799,6 +805,7 @@ function Module:Stop()
         self._gui:Destroy()
         self._gui = nil
     end
+    self.gui = nil
     _G.VX.UI = nil
 end
 
