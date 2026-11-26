@@ -1,258 +1,216 @@
 --[[
-    VX_Remote v3.0.0
-    Centralized server communication with rate limiting and fallback.
-
-    Depends on: Core
-    Exposes:
-      playSound(soundId, volume, pitch, parentPart)
-      fireBoostPulse(duration)
-      sendThrottle(value)
-      toggleHeadlights(), toggleHazards(), setDriftStrength(v)
-      getStatus()
-
-    Rate limits:
-      sounds   : 6/sec total, 3/sec per-id
-      boost    : 4/sec
-      throttle : 10/sec
+    VX_Remote v3.0.1
+    Handles ALL server replication & fallback audio/VFX.
+    - Sequence-guarded fireBoostPulse (0.03s cooldown) so rapid redline backfires
+      keep SET_BOOST spitting fire continuously without premature off-flickers.
 ]]
 
 local VX = _G.VX
 if not VX or not VX.Framework then error("VX_Remote requires VX_Kernel") end
 
-local RS = game:GetService("ReplicatedStorage")
-local Players = game:GetService("Players")
-local Debris = game:GetService("Debris")
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Debris            = game:GetService("Debris")
+
 local Player = Players.LocalPlayer
 
 local Module = VX.Framework.Module.new({
     Name = "Remote",
     Dependencies = { "Core" },
-    Version = "3.0.0",
+    Version = "3.0.1",
 })
 
--- ==================== CONSTANTS ====================
-local RATE = {
-    soundTotalPerSec   = 6,
-    soundPerIdPerSec   = 3,
-    boostPerSec        = 4,
-    throttlePerSec     = 10,
-    throttleChangeEps  = 0.02,
-}
+local SOUND_COOLDOWN_MS = 0.03
+local BOOST_COOLDOWN_MS = 0.03
+local THROTTLE_HZ       = 10
 
--- ==================== LIFECYCLE ====================
 function Module:Construct()
-    self._gunSounds        = nil
+    self._gunSoundsRemote = nil
+    self._remotesFolder   = nil
     self._vehicleController = nil
-    self._toggleHeadlights = nil
-    self._toggleHazards    = nil
-    self._setDrift         = nil
-    self._setBoost         = nil
-    self._setThrottle      = nil
-
-    self._soundTimesById  = {}
-    self._soundTimesTotal = {}
-    self._boostTimes      = {}
-    self._throttleTimes   = {}
-    self._lastThrottleSent = nil
-    self._lastBoostPulse   = 0
-    self._lastThrottleSend = 0
-
-    self.status = {
-        gunSounds = false,
-        boost     = false,
-        throttle  = false,
-        lights    = false,
-        drift     = false,
-        vc        = false,
+    self._remotes = {
+        headlights = nil, hazards = nil, drift = nil, boost = nil, throttle = nil,
     }
+    self._lastSoundTime    = 0
+    self._lastBoostTime    = 0
+    self._lastThrottleTime = 0
+    self._lastThrottleVal  = nil
+    self._boostSeq         = 0
+    self._boostActive      = false
+    self._stats = { soundsSent = 0, soundsFallback = 0, boostPulses = 0, remoteFailures = 0 }
 end
 
 function Module:Init(deps)
-    self:_locateRemotes()
-    print("[VX] Remote status: " .. self:_statusString())
+    self.core = deps.Core
+    self:_discover()
 end
 
 function Module:Start()
     _G.VX.Remote = self
+    self:_registerDiagnostics()
 end
 
 function Module:Stop()
-    self._gunSounds = nil
-    self._vehicleController = nil
     if _G.VX.Remote == self then _G.VX.Remote = nil end
 end
 
 function Module:heartbeat()
-    return self.status.gunSounds or self.status.vc
-end
-
--- ==================== DISCOVERY ====================
-function Module:_locateRemotes()
-    -- GunSounds via Player8Handler
-    pcall(function()
-        local handler = Player:WaitForChild("PlayerGui", 3):FindFirstChild("Player8Handler")
-        if handler then
-            local settings = handler:FindFirstChild("Game8Settings")
-            if settings then
-                local req = require(settings)
-                if req and req.GunSounds then
-                    self._gunSounds = req.GunSounds
-                    self.status.gunSounds = true
-                end
-            end
-        end
-    end)
-
-    -- Remotes folder
-    local remotes = RS:FindFirstChild("Remotes")
-    if remotes then
-        self._toggleHeadlights = remotes:FindFirstChild("ToggleHeadLights")
-        self._toggleHazards    = remotes:FindFirstChild("ToggleHazards")
-        self._setDrift         = remotes:FindFirstChild("SetDriftStrength")
-        self._setBoost         = remotes:FindFirstChild("SET_BOOST")
-        self._setThrottle      = remotes:FindFirstChild("SET_THROTTLE_FLOAT")
-
-        if self._toggleHeadlights and self._toggleHazards then
-            self.status.lights = true
-        end
-        if self._setDrift then self.status.drift = true end
-        if self._setBoost then self.status.boost = true end
-        if self._setThrottle then self.status.throttle = true end
-    end
-
-    -- VehicleController (used for SetBoost + SetThrottleFloat)
-    pcall(function()
-        local vc = require(RS:WaitForChild("Modules", 3):WaitForChild("Client", 3)
-            :WaitForChild("Vehicles", 3):WaitForChild("VehicleController", 3))
-        if vc then
-            self._vehicleController = vc
-            self.status.vc = true
-        end
-    end)
-end
-
-function Module:_statusString()
-    local parts = {}
-    for k, v in pairs(self.status) do
-        table.insert(parts, k .. "=" .. (v and "✓" or "✗"))
-    end
-    return table.concat(parts, " ")
-end
-
--- ==================== RATE LIMITER ====================
-local function _rateBucket(tbl, key, perSec)
-    local now = tick()
-    local times = tbl[key]
-    if not times then
-        times = {}
-        tbl[key] = times
-    end
-    local cutoff = now - 1
-    local kept = {}
-    for _, t in ipairs(times) do
-        if t > cutoff then table.insert(kept, t) end
-    end
-    tbl[key] = kept
-    if #kept >= perSec then return false end
-    table.insert(kept, now)
-    tbl[key] = kept
     return true
 end
 
--- ==================== SOUND ====================
-function Module:playSound(soundId, volume, pitch, parentPart)
-    soundId = tostring(soundId)
-    volume = volume or 1
-    pitch = pitch or 1
-
-    -- Always play locally for instant feedback
-    local localSound = Instance.new("Sound")
-    localSound.SoundId = "rbxassetid://" .. soundId
-    localSound.Volume = volume
-    localSound.PlaybackSpeed = pitch
-    localSound.Parent = Player:WaitForChild("PlayerGui")
-    localSound:Play()
-    Debris:AddItem(localSound, 8)
-
-    -- Try to replicate via GunSounds
-    if not self._gunSounds or not parentPart then return end
-    if not _rateBucket(self._soundTimesById, soundId, RATE.soundPerIdPerSec) then return end
-    if not _rateBucket(self._soundTimesTotal, "_total", RATE.soundTotalPerSec) then return end
-
+function Module:_registerDiagnostics()
+    local D = _G.VX.diagnostics
     pcall(function()
-        self._gunSounds:FireServer(parentPart, tonumber(soundId), volume, pitch)
+        D.register("remote.soundsSent",     { fn = function() return { value = self._stats.soundsSent, unit = "", status = "normal" } end, category = "Remote" }, "Remote")
+        D.register("remote.soundsFallback", { fn = function() return { value = self._stats.soundsFallback, unit = "", status = "normal" } end, category = "Remote" }, "Remote")
+        D.register("remote.boostPulses",    { fn = function() return { value = self._stats.boostPulses, unit = "", status = "normal" } end, category = "Remote" }, "Remote")
+        D.register("remote.failures",       { fn = function() return { value = self._stats.remoteFailures, unit = "", status = self._stats.remoteFailures > 10 and "warn" or "normal" } end, category = "Remote" }, "Remote")
     end)
 end
 
--- ==================== BOOST (Backfire VFX) ====================
-function Module:fireBoostPulse(duration)
-    local now = tick()
-    if now - self._lastBoostPulse < 0.25 then return end
-    if not _rateBucket(self._boostTimes, "_total", RATE.boostPerSec) then return end
-    self._lastBoostPulse = now
-
-    duration = duration or 0.06
-
-    -- Local: prefer VehicleController.SetBoost (hooked by game's VehicleBoost)
-    if self._vehicleController then
-        pcall(function() self._vehicleController.SetBoost(true) end)
-        task.delay(duration, function()
-            if self._vehicleController then
-                pcall(function() self._vehicleController.SetBoost(false) end)
+-- ==================== DISCOVERY ====================
+function Module:_discover()
+    task.spawn(function()
+        local p8 = Player:FindFirstChild("Player8Handler") or Player:WaitForChild("Player8Handler", 3)
+        if p8 then
+            local g8 = p8:FindFirstChild("Game8Settings")
+            if g8 then
+                self._gunSoundsRemote = g8:FindFirstChild("GunSounds")
             end
-        end)
-        return
-    end
+        end
 
-    -- Fallback: raw remote
-    if self._setBoost then
-        pcall(function() self._setBoost:FireServer(true) end)
-        task.delay(duration, function()
-            pcall(function() self._setBoost:FireServer(false) end)
-        end)
-    end
+        local rf = ReplicatedStorage:FindFirstChild("Remotes")
+        if rf then
+            self._remotesFolder = rf
+            self._remotes.headlights = rf:FindFirstChild("ToggleHeadLights")
+            self._remotes.hazards    = rf:FindFirstChild("ToggleHazards")
+            self._remotes.drift      = rf:FindFirstChild("SetDriftStrength")
+            self._remotes.boost      = rf:FindFirstChild("SET_BOOST")
+            self._remotes.throttle   = rf:FindFirstChild("SET_THROTTLE_FLOAT")
+        end
+
+        local ps = Player:FindFirstChild("PlayerScripts")
+        if ps then
+            local vc = ps:FindFirstChild("VehicleController")
+            if vc and vc:IsA("ModuleScript") then
+                pcall(function() self._vehicleController = require(vc) end)
+            end
+        end
+
+        local found = 0
+        if self._gunSoundsRemote then found = found + 1 end
+        for _, r in pairs(self._remotes) do if r then found = found + 1 end end
+        print("[VX] Remote discovered " .. found .. " endpoints")
+    end)
 end
 
--- ==================== THROTTLE ====================
+-- ==================== SOUND REPLICATION ====================
+function Module:playSound(soundId, volume, pitch, parent)
+    local now = os.clock()
+    if now - self._lastSoundTime < SOUND_COOLDOWN_MS then
+        return false
+    end
+    self._lastSoundTime = now
+
+    if self._gunSoundsRemote then
+        local ok = pcall(function()
+            self._gunSoundsRemote:FireServer(soundId, volume, pitch, parent)
+        end)
+        if ok then
+            self._stats.soundsSent = self._stats.soundsSent + 1
+            return true
+        else
+            self._stats.remoteFailures = self._stats.remoteFailures + 1
+        end
+    end
+
+    self._stats.soundsFallback = self._stats.soundsFallback + 1
+    pcall(function()
+        local s = Instance.new("Sound")
+        s.SoundId = "rbxassetid://" .. tostring(soundId)
+        s.Volume = volume or 1
+        s.PlaybackSpeed = pitch or 1
+        s.RollOffMode = Enum.RollOffMode.Linear
+        s.RollOffMaxDistance = 300
+        s.Parent = parent or workspace
+        s:Play()
+        Debris:AddItem(s, 3)
+    end)
+    return false
+end
+
+-- ==================== BOOST PULSE ====================
+function Module:_setBoostState(state)
+    local sent = false
+    if self._remotes.boost then
+        local ok = pcall(function() self._remotes.boost:FireServer(state) end)
+        if ok then sent = true else self._stats.remoteFailures = self._stats.remoteFailures + 1 end
+    end
+    if not sent and self._vehicleController and self._vehicleController.SetBoost then
+        pcall(function() self._vehicleController:SetBoost(state) end)
+    end
+    self._boostActive = state
+end
+
+function Module:fireBoostPulse(duration)
+    local now = os.clock()
+    if now - self._lastBoostTime < BOOST_COOLDOWN_MS then return end
+    self._lastBoostTime = now
+
+    duration = duration or 0.08
+    self._boostSeq = self._boostSeq + 1
+    local mySeq = self._boostSeq
+
+    self._stats.boostPulses = self._stats.boostPulses + 1
+    self:_setBoostState(true)
+
+    task.delay(duration, function()
+        if self._boostSeq == mySeq then
+            self:_setBoostState(false)
+        end
+    end)
+end
+
+-- ==================== THROTTLE REPLICATION ====================
 function Module:sendThrottle(value)
-    -- Rate gate
-    local now = tick()
-    if now - self._lastThrottleSend < (1 / RATE.throttlePerSec) then return end
-    if self._lastThrottleSent and math.abs(self._lastThrottleSent - value) < RATE.throttleChangeEps then return end
+    local now = os.clock()
+    if now - self._lastThrottleTime < (1 / THROTTLE_HZ) then return end
+    if self._lastThrottleVal and math.abs(value - self._lastThrottleVal) < 0.02 then return end
+    self._lastThrottleTime = now
+    self._lastThrottleVal = value
 
-    self._lastThrottleSend = now
-    self._lastThrottleSent = value
-
-    if self._vehicleController and self._vehicleController.SetThrottleFloat then
-        pcall(function() self._vehicleController.SetThrottleFloat(value) end)
-    elseif self._setThrottle then
-        pcall(function() self._setThrottle:FireServer(value) end)
+    if self._remotes.throttle then
+        pcall(function() self._remotes.throttle:FireServer(value) end)
+    elseif self._vehicleController and self._vehicleController.SetThrottleFloat then
+        pcall(function() self._vehicleController:SetThrottleFloat(value) end)
     end
 end
 
--- ==================== LIGHTS ====================
+-- ==================== LIGHTS & DRIFT ====================
 function Module:toggleHeadlights()
-    if self._toggleHeadlights then
-        pcall(function() self._toggleHeadlights:InvokeServer() end)
+    if self._remotes.headlights then
+        pcall(function() self._remotes.headlights:FireServer() end)
     end
 end
 
 function Module:toggleHazards()
-    if self._toggleHazards then
-        pcall(function() self._toggleHazards:InvokeServer() end)
+    if self._remotes.hazards then
+        pcall(function() self._remotes.hazards:FireServer() end)
     end
 end
 
--- ==================== DRIFT ====================
-function Module:setDriftStrength(value)
-    if self._setDrift then
-        pcall(function() self._setDrift:FireServer(value) end)
+function Module:setDriftStrength(val)
+    if self._remotes.drift then
+        pcall(function() self._remotes.drift:FireServer(val) end)
     end
 end
 
--- ==================== STATUS ====================
 function Module:getStatus()
-    return self.status
+    return {
+        gunSounds = self._gunSoundsRemote ~= nil,
+        remotesFolder = self._remotesFolder ~= nil,
+        stats = self._stats,
+    }
 end
 
 return Module
