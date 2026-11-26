@@ -1,9 +1,10 @@
 --[[
-    VX_Powertrain v3.5.0
+    VX_Powertrain v3.5.1
     - Wheel-Coupled Gear-Stage RPM + Stall-Speed Torque Converter Launch
     - Unified gearRatios[maxGear] / gearRatios[gear] speed & ratio-conserving shifts
     - Adaptive TCU: Struggle/Hill Downshift, Anti-Hunt Hysteresis, UPOD Multi-Gear Kickdown,
       Corner-Entry Lift-Off Hold, Braking Downshifts & Rev-Match Blip
+    - Redline Backfires: Emits vehicle.backfire on every redline upshift & every rev-limiter hit/bounce
     - Upshift trigger: RPM >= effectiveRedline * 0.98
 ]]
 
@@ -16,7 +17,7 @@ local Player = Players.LocalPlayer
 local Module = VX.Framework.Module.new({
     Name = "Powertrain",
     Dependencies = { "Core", "Profiles", "Input", "VehicleState" },
-    Version = "3.5.0",
+    Version = "3.5.1",
 })
 
 local TICK_NORMAL = 60
@@ -50,6 +51,7 @@ function Module:Construct()
     self._lastShiftTime = 0
     self._lastShiftUpTime = 0
     self._lastShiftDownTime = 0
+    self._lastRedlineBackfire = 0
     self._coldStartEndTime = 0
     self._coldStartDone = false
     self._bogUntil = 0
@@ -146,6 +148,7 @@ function Module:_start()
     self.revLimiterActive = false
     self._coldStartEndTime = 0
     self._coldStartDone = false
+    self._lastRedlineBackfire = 0
     self._effectiveTopSpeed = self.core.settings.topSpeed or 100
     self._prevBodySpeed = 0
     self._smoothAccel = 0
@@ -252,9 +255,9 @@ function Module:_getGearMaxMPH(prof, gear)
     elseif gear <= 0 then
         return effTop
     end
-    local ratios = prof.gearRatios or { 4.71, 3.14, 2.11, 1.67, 1.29, 1.00, 0.84 }
+    local ratios = prof.gearRatios or { 3.65, 2.28, 1.62, 1.25, 1.00, 0.84, 0.70 }
     local maxGear = #ratios
-    local topRatio = ratios[maxGear] or 0.65
+    local topRatio = ratios[maxGear] or 0.70
     local curRatio = ratios[math.clamp(gear, 1, maxGear)] or topRatio
     return effTop * (topRatio / math.max(curRatio, 0.01))
 end
@@ -367,7 +370,7 @@ function Module:_updateRPM(dt, prof)
         local target = prof.idleRPM + posThr * (effectiveRedline - prof.idleRPM)
         local rate = (target > self.rpm) and (6.0 * riseMult) or 3.5
         self.rpm = self.rpm + (target - self.rpm) * math.min(rate * dt, 1)
-        self.rpm = math.clamp(self.rpm, prof.idleRPM * 0.9, effectiveRedline)
+        self.rpm = math.clamp(self.rpm, prof.idleRPM * 0.9, effectiveRedline + 80)
         return
     end
 
@@ -450,6 +453,7 @@ function Module:_updateGear(dt, prof)
     local lowRpmDownshift = self.core.config.lowRpmDownshift or DEFAULT_LOW_RPM_DOWNSHIFT
     local stallThreshold = self.core.config.stallThreshold or DEFAULT_STALL_THRESHOLD
     local posThr = math.max(0, self.smoothedThrottle)
+    local sinceUpshift = now - self._lastShiftUpTime
 
     if self.gear == -1 then
         if self.smoothedThrottle > 0.1 then
@@ -538,33 +542,37 @@ function Module:_updateGear(dt, prof)
             return
         end
 
-        local wantKickdown = (posThr > 0.85) or (now < self._sportStabUntil and posThr > 0.75)
-        if wantKickdown and self.rpm < effectiveRedline * 0.58 then
-            local optGear = self:_findOptimalKickdownGear(prof, effectiveRedline)
-            if optGear and optGear < self.gear then
-                self._struggleTimer = 0
-                self:_doShift(optGear, "down", false)
-                self.shiftCooldown = math.max(self.shiftCooldown, 0.28)
-                return
-            end
-        end
-
-        local gearMaxMPH = self:_getGearMaxMPH(prof, self.gear)
-        if posThr > 0.55 and self.rpm < effectiveRedline * 0.72 and bodySpeed < gearMaxMPH * 0.88 then
-            local expectedMin = math.max(1.0, posThr * (currentRatio or 1.0) * 0.9)
-            if self._smoothAccel < expectedMin * 0.35 then
-                self._struggleTimer = self._struggleTimer + dt
-                if self._struggleTimer >= 0.55 then
-                    local oldGear = self.gear
+        if sinceUpshift >= 0.80 then
+            local wantKickdown = (posThr > 0.85) or (now < self._sportStabUntil and posThr > 0.75)
+            if wantKickdown and self.rpm < effectiveRedline * 0.58 then
+                local optGear = self:_findOptimalKickdownGear(prof, effectiveRedline)
+                if optGear and optGear < self.gear then
                     self._struggleTimer = 0
-                    self:_doShift(lowerGear, "down", false)
-                    self._antiHuntGear = oldGear
-                    self._antiHuntUntil = now + 2.5
-                    self.shiftCooldown = math.max(self.shiftCooldown, 0.55)
+                    self:_doShift(optGear, "down", false)
+                    self.shiftCooldown = math.max(self.shiftCooldown, 0.28)
                     return
                 end
+            end
+
+            local gearMaxMPH = self:_getGearMaxMPH(prof, self.gear)
+            if posThr > 0.55 and self.rpm < effectiveRedline * 0.72 and bodySpeed < gearMaxMPH * 0.88 then
+                local expectedMin = math.max(1.0, posThr * (currentRatio or 1.0) * 0.9)
+                if self._smoothAccel < expectedMin * 0.35 then
+                    self._struggleTimer = self._struggleTimer + dt
+                    if self._struggleTimer >= 0.55 then
+                        local oldGear = self.gear
+                        self._struggleTimer = 0
+                        self:_doShift(lowerGear, "down", false)
+                        self._antiHuntGear = oldGear
+                        self._antiHuntUntil = now + 2.5
+                        self.shiftCooldown = math.max(self.shiftCooldown, 0.55)
+                        return
+                    end
+                else
+                    self._struggleTimer = math.max(0, self._struggleTimer - dt * 2.0)
+                end
             else
-                self._struggleTimer = math.max(0, self._struggleTimer - dt * 2.0)
+                self._struggleTimer = 0
             end
         else
             self._struggleTimer = 0
@@ -577,6 +585,7 @@ function Module:_doShift(newGear, direction, emergency)
     local oldGear = self.gear
     local rpmBefore = self.rpm
     local prof = self.profiles:current()
+    local effectiveRedline = self:_getEffectiveRedline(prof)
 
     self.gear = newGear
     self._struggleTimer = 0
@@ -609,6 +618,11 @@ function Module:_doShift(newGear, direction, emergency)
     self._lastShiftTime = os.clock()
     if direction == "up" then
         self._lastShiftUpTime = os.clock()
+        -- Backfire on every redline upshift
+        if self.core.settings.backfireEnabled ~= false and rpmBefore >= effectiveRedline * 0.94 then
+            self._lastRedlineBackfire = os.clock()
+            _G.VX.bus:emit("vehicle.backfire", { source = "redline_shift", count = 1 })
+        end
     else
         self._lastShiftDownTime = os.clock()
     end
@@ -624,21 +638,31 @@ function Module:_doShift(newGear, direction, emergency)
 end
 
 function Module:_updateRevLimiter(dt, prof)
-    local throttle = self.smoothedThrottle
     if self.launch.twostepActive then return end
+    local posThr = math.max(0, self.smoothedThrottle)
     local maxGear = self:_getMaxGear(prof)
     local effectiveRedline = self:_getEffectiveRedline(prof)
+    local canHitLimiter = (self.gear >= maxGear) or self.input:isClutchHeld() or self.pendingUpshift.active
 
-    if throttle > 0.7 and self.rpm >= effectiveRedline and self.gear >= maxGear then
+    if posThr > 0.65 and self.rpm >= effectiveRedline * 0.985 and canHitLimiter then
+        local now = os.clock()
         if not self.revLimiterActive then
             self.revLimiterActive = true
             self.revLimiterPhase = 0
             _G.VX.bus:emit("engine.revLimit", { active = true })
+            if self.core.settings.backfireEnabled ~= false and (now - self._lastRedlineBackfire >= 0.12) then
+                self._lastRedlineBackfire = now
+                _G.VX.bus:emit("vehicle.backfire", { source = "redline", count = 1 })
+            end
         end
         self.revLimiterPhase = self.revLimiterPhase + dt
-        local phase = self.revLimiterPhase % 0.16
-        if phase < 0.08 then
-            self.rpm = math.max(effectiveRedline - 100, self.rpm - 800 * dt)
+        local phase = self.revLimiterPhase % 0.14
+        if phase < 0.07 then
+            self.rpm = math.max(effectiveRedline - 180, self.rpm - 1800 * dt)
+            if self.core.settings.backfireEnabled ~= false and (now - self._lastRedlineBackfire >= 0.14) then
+                self._lastRedlineBackfire = now
+                _G.VX.bus:emit("vehicle.backfire", { source = "redline", count = 1 })
+            end
         end
     else
         if self.revLimiterActive then
