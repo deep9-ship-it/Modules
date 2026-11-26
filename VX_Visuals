@@ -1,283 +1,268 @@
 --[[
-    VX_Visuals v3.1.0
-    - shiftingJolt toggle (off default)
-    - vehicleShaking toggle (off default)
+    VX_Visuals v3.1.1
+    Camera effects + body tilt + exhaust flame VFX.
+    - Every backfire spits fire locally AND via Remote:fireBoostPulse() (0.03s gate)
+    - Sequence-guarded flame off-timer so rapid redline bounces keep fire spitting continuously
 ]]
 
 local VX = _G.VX
 if not VX or not VX.Framework then error("VX_Visuals requires VX_Kernel") end
 
 local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
-local Camera = Workspace.CurrentCamera
+local Camera     = workspace.CurrentCamera
 
 local Module = VX.Framework.Module.new({
     Name = "Visuals",
     Dependencies = { "Core", "Authority", "Powertrain", "DriveSystem" },
-    Version = "3.1.0",
+    Version = "3.1.1",
 })
 
-local CAMERA_PRIORITY = 300
+local STUDS_TO_MPH = 0.626
+local DEFAULT_FOV  = 70
+local DEFAULT_SENSITIVITY = 1.0
 
 function Module:Construct()
-    self.currentFOV = 70
-    self.targetFOV = 70
-    self.vibrateTime = 0
-    self.shock = { active = false, magnitude = 0, initial = 0, decay = 8, duration = 0.15, elapsed = 0, direction = Vector3.new(), rotation = Vector3.new() }
-    self.launchJolt = { active = false, magnitude = 0, decay = 10, elapsed = 0, duration = 0.4 }
-    self.tiltLevel = "Off"
+    self.lastCameraUpdate = 0
+    self.currentFOV = DEFAULT_FOV
+    self.vibPhase = 0
+    self.joltOffset = Vector3.new()
+    self.joltVelocity = Vector3.new()
+    self.tiltC0 = nil
     self.lastFlameTime = 0
     self.lastRemotePulseTime = 0
-    self._loopThread = nil
-    self._running = false
-    self._cameraBound = false
+    self._flameSeq = 0
+    self._renderBound = false
+    self._conns = {}
 end
 
 function Module:Init(deps)
-    self.core = deps.Core
-    self.authority = deps.Authority
+    self.core       = deps.Core
+    self.authority  = deps.Authority
     self.powertrain = deps.Powertrain
-    self.drive = deps.DriveSystem
+    self.drive      = deps.DriveSystem
+end
+
+function Module:_trackConn(conn)
+    if conn then table.insert(self._conns, conn) end
 end
 
 function Module:Start()
     _G.VX.Visuals = self
-    self.tiltLevel = self.core.settings.physicsTiltLevel or "Off"
-
-    _G.VX.bus:on("vehicle.stateChanged", function(evt) self:_onStateChange(evt) end)
-    _G.VX.bus:on("vehicle.shift", function(evt) self:_onShift(evt) end)
-    _G.VX.bus:on("vehicle.backfire", function(evt) self:_onBackfire(evt) end)
-    _G.VX.bus:on("vehicle.launchRelease", function(evt) self:_onLaunchRelease(evt) end)
-    _G.VX.bus:on("settings.changed", function(evt) self:_onSettingChange(evt) end)
-
     self:_registerDiagnostics()
+
+    self:_trackConn(_G.VX.bus:on("vehicle.stateChanged", function(evt)
+        if evt.to == "Ready" or evt.to == "Idle" then
+            self:_bindCamera()
+        elseif evt.to == "Exiting" or evt.to == "Disabled" then
+            self:_unbindCamera()
+        end
+    end))
+
+    self:_trackConn(_G.VX.bus:on("vehicle.shift", function(evt)
+        self:_onShift(evt)
+    end))
+
+    self:_trackConn(_G.VX.bus:on("vehicle.launchRelease", function(evt)
+        if evt.quality == "perfect" or evt.quality == "good" then
+            local cfg = self.core.config.launch
+            self.joltVelocity = self.joltVelocity + Vector3.new(0, 0, cfg.joltMagnitude * 30)
+            self:fireExhaustFlame()
+        end
+    end))
+
+    self:_trackConn(_G.VX.bus:on("vehicle.backfire", function()
+        self:fireExhaustFlame()
+    end))
+
+    self:_trackConn(_G.VX.bus:on("vehicle.twostepStart", function()
+        self:fireExhaustFlame()
+    end))
+
+    local auth = self.authority
+    if auth and auth:getHandle() then
+        self:_bindCamera()
+    end
 end
 
 function Module:Stop()
-    self:_detach()
+    self:_unbindCamera()
+    for _, c in ipairs(self._conns) do
+        if typeof(c) == "RBXScriptConnection" then
+            c:Disconnect()
+        elseif type(c) == "table" and c.Disconnect then
+            c:Disconnect()
+        end
+    end
+    self._conns = {}
     if _G.VX.Visuals == self then _G.VX.Visuals = nil end
 end
 
-function Module:heartbeat() return true end
+function Module:heartbeat()
+    return true
+end
 
 function Module:_registerDiagnostics()
     local D = _G.VX.diagnostics
     pcall(function()
         D.register("visuals.fov", {
-            fn = function() return { value = string.format("%.0f", self.currentFOV), unit = "deg", status = "normal" } end,
-            category = "Visuals",
-        }, "Visuals")
-        D.register("visuals.tiltLevel", {
-            fn = function() return { value = self.tiltLevel, unit = "", status = "normal" } end,
+            fn = function() return { value = string.format("%.1f", self.currentFOV), unit = "deg", status = "normal" } end,
             category = "Visuals",
         }, "Visuals")
     end)
 end
 
-function Module:_onStateChange(evt)
-    if evt.to == "Ready" or evt.to == "Idle" then self:_attach()
-    elseif evt.to == "Exiting" or evt.to == "Disabled" then self:_detach() end
-end
+-- ==================== CAMERA BIND ====================
+function Module:_bindCamera()
+    if self._renderBound then return end
+    self._renderBound = true
+    self.currentFOV = Camera and Camera.FieldOfView or DEFAULT_FOV
+    self.lastCameraUpdate = os.clock()
 
-function Module:_attach()
-    if self._running then return end
-    self._running = true
-    self.currentFOV = self.core.config.cameraFx.fovIdle
-    self.targetFOV = self.currentFOV
-    self.vibrateTime = 0
-    self.shock.active = false
-    self.launchJolt.active = false
-
-    if not self._cameraBound then
-        self._cameraBound = true
-        local mod = self
-        RunService:BindToRenderStep("VX_Camera", CAMERA_PRIORITY, function(dt)
-            pcall(function() mod:_updateCamera(dt) end)
-        end)
-    end
-
-    self._loopThread = task.spawn(function()
-        while self._running do
-            local dt = task.wait(1/60)
-            if dt > 0.1 then dt = 1/60 end
-            pcall(function() self:_updateTilt(dt) end)
-        end
+    RunService:BindToRenderStep("VX_Camera", 300, function(dt)
+        pcall(function() self:_updateCamera(dt) end)
     end)
-    print("[VX] Visuals attached")
+    print("[VX] Visuals camera bound")
 end
 
-function Module:_detach()
-    if not self._running then return end
-    self._running = false
-    if self._cameraBound then pcall(function() RunService:UnbindFromRenderStep("VX_Camera") end); self._cameraBound = false end
-    if self._loopThread then pcall(function() task.cancel(self._loopThread) end); self._loopThread = nil end
-    if Camera then pcall(function() Camera.FieldOfView = self.core.config.cameraFx.fovIdle end) end
-    print("[VX] Visuals detached")
-end
+function Module:_unbindCamera()
+    if not self._renderBound then return end
+    self._renderBound = false
+    pcall(function() RunService:UnbindFromRenderStep("VX_Camera") end)
 
-function Module:_updateCamera(dt)
-    if not Camera then return end
-    if not self._running then return end
+    if Camera then Camera.FieldOfView = DEFAULT_FOV end
+    self.joltOffset = Vector3.new()
+    self.joltVelocity = Vector3.new()
 
-    local cfg = self.core.config.cameraFx
     local handle = self.authority:getHandle()
+    if handle and handle.tiltWeld and handle.neutralC0 then
+        pcall(function() handle.tiltWeld.C0 = handle.neutralC0 end)
+    end
+    print("[VX] Visuals camera unbound")
+end
+
+-- ==================== CAMERA UPDATE ====================
+function Module:_updateCamera(dt)
+    if not Camera then Camera = workspace.CurrentCamera end
+    if not Camera then return end
+    if dt > 0.1 then dt = 0.016 end
+
+    local handle = self.authority:getHandle()
+    if not handle or not handle.root then return end
+
+    local settings = self.core.settings
+    local cfg = self.core.config.cameraFx
+    local part = handle.root.PrimaryPart or handle.platform or handle.chassis or handle.seat
     local speed = 0
-    if handle and handle.root and handle.root.PrimaryPart then
-        local v = handle.root.PrimaryPart.AssemblyLinearVelocity
-        speed = Vector3.new(v.X, 0, v.Z).Magnitude * 0.626
+    if part then
+        local v = part.AssemblyLinearVelocity
+        speed = Vector3.new(v.X, 0, v.Z).Magnitude * STUDS_TO_MPH
     end
 
-    if self.core.settings.fovDynamicsEnabled then
-        local sf = math.clamp(speed / cfg.fovSpeedThreshold, 0, 1)
-        local smooth = sf * sf * (3 - 2 * sf)
-        self.targetFOV = cfg.fovIdle + smooth * (cfg.fovMax - cfg.fovIdle)
-        self.currentFOV = self.currentFOV + (self.targetFOV - self.currentFOV) * math.min(dt * cfg.fovSmoothness, 1)
+    if settings.fovDynamicsEnabled then
+        local t = math.clamp(speed / cfg.fovSpeedThreshold, 0, 1)
+        local targetFOV = cfg.fovIdle + t * (cfg.fovMax - cfg.fovIdle)
+        self.currentFOV = self.currentFOV + (targetFOV - self.currentFOV) * math.min(cfg.fovSmoothness * dt, 1)
         Camera.FieldOfView = self.currentFOV
-    else
-        Camera.FieldOfView = cfg.fovIdle
-        self.currentFOV = cfg.fovIdle
     end
 
-    local vibOffset = Vector3.new()
-    if self.core.settings.vehicleShaking then
+    if settings.vehicleShaking then
         local rpm = self.powertrain:getRPM()
         if rpm > cfg.vibRpmMin then
-            self.vibrateTime = self.vibrateTime + dt
-            local rpmFactor = (rpm - cfg.vibRpmMin) / (cfg.vibRpmMax - cfg.vibRpmMin)
-            local amp = rpmFactor * cfg.vibMaxOffset
-            local freq = rpm * cfg.vibFreqMultiplier
-            vibOffset = Vector3.new(
-                math.sin(self.vibrateTime * freq) * amp * 0.3,
-                math.cos(self.vibrateTime * freq * 1.1) * amp,
-                math.sin(self.vibrateTime * freq * 0.7) * amp * 0.1
-            )
+            local factor = math.clamp((rpm - cfg.vibRpmMin) / (cfg.vibRpmMax - cfg.vibRpmMin), 0, 1)
+            local amp = cfg.vibMaxOffset * factor
+            self.vibPhase = self.vibPhase + dt * (rpm * cfg.vibFreqMultiplier)
+            local ox = math.sin(self.vibPhase * 1.1) * amp
+            local oy = math.cos(self.vibPhase * 1.7) * amp * 0.7
+            local oz = math.sin(self.vibPhase * 0.7) * amp * 0.5
+            Camera.CFrame = Camera.CFrame * CFrame.new(ox, oy, oz)
         end
     end
 
-    local shockOffset = Vector3.new()
-    local shockRot = Vector3.new()
-    if self.shock.active then
-        self.shock.elapsed = self.shock.elapsed + dt
-        self.shock.magnitude = self.shock.magnitude * math.exp(-self.shock.decay * dt)
-        if self.shock.magnitude < 0.001 or self.shock.elapsed >= self.shock.duration then
-            self.shock.active = false
-            self.shock.magnitude = 0
-        else
-            shockOffset = self.shock.direction * self.shock.magnitude
-            shockRot = self.shock.rotation * self.shock.magnitude * 0.5
-            if self.shock.elapsed < 0.05 then
-                local res = math.sin(self.shock.elapsed * 120) * self.shock.magnitude * 0.3
-                shockOffset = shockOffset + Vector3.new(0, res, 0)
-            end
-        end
+    if self.joltOffset.Magnitude > 0.001 or self.joltVelocity.Magnitude > 0.001 then
+        local stiffness = 120
+        local damping = 18
+        local force = -self.joltOffset * stiffness - self.joltVelocity * damping
+        self.joltVelocity = self.joltVelocity + force * dt
+        self.joltOffset = self.joltOffset + self.joltVelocity * dt
+        Camera.CFrame = Camera.CFrame * CFrame.new(self.joltOffset)
     end
 
-    local joltOffset = Vector3.new()
-    if self.launchJolt.active then
-        self.launchJolt.elapsed = self.launchJolt.elapsed + dt
-        self.launchJolt.magnitude = self.launchJolt.magnitude * math.exp(-self.launchJolt.decay * dt)
-        if self.launchJolt.elapsed >= self.launchJolt.duration or self.launchJolt.magnitude < 0.001 then
-            self.launchJolt.active = false
-            self.launchJolt.magnitude = 0
-        else
-            local t = self.launchJolt.elapsed
-            local m = self.launchJolt.magnitude
-            joltOffset = Vector3.new(
-                math.sin(t * 40) * m * 0.3,
-                math.cos(t * 35) * m,
-                math.sin(t * 45) * m * 0.2
-            )
-        end
-    end
-
-    local totalOffset = vibOffset + shockOffset + joltOffset
-    if totalOffset.Magnitude > 0.001 or shockRot.Magnitude > 0.001 then
-        local cf = Camera.CFrame
-        if totalOffset.Magnitude > 0.001 then cf = cf * CFrame.new(totalOffset) end
-        if shockRot.Magnitude > 0.001 then cf = cf * CFrame.fromEulerAnglesXYZ(shockRot.X, shockRot.Y, shockRot.Z) end
-        Camera.CFrame = cf
-    end
+    self:_updateTilt(dt)
 end
 
+-- ==================== SHIFT SHOCK ====================
+function Module:_onShift(evt)
+    if not self.core.settings.shiftingJolt then return end
+    local cfg = self.core.config.cameraFx
+    local shock
+    if evt.emergency then shock = cfg.shiftEmergency
+    elseif evt.up then shock = cfg.shiftUp
+    else shock = cfg.shiftDown end
+    self.joltVelocity = self.joltVelocity + Vector3.new(0, 0, shock.mag * 18)
+end
+
+-- ==================== BODY TILT ====================
 function Module:_updateTilt(dt)
     local handle = self.authority:getHandle()
     if not handle or not handle.tiltWeld or not handle.neutralC0 then return end
-    local lvl = self.core.config.tiltLevels[self.tiltLevel] or self.core.config.tiltLevels.Off
-    local throttle = self.powertrain:getSmoothedThrottle()
-    local steer = _G.VX.Input and _G.VX.Input:getRawSteer() or 0
-    local yShift = lvl.cogRise
-    local zShift = math.abs(throttle) > 0.2 and (throttle * lvl.maxZ) or 0
-    local xShift = math.abs(steer) > 0.2 and (-steer * lvl.maxX) or 0
-    local targetC0 = handle.neutralC0 * CFrame.new(xShift, yShift, zShift)
-    local curWeld = handle.tiltWeld
-    if not curWeld or not curWeld.Parent then return end
-    local currentC0 = curWeld.C0
-    local newC0 = currentC0:Lerp(targetC0, math.min(dt * 8, 1))
-    pcall(function() curWeld.C0 = newC0 end)
-end
 
-function Module:_onShift(evt)
-    if self.core.settings.shiftingJolt then
-        self:triggerShiftShock(evt.up, evt.emergency)
+    local levelName = self.core.settings.physicsTiltLevel or "Off"
+    local levelCfg = self.core.config.tiltLevels[levelName]
+    if not levelCfg or levelName == "Off" then
+        handle.tiltWeld.C0 = handle.neutralC0
+        return
     end
+
+    local throttle = self.powertrain:getSmoothedThrottle()
+    local input = _G.VX.Modules and _G.VX.Modules.Input
+    local steer = input and input:getRawSteer() or 0
+
+    local pitch = math.clamp(throttle, -1, 1) * levelCfg.maxX
+    local roll  = math.clamp(steer, -1, 1) * levelCfg.maxZ
+
+    local targetC0 = handle.neutralC0 * CFrame.Angles(pitch, 0, roll)
+    local cur = handle.tiltWeld.C0
+    handle.tiltWeld.C0 = cur:Lerp(targetC0, math.min(dt * 8, 1))
 end
 
-function Module:_onBackfire(evt) self:fireExhaustFlame() end
-function Module:_onLaunchRelease(evt) self:triggerLaunchJolt() end
-
-function Module:_onSettingChange(evt)
-    if evt.path == "physicsTiltLevel" then self.tiltLevel = evt.new or "Off" end
-end
-
-function Module:triggerShiftShock(up, emergency)
-    local cfg = self.core.config.cameraFx
-    local params
-    if emergency then params = cfg.shiftEmergency
-    elseif up then params = cfg.shiftUp
-    else params = cfg.shiftDown end
-    self.shock.active = true
-    self.shock.magnitude = params.mag
-    self.shock.initial = params.mag
-    self.shock.decay = params.decay
-    self.shock.duration = params.dur
-    self.shock.elapsed = 0
-    self.shock.direction = Vector3.new(0, params.pitch, 0)
-    self.shock.rotation = Vector3.new(params.pitch, params.yaw, params.roll)
-end
-
-function Module:triggerLaunchJolt()
-    self.launchJolt.active = true
-    self.launchJolt.magnitude = self.core.config.launch.joltMagnitude
-    self.launchJolt.decay = self.core.config.launch.joltDecay
-    self.launchJolt.elapsed = 0
-    self.launchJolt.duration = 0.4
-end
-
+-- ==================== EXHAUST FLAMES ====================
 function Module:fireExhaustFlame()
+    if self.core.settings.backfireEnabled == false then return end
     local now = os.clock()
-    if now - self.lastFlameTime < 0.06 then return end
+    if now - self.lastFlameTime < 0.03 then return end
     self.lastFlameTime = now
+
     local handle = self.authority:getHandle()
     if not handle then return end
+
     local emitter = nil
     if handle.vfxAttach then
         emitter = handle.vfxAttach:FindFirstChild("fire") or handle.vfxAttach:FindFirstChildWhichIsA("ParticleEmitter")
     end
+    if not emitter and handle.nitrous then
+        emitter = handle.nitrous:FindFirstChild("fire", true) or handle.nitrous:FindFirstChildWhichIsA("ParticleEmitter", true)
+    end
+    if not emitter and handle.root then
+        emitter = handle.root:FindFirstChild("fire", true)
+    end
+
+    self._flameSeq = self._flameSeq + 1
+    local mySeq = self._flameSeq
+
     if emitter and emitter:IsA("ParticleEmitter") then
         emitter.Enabled = true
-        task.delay(0.08, function() if emitter and emitter.Parent then emitter.Enabled = false end end)
+        pcall(function() emitter:Emit(math.random(5, 9)) end)
+        task.delay(0.09, function()
+            if self._flameSeq == mySeq and emitter and emitter.Parent then
+                emitter.Enabled = false
+            end
+        end)
     end
-    if now - self.lastRemotePulseTime > 0.20 then
-        self.lastRemotePulseTime = now
-        pcall(function() if _G.VX.Remote then _G.VX.Remote:fireBoostPulse(0.06) end end)
-    end
-end
 
-function Module:setTiltLevel(level)
-    if not self.core.config.tiltLevels[level] then return end
-    self.tiltLevel = level
-    _G.VX.setSetting("physicsTiltLevel", level)
+    if _G.VX.Remote and (now - self.lastRemotePulseTime >= 0.03) then
+        self.lastRemotePulseTime = now
+        pcall(function() _G.VX.Remote:fireBoostPulse(0.08) end)
+    end
 end
-function Module:getTiltLevel() return self.tiltLevel end
 
 return Module
