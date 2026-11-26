@@ -1,9 +1,12 @@
 --[[
-    VX_Kernel.lua — Microkernel, Topological Loader (GitHub), EventBus, Registry, Diagnostics & Watchdog
-    Version: 3.2.1
+    VX_Kernel.lua — Microkernel, Topological Loader (GitHub), EventBus, Registry, Diagnostics, Watchdog & Community Notice
+    Version: 3.2.3
 ]]
 
-local VERSION = "3.2.1"
+local VERSION = "3.2.3"
+local KERNEL_URL = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Kernel"
+local COMMUNITY_URL = "https://youtube.com/@ds90-t9e/community?si=GrhOry6Um1XuhQNk"
+local NOTICE_DURATION = 20
 
 local MODULE_URLS = {
     Core         = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Core",
@@ -40,6 +43,10 @@ local MODULE_ORDER = {
 local WATCHDOG_INTERVAL = 2.5
 local MAX_HEARTBEAT_FAILS = 3
 local HTTP_RETRIES = 2
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
 
 local function _deepCopy(tbl)
     if type(tbl) ~= "table" then return tbl end
@@ -182,6 +189,7 @@ local _bootOrder = {}
 local _failCounts = {}
 local _watchdogThread = nil
 local _hotkeyConns = {}
+local _noticeGui = nil
 
 -- ==================== EVENT BUS ====================
 
@@ -507,6 +515,45 @@ local function _topoSort(modules, orderList)
     return sorted
 end
 
+local function _runSingleModuleLifecycle(name, mod)
+    local cok, cerr = pcall(mod.Construct, mod)
+    if not cok then
+        mod:setState("failed")
+        warn("[VX] " .. name .. ".Construct: " .. tostring(cerr))
+        return false
+    end
+    mod:setState("constructed")
+
+    local deps = {}
+    for _, dep in ipairs(mod:getDeps()) do
+        local d = VX.Modules[dep]
+        if not d or d:getState() == "failed" or d:getState() == "skipped" then
+            mod:setState("skipped")
+            warn("[VX] " .. name .. " skipped (unhealthy dep: " .. dep .. ")")
+            return false
+        end
+        deps[dep] = d
+    end
+
+    local iok, ierr = pcall(mod.Init, mod, deps)
+    if not iok then
+        mod:setState("failed")
+        warn("[VX] " .. name .. ".Init: " .. tostring(ierr))
+        return false
+    end
+    mod:setState("inited")
+
+    local sok, serr = pcall(mod.Start, mod)
+    if not sok then
+        mod:setState("failed")
+        warn("[VX] " .. name .. ".Start: " .. tostring(serr))
+        return false
+    end
+    mod:setState("started")
+    _failCounts[name] = 0
+    return true
+end
+
 local function _runLifecycle(sorted, modules)
     for _, name in ipairs(sorted) do
         local mod = modules[name]
@@ -560,6 +607,167 @@ local function _runLifecycle(sorted, modules)
     end
 end
 
+-- ==================== COMMUNITY CLIPBOARD & POPUP ====================
+
+local function _copyCommunityUrl()
+    if type(setclipboard) == "function" then
+        return pcall(setclipboard, COMMUNITY_URL)
+    elseif type(toclipboard) == "function" then
+        return pcall(toclipboard, COMMUNITY_URL)
+    elseif type(Clipboard) == "table" and type(Clipboard.set) == "function" then
+        return pcall(Clipboard.set, COMMUNITY_URL)
+    end
+    return false
+end
+
+local function _showCommunityPopup(copied)
+    task.spawn(function()
+        local player = Players.LocalPlayer or Players.PlayerAdded:Wait()
+        local pg = player and player:WaitForChild("PlayerGui", 10)
+        if not pg then return end
+
+        local old = pg:FindFirstChild("VX_CommunityNotice")
+        if old then old:Destroy() end
+
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "VX_CommunityNotice"
+        gui.ResetOnSpawn = false
+        gui.IgnoreGuiInset = true
+        gui.DisplayOrder = 50
+        gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        gui.Parent = pg
+        _noticeGui = gui
+
+        local card = Instance.new("Frame")
+        card.Name = "NoticeCard"
+        card.Size = UDim2.new(0, 390, 0, 246)
+        card.AnchorPoint = Vector2.new(0.5, 0.5)
+        card.Position = UDim2.new(0.5, 0, 0.5, 0)
+        card.BackgroundColor3 = Color3.fromRGB(10, 11, 14)
+        card.BackgroundTransparency = 0.04
+        card.BorderSizePixel = 0
+        card.Parent = gui
+
+        local sizeConstraint = Instance.new("UISizeConstraint")
+        sizeConstraint.MinSize = Vector2.new(290, 210)
+        sizeConstraint.MaxSize = Vector2.new(410, 270)
+        sizeConstraint.Parent = card
+
+        local cCorner = Instance.new("UICorner")
+        cCorner.CornerRadius = UDim.new(0, 12)
+        cCorner.Parent = card
+
+        local cStroke = Instance.new("UIStroke")
+        cStroke.Color = Color3.fromRGB(255, 180, 0)
+        cStroke.Thickness = 1.4
+        cStroke.Transparency = 0.25
+        cStroke.Parent = card
+
+        local trim = Instance.new("Frame")
+        trim.Size = UDim2.new(1, -24, 0, 2)
+        trim.Position = UDim2.new(0, 12, 0, 0)
+        trim.BackgroundColor3 = Color3.fromRGB(255, 180, 0)
+        trim.BorderSizePixel = 0
+        trim.Parent = card
+
+        local title = Instance.new("TextLabel")
+        title.Size = UDim2.new(1, -28, 0, 26)
+        title.Position = UDim2.new(0, 14, 0, 12)
+        title.BackgroundTransparency = 1
+        title.Font = Enum.Font.GothamBlack
+        title.TextSize = 15
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.TextColor3 = Color3.fromRGB(255, 180, 0)
+        title.Text = "VX // GT3 COMMUNITY"
+        title.Parent = card
+
+        local statusLbl = Instance.new("TextLabel")
+        statusLbl.Size = UDim2.new(1, -28, 0, 18)
+        statusLbl.Position = UDim2.new(0, 14, 0, 38)
+        statusLbl.BackgroundTransparency = 1
+        statusLbl.Font = Enum.Font.GothamBold
+        statusLbl.TextSize = 11
+        statusLbl.TextXAlignment = Enum.TextXAlignment.Left
+        statusLbl.TextColor3 = copied and Color3.fromRGB(34, 229, 138) or Color3.fromRGB(0, 212, 255)
+        statusLbl.Text = copied and "YouTube Community link copied to your clipboard!" or "Visit the YouTube Community page below:"
+        statusLbl.Parent = card
+
+        local body = Instance.new("TextLabel")
+        body.Size = UDim2.new(1, -28, 0, 74)
+        body.Position = UDim2.new(0, 14, 0, 60)
+        body.BackgroundTransparency = 1
+        body.Font = Enum.Font.GothamMedium
+        body.TextSize = 13
+        body.TextWrapped = true
+        body.TextXAlignment = Enum.TextXAlignment.Left
+        body.TextYAlignment = Enum.TextYAlignment.Top
+        body.TextColor3 = Color3.fromRGB(244, 246, 250)
+        body.Text = "Check out the YouTube Community (@ds90-t9e) to leave your feedback, report any issues, and share your GT3 tuning settings & setups with other players!"
+        body.Parent = card
+
+        local urlBox = Instance.new("TextBox")
+        urlBox.Size = UDim2.new(1, -28, 0, 28)
+        urlBox.Position = UDim2.new(0, 14, 0, 140)
+        urlBox.BackgroundColor3 = Color3.fromRGB(20, 23, 31)
+        urlBox.BorderSizePixel = 0
+        urlBox.ClearTextOnFocus = false
+        urlBox.TextEditable = false
+        urlBox.Font = Enum.Font.Code
+        urlBox.TextSize = 10
+        urlBox.TextColor3 = Color3.fromRGB(0, 212, 255)
+        urlBox.TextTruncate = Enum.TextTruncate.AtEnd
+        urlBox.Text = COMMUNITY_URL
+        urlBox.Parent = card
+
+        local uCorner = Instance.new("UICorner")
+        uCorner.CornerRadius = UDim.new(0, 6)
+        uCorner.Parent = urlBox
+
+        local okBtn = Instance.new("TextButton")
+        okBtn.Size = UDim2.new(0, 150, 0, 36)
+        okBtn.AnchorPoint = Vector2.new(0.5, 1)
+        okBtn.Position = UDim2.new(0.5, 0, 1, -14)
+        okBtn.BackgroundColor3 = Color3.fromRGB(255, 180, 0)
+        okBtn.Font = Enum.Font.GothamBlack
+        okBtn.TextSize = 13
+        okBtn.TextColor3 = Color3.fromRGB(10, 11, 14)
+        okBtn.Text = string.format("Okay (%ds)", NOTICE_DURATION)
+        okBtn.Parent = card
+
+        local bCorner = Instance.new("UICorner")
+        bCorner.CornerRadius = UDim.new(0, 8)
+        bCorner.Parent = okBtn
+
+        local closed = false
+        local function closeNotice()
+            if closed then return end
+            closed = true
+            if gui and gui.Parent then
+                TweenService:Create(card, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                    BackgroundTransparency = 1,
+                }):Play()
+                TweenService:Create(cStroke, TweenInfo.new(0.2), { Transparency = 1 }):Play()
+                task.wait(0.22)
+                if gui and gui.Parent then
+                    gui:Destroy()
+                end
+            end
+            if _noticeGui == gui then
+                _noticeGui = nil
+            end
+        end
+
+        okBtn.MouseButton1Click:Connect(closeNotice)
+
+        for remaining = NOTICE_DURATION, 1, -1 do
+            if closed or not gui.Parent then break end
+            okBtn.Text = string.format("Okay (%ds)", remaining)
+            task.wait(1)
+        end
+        closeNotice()
+    end)
+end
+
 -- ==================== PUBLIC API ====================
 
 function VX.getModule(name)
@@ -599,9 +807,30 @@ function VX.resetAll()
     return true, count
 end
 
+function VX.restartModule(name)
+    local mod = VX.Modules[name]
+    if not mod then
+        warn("[VX] restartModule: not found — " .. tostring(name))
+        return false
+    end
+    for _, kind in ipairs({ "settings", "sounds", "events", "diagnostics", "presets", "hotkeys", "parts" }) do
+        registry:removeAll(kind, name)
+    end
+    diagnostics.unregisterByOwner(name)
+    pcall(mod.Stop, mod)
+    if mod._janitor then pcall(function() mod._janitor:Cleanup() end) end
+    mod:setState("stopped")
+
+    local ok = _runSingleModuleLifecycle(name, mod)
+    if ok then
+        print("[VX] Restarted: " .. name)
+    end
+    return ok
+end
+
 function VX.reload(name)
     if not name then
-        local ok, src = _httpGet("https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Kernel", true)
+        local ok, src = _httpGet(KERNEL_URL, true)
         if not ok then warn("[VX] Kernel reload failed: " .. tostring(src)); return false end
         local chunk, err = loadstring(src, "@VX_Kernel")
         if not chunk then warn("[VX] Kernel compile error: " .. tostring(err)); return false end
@@ -624,18 +853,17 @@ function VX.reload(name)
     end
 
     local mod, err = _compileModule(name, url, true)
-    if not mod then warn("[VX] Reload failed " .. name .. ": " .. tostring(err)); return false end
+    if not mod then
+        warn("[VX] Reload failed " .. name .. ": " .. tostring(err))
+        return false
+    end
 
-    pcall(mod.Construct, mod)
-    local deps = {}
-    for _, dep in ipairs(mod:getDeps()) do deps[dep] = VX.Modules[dep] end
-    pcall(mod.Init, mod, deps)
-    pcall(mod.Start, mod)
     VX.Modules[name] = mod
-    mod:setState("started")
-    _failCounts[name] = 0
-    print("[VX] Reloaded: " .. name)
-    return true
+    local ok = _runSingleModuleLifecycle(name, mod)
+    if ok then
+        print("[VX] Reloaded: " .. name)
+    end
+    return ok
 end
 
 function VX.reloadAll()
@@ -644,8 +872,52 @@ function VX.reloadAll()
     end
 end
 
+function VX.diag()
+    local all = diagnostics.getAll()
+    local keys = {}
+    for k in pairs(all) do
+        table.insert(keys, k)
+    end
+    table.sort(keys)
+
+    print("========== VX DIAGNOSTICS ==========")
+    for _, k in ipairs(keys) do
+        local d = all[k]
+        local valStr
+        if type(d.value) == "number" then
+            valStr = (d.value % 1 == 0) and string.format("%d", d.value) or string.format("%.2f", d.value)
+        else
+            valStr = tostring(d.value)
+        end
+        local unitStr = d.unit and (" " .. tostring(d.unit)) or ""
+        local statusStr = d.status and (" [" .. tostring(d.status) .. "]") or ""
+        print(string.format("  %-26s = %s%s%s (%s)", k, valStr, unitStr, statusStr, d.owner))
+    end
+    print("====================================")
+end
+
+function VX.help()
+    print([[
+========== VX KERNEL COMMANDS ==========
+  _G.VX.getStatus()         -> Module states & versions
+  _G.VX.getModule(name)     -> Get loaded module instance
+  _G.VX.restartModule(name) -> Restart module in-memory
+  _G.VX.reload(name?)       -> Hot-reload module or Kernel from GitHub
+  _G.VX.reloadAll()         -> Hot-reload all modules from GitHub
+  _G.VX.diag()              -> Print live diagnostics
+  _G.VX.getSetting(path)    -> Read setting
+  _G.VX.setSetting(p, v)    -> Write setting
+  _G.VX.resetAll()          -> Reset all settings to defaults
+  _G.VX.shutdown()          -> Cleanly stop all modules
+========================================]])
+end
+
 function VX.shutdown()
     VX._booted = false
+    if _noticeGui then
+        pcall(function() _noticeGui:Destroy() end)
+        _noticeGui = nil
+    end
     if _watchdogThread then
         pcall(task.cancel, _watchdogThread)
         _watchdogThread = nil
@@ -699,6 +971,9 @@ _bootOrder = _topoSort(loaded, MODULE_ORDER)
 _runLifecycle(_bootOrder, loaded)
 VX._booted = true
 
+local _copied = _copyCommunityUrl()
+_showCommunityPopup(_copied)
+
 print("========================================")
 print("  VX System Ready  —  v" .. VERSION)
 print("========================================")
@@ -729,7 +1004,7 @@ _watchdogThread = task.spawn(function()
                     if _failCounts[name] >= MAX_HEARTBEAT_FAILS then
                         warn("[VX] Watchdog restarting unhealthy module: " .. name)
                         _failCounts[name] = 0
-                        VX.reload(name)
+                        VX.restartModule(name)
                     end
                 end
             end
@@ -739,10 +1014,9 @@ end)
 
 -- ==================== HOTKEYS ====================
 
-local UIS = game:GetService("UserInputService")
 local panicStart = 0
 
-table.insert(_hotkeyConns, UIS.InputBegan:Connect(function(input, gp)
+table.insert(_hotkeyConns, UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
     local kc = input.KeyCode
     if kc == Enum.KeyCode.V and VX.Modules.UI and VX.Modules.UI.toggleVideoMode then
@@ -759,8 +1033,12 @@ table.insert(_hotkeyConns, UIS.InputBegan:Connect(function(input, gp)
     end
 end))
 
-table.insert(_hotkeyConns, UIS.InputEnded:Connect(function(input)
+table.insert(_hotkeyConns, UserInputService.InputEnded:Connect(function(input)
     if input.KeyCode == Enum.KeyCode.Backspace then
+        if UserInputService:GetFocusedTextBox() then
+            panicStart = 0
+            return
+        end
         if panicStart > 0 and (tick() - panicStart) >= 2 then
             VX.shutdown()
         end
