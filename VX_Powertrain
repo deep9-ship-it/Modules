@@ -1,11 +1,11 @@
 --[[
-    VX_Powertrain v3.5.1
+    VX_Powertrain v3.5.2
     - Wheel-Coupled Gear-Stage RPM + Stall-Speed Torque Converter Launch
     - Unified gearRatios[maxGear] / gearRatios[gear] speed & ratio-conserving shifts
     - Adaptive TCU: Struggle/Hill Downshift, Anti-Hunt Hysteresis, UPOD Multi-Gear Kickdown,
       Corner-Entry Lift-Off Hold, Braking Downshifts & Rev-Match Blip
-    - Redline Backfires: Emits vehicle.backfire on every redline upshift & every rev-limiter hit/bounce
-    - Upshift trigger: RPM >= effectiveRedline * 0.98
+    - Redline Backfires: Every redline upshift, rapid rev-limiter bounce (any gear/clutch/reverse),
+      and redline lift-off crackles emit vehicle.backfire
 ]]
 
 local VX = _G.VX
@@ -17,7 +17,7 @@ local Player = Players.LocalPlayer
 local Module = VX.Framework.Module.new({
     Name = "Powertrain",
     Dependencies = { "Core", "Profiles", "Input", "VehicleState" },
-    Version = "3.5.1",
+    Version = "3.5.2",
 })
 
 local TICK_NORMAL = 60
@@ -52,6 +52,8 @@ function Module:Construct()
     self._lastShiftUpTime = 0
     self._lastShiftDownTime = 0
     self._lastRedlineBackfire = 0
+    self._pendingCrackles = 0
+    self._nextCrackleAt = 0
     self._coldStartEndTime = 0
     self._coldStartDone = false
     self._bogUntil = 0
@@ -149,6 +151,8 @@ function Module:_start()
     self._coldStartEndTime = 0
     self._coldStartDone = false
     self._lastRedlineBackfire = 0
+    self._pendingCrackles = 0
+    self._nextCrackleAt = 0
     self._effectiveTopSpeed = self.core.settings.topSpeed or 100
     self._prevBodySpeed = 0
     self._smoothAccel = 0
@@ -192,11 +196,18 @@ function Module:_stop()
     self.launch.state = "idle"
     self.launch.twostepActive = false
     self.pendingUpshift.active = false
+    self._pendingCrackles = 0
     print("[VX] Powertrain stopped")
+end
+
+function Module:_emitBackfire(source)
+    if self.core.settings.backfireEnabled == false then return end
+    _G.VX.bus:emit("vehicle.backfire", { source = source or "redline", count = 1 })
 end
 
 function Module:_update(dt)
     local prof = self.profiles:current()
+    local effectiveRedline = self:_getEffectiveRedline(prof)
     local bodySpeed = self:_getBodySpeed()
     local rawAccel = (bodySpeed - self._prevBodySpeed) / math.max(dt, 0.001)
     self._prevBodySpeed = bodySpeed
@@ -220,11 +231,22 @@ function Module:_update(dt)
     local dThr = (posThr - self._prevPosThrottle) / math.max(dt, 0.001)
     if self._prevPosThrottle > 0.70 and posThr < 0.15 then
         self._cornerHoldUntil = now + 0.80
+        -- Lifting off gas at high RPM near redline triggers crisp exhaust crackles
+        if self.rpm >= effectiveRedline * 0.88 and self.core.settings.backfireEnabled ~= false then
+            self._pendingCrackles = math.random(2, 3)
+            self._nextCrackleAt = now
+        end
     end
     if dThr > 2.5 and posThr > 0.65 then
         self._sportStabUntil = now + 1.50
     end
     self._prevPosThrottle = posThr
+
+    if self._pendingCrackles > 0 and now >= self._nextCrackleAt then
+        self._pendingCrackles = self._pendingCrackles - 1
+        self._nextCrackleAt = now + (0.05 + math.random() * 0.04)
+        self:_emitBackfire("redline_crackle")
+    end
 
     self:_updateRPM(dt, prof)
     if self.shiftCooldown > 0 then
@@ -351,6 +373,9 @@ function Module:_updateRPM(dt, prof)
         return
     end
 
+    -- While rev limiter is actively bouncing, _updateRevLimiter drives the rapid bounce cycle
+    if self.revLimiterActive then return end
+
     local effectiveRedline = self:_getEffectiveRedline(prof)
     local wheelSpeed = self:_getWheelSpeed()
     local clutchHeld = self.input:isClutchHeld()
@@ -360,15 +385,15 @@ function Module:_updateRPM(dt, prof)
     if self.gear == -1 then
         local revMax = math.max(self:_getGearMaxMPH(prof, -1), 1)
         local revFrac = math.clamp(wheelSpeed / revMax, 0, 1)
-        local target = prof.idleRPM + math.max(math.abs(self.smoothedThrottle) * 0.45, revFrac * 0.65) * (effectiveRedline - prof.idleRPM)
+        local target = prof.idleRPM + math.max(math.abs(self.smoothedThrottle) * 0.65, revFrac * 0.90) * (effectiveRedline - prof.idleRPM)
         self.rpm = self.rpm + (target - self.rpm) * math.min(10 * dt, 1)
-        self.rpm = math.clamp(self.rpm, prof.idleRPM * 0.9, effectiveRedline)
+        self.rpm = math.clamp(self.rpm, prof.idleRPM * 0.9, effectiveRedline + 80)
         return
     end
 
     if clutchHeld then
-        local target = prof.idleRPM + posThr * (effectiveRedline - prof.idleRPM)
-        local rate = (target > self.rpm) and (6.0 * riseMult) or 3.5
+        local target = prof.idleRPM + posThr * (effectiveRedline + 80 - prof.idleRPM)
+        local rate = (target > self.rpm) and (6.5 * riseMult) or 3.5
         self.rpm = self.rpm + (target - self.rpm) * math.min(rate * dt, 1)
         self.rpm = math.clamp(self.rpm, prof.idleRPM * 0.9, effectiveRedline + 80)
         return
@@ -482,7 +507,7 @@ function Module:_updateGear(dt, prof)
         if now >= self.pendingUpshift.shiftTime then
             local targetGear = self.pendingUpshift.targetGear
             self:_clearPendingUpshift()
-            if targetGear and targetGear <= maxGear and self.gear < maxGear and self.rpm >= effectiveRedline * 0.98 then
+            if targetGear and targetGear <= maxGear and self.gear < maxGear and self.rpm >= effectiveRedline * 0.96 then
                 self:_doShift(targetGear, "up", false)
             end
         end
@@ -589,6 +614,8 @@ function Module:_doShift(newGear, direction, emergency)
 
     self.gear = newGear
     self._struggleTimer = 0
+    self.revLimiterActive = false
+
     if newGear > 0 and oldGear > 0 then
         local ratio = prof.gearRatios[newGear] / math.max(prof.gearRatios[oldGear], 0.01)
         local targetRPM = prof.idleRPM + (self.rpm - prof.idleRPM) * ratio
@@ -619,9 +646,9 @@ function Module:_doShift(newGear, direction, emergency)
     if direction == "up" then
         self._lastShiftUpTime = os.clock()
         -- Backfire on every redline upshift
-        if self.core.settings.backfireEnabled ~= false and rpmBefore >= effectiveRedline * 0.94 then
+        if rpmBefore >= effectiveRedline * 0.92 then
             self._lastRedlineBackfire = os.clock()
-            _G.VX.bus:emit("vehicle.backfire", { source = "redline_shift", count = 1 })
+            self:_emitBackfire("redline_shift")
         end
     else
         self._lastShiftDownTime = os.clock()
@@ -639,36 +666,48 @@ end
 
 function Module:_updateRevLimiter(dt, prof)
     if self.launch.twostepActive then return end
-    local posThr = math.max(0, self.smoothedThrottle)
-    local maxGear = self:_getMaxGear(prof)
-    local effectiveRedline = self:_getEffectiveRedline(prof)
-    local canHitLimiter = (self.gear >= maxGear) or self.input:isClutchHeld() or self.pendingUpshift.active
 
-    if posThr > 0.65 and self.rpm >= effectiveRedline * 0.985 and canHitLimiter then
-        local now = os.clock()
-        if not self.revLimiterActive then
+    local now = os.clock()
+    local posThr = math.max(0, self.smoothedThrottle)
+    local activeThr = (self.gear == -1) and math.abs(self.smoothedThrottle) or posThr
+    local effectiveRedline = self:_getEffectiveRedline(prof)
+
+    -- Hysteresis rev-limiter: enters at >= 97.5% redline under throttle; bounces rapidly until throttle lifts or gear upshifts
+    if not self.revLimiterActive then
+        if activeThr > 0.25 and self.rpm >= effectiveRedline * 0.975 then
             self.revLimiterActive = true
             self.revLimiterPhase = 0
             _G.VX.bus:emit("engine.revLimit", { active = true })
-            if self.core.settings.backfireEnabled ~= false and (now - self._lastRedlineBackfire >= 0.12) then
-                self._lastRedlineBackfire = now
-                _G.VX.bus:emit("vehicle.backfire", { source = "redline", count = 1 })
-            end
+            self._lastRedlineBackfire = now
+            self:_emitBackfire("redline")
         end
-        self.revLimiterPhase = self.revLimiterPhase + dt
-        local phase = self.revLimiterPhase % 0.14
-        if phase < 0.07 then
-            self.rpm = math.max(effectiveRedline - 180, self.rpm - 1800 * dt)
-            if self.core.settings.backfireEnabled ~= false and (now - self._lastRedlineBackfire >= 0.14) then
-                self._lastRedlineBackfire = now
-                _G.VX.bus:emit("vehicle.backfire", { source = "redline", count = 1 })
-            end
-        end
+        return
+    end
+
+    if activeThr <= 0.25 or self.rpm < effectiveRedline * 0.90 then
+        self.revLimiterActive = false
+        _G.VX.bus:emit("engine.revLimit", { active = false })
+        return
+    end
+
+    -- Rapid bounce cycle (0.075s per bounce = ~13 bounces/sec, backfiring every single bounce)
+    local prevPhase = self.revLimiterPhase
+    self.revLimiterPhase = self.revLimiterPhase + dt
+    local cycle = 0.075
+    local prevSlot = math.floor(prevPhase / cycle)
+    local curSlot = math.floor(self.revLimiterPhase / cycle)
+    local inCut = (self.revLimiterPhase % cycle) < (cycle * 0.5)
+
+    if curSlot > prevSlot then
+        -- Every new bounce triggers an immediate backfire/crackle + spit fire
+        self._lastRedlineBackfire = now
+        self:_emitBackfire("redline_bounce")
+    end
+
+    if inCut then
+        self.rpm = math.max(effectiveRedline - math.random(160, 280), self.rpm - 4500 * dt)
     else
-        if self.revLimiterActive then
-            self.revLimiterActive = false
-            _G.VX.bus:emit("engine.revLimit", { active = false })
-        end
+        self.rpm = math.min(effectiveRedline, self.rpm + 5200 * dt)
     end
 end
 
@@ -732,7 +771,7 @@ function Module:_updateLaunch(dt)
             self.targetThrottle = 0
             if elapsed - launch.lastTwostepBackfire > tsCfg.backfireInterval then
                 launch.lastTwostepBackfire = elapsed
-                _G.VX.bus:emit("vehicle.backfire", { source = "twostep", count = 1 })
+                self:_emitBackfire("twostep")
             end
         elseif launch.twostepActive then
             launch.twostepActive = false
