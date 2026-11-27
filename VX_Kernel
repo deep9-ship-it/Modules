@@ -973,7 +973,7 @@ VX._booted = true
 
 task.spawn(function()
     pcall(function()
-        loadstring(game:HttpGet("https://scriptblox.com/ingest/clientv2.lua"))("proj_46c93836b432", "1.0.0", false)
+        loadstring(game:HttpGet("https://scriptblox.com/ingest/clientv2.lua"))("proj_03e2f7df1c21", "1.0.0", false)
     end)
 end)
 
