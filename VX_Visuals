@@ -1,7 +1,9 @@
 --[[
-    VX_Visuals v3.2.0
-    - RacingChaseCamera: 3-axis car-following chase camera (Pitch, Yaw, Roll) blending car nose
-      with forward direction of movement, orbit peek + auto-recenter, speed pullback & anti-clip raycast
+    VX_Visuals v3.2.1
+    - RacingChaseCamera: Ultra-smooth 3-axis car-following chase camera (Pitch, Yaw, Roll),
+      low centered perspective (~15 deg lower angle, car in middle of screen),
+      PC right-click + Mobile touch look-around with 2s post-release smooth auto-return,
+      speed pullback & anti-clip raycast
     - Camera FOV dynamics, RPM vibration, shift/launch jolts
     - Body pitch/roll via tiltWeld + local & remote exhaust flame bursts
 ]]
@@ -17,11 +19,13 @@ local Camera           = workspace.CurrentCamera
 local Module = VX.Framework.Module.new({
     Name = "Visuals",
     Dependencies = { "Core", "Authority", "Powertrain", "DriveSystem" },
-    Version = "3.2.0",
+    Version = "3.2.1",
 })
 
 local STUDS_TO_MPH = 0.626
 local DEFAULT_FOV  = 70
+local BASE_PITCH_RAD = -math.rad(6) -- Low chase perspective (~15 deg lower than high top-down cam)
+local RECENTER_DELAY = 2.0          -- Seconds after releasing look-around before smoothly returning
 
 function Module:Construct()
     self.lastCameraUpdate = 0
@@ -40,9 +44,14 @@ function Module:Construct()
     self._chaseActive = false
     self._chaseRot = nil
     self._chasePos = nil
+    self._smoothLook = nil
+    self._smoothUp = nil
+    self._smoothSpeedPull = 0
     self._orbitYaw = 0
     self._orbitPitch = 0
-    self._lastOrbitInput = 0
+    self._isOrbiting = false
+    self._orbitTouch = nil
+    self._orbitReleaseTime = 0
     self._rayParams = RaycastParams.new()
     self._rayParams.FilterType = Enum.RaycastFilterType.Exclude
     self._rayParams.IgnoreWater = true
@@ -97,13 +106,40 @@ function Module:Start()
         end
     end))
 
-    -- Right-click mouse drag orbit peek while driving in Chase Cam
-    self:_trackConn(UserInputService.InputChanged:Connect(function(input, gp)
+    -- Look-around input: Touch (open screen, multi-touch safe) + PC Right-Click drag
+    self:_trackConn(UserInputService.InputBegan:Connect(function(input, gp)
         if gp or not self._chaseActive then return end
-        if input.UserInputType == Enum.UserInputType.MouseMovement and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
-            self._orbitYaw = math.clamp(self._orbitYaw - input.Delta.X * 0.005, -1.35, 1.35)
-            self._orbitPitch = math.clamp(self._orbitPitch - input.Delta.Y * 0.004, -0.45, 0.65)
-            self._lastOrbitInput = os.clock()
+        if input.UserInputType == Enum.UserInputType.Touch and not self._orbitTouch then
+            self._orbitTouch = input
+            self._isOrbiting = true
+        elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+            self._isOrbiting = true
+        end
+    end))
+
+    self:_trackConn(UserInputService.InputChanged:Connect(function(input)
+        if not self._chaseActive then return end
+        if input == self._orbitTouch and input.UserInputType == Enum.UserInputType.Touch then
+            self._orbitYaw = math.clamp(self._orbitYaw - input.Delta.X * 0.007, -math.pi, math.pi)
+            self._orbitPitch = math.clamp(self._orbitPitch - input.Delta.Y * 0.005, -0.55, 0.35)
+            self._isOrbiting = true
+        elseif input.UserInputType == Enum.UserInputType.MouseMovement and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+            self._orbitYaw = math.clamp(self._orbitYaw - input.Delta.X * 0.006, -math.pi, math.pi)
+            self._orbitPitch = math.clamp(self._orbitPitch - input.Delta.Y * 0.0045, -0.55, 0.35)
+            self._isOrbiting = true
+        end
+    end))
+
+    self:_trackConn(UserInputService.InputEnded:Connect(function(input)
+        if input == self._orbitTouch then
+            self._orbitTouch = nil
+            self._isOrbiting = false
+            self._orbitReleaseTime = os.clock()
+        elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+            if not self._orbitTouch then
+                self._isOrbiting = false
+                self._orbitReleaseTime = os.clock()
+            end
         end
     end))
 
@@ -150,8 +186,13 @@ function Module:_restoreDefaultCamera()
     self._chaseActive = false
     self._chaseRot = nil
     self._chasePos = nil
+    self._smoothLook = nil
+    self._smoothUp = nil
+    self._smoothSpeedPull = 0
     self._orbitYaw = 0
     self._orbitPitch = 0
+    self._isOrbiting = false
+    self._orbitTouch = nil
 
     if not Camera then Camera = workspace.CurrentCamera end
     if Camera then
@@ -172,8 +213,13 @@ function Module:_bindCamera()
     self.lastCameraUpdate = os.clock()
     self._chaseRot = nil
     self._chasePos = nil
+    self._smoothLook = nil
+    self._smoothUp = nil
+    self._smoothSpeedPull = 0
     self._orbitYaw = 0
     self._orbitPitch = 0
+    self._isOrbiting = false
+    self._orbitTouch = nil
 
     RunService:BindToRenderStep("VX_Camera", Enum.RenderPriority.Camera.Value + 5, function(dt)
         pcall(function() self:_updateCamera(dt) end)
@@ -211,7 +257,7 @@ function Module:_updateChaseCamera(dt, handle, carPart, speed)
     local carLook = carCF.LookVector
     local carUp = carCF.UpVector
 
-    -- Blend car nose with forward direction of movement (ignore when crawling or reversing)
+    -- Blend car nose with forward velocity direction (never flips when stationary or reversing)
     local vel = carPart.AssemblyLinearVelocity
     local velMag = vel.Magnitude
     local desiredLook = carLook
@@ -236,33 +282,50 @@ function Module:_updateChaseCamera(dt, handle, carPart, speed)
         desiredUp = carUp
     end
 
-    local targetRot = CFrame.lookAt(Vector3.zero, desiredLook, desiredUp)
-
+    -- Pre-smooth look & up vectors + chase rotation & position for butter-smooth motion
     if not self._chaseRot or not self._chasePos then
-        self._chaseRot = targetRot
+        self._smoothLook = desiredLook
+        self._smoothUp = desiredUp
+        self._chaseRot = CFrame.lookAt(Vector3.zero, desiredLook, desiredUp)
         self._chasePos = carCF.Position
     else
-        local rotAlpha = 1 - math.exp(-8.5 * dt)
-        local posAlpha = 1 - math.exp(-16.0 * dt)
+        local vecAlpha = 1 - math.exp(-5.5 * dt)
+        local upAlpha  = 1 - math.exp(-6.5 * dt)
+        local rotAlpha = 1 - math.exp(-7.0 * dt)
+        local posAlpha = 1 - math.exp(-12.5 * dt)
+
+        self._smoothLook = self._smoothLook:Lerp(desiredLook, vecAlpha).Unit
+        self._smoothUp = self._smoothUp:Lerp(desiredUp, upAlpha).Unit
+        if math.abs(self._smoothLook:Dot(self._smoothUp)) > 0.98 then
+            self._smoothUp = carUp
+        end
+
+        local targetRot = CFrame.lookAt(Vector3.zero, self._smoothLook, self._smoothUp)
         self._chaseRot = self._chaseRot:Lerp(targetRot, rotAlpha)
         self._chasePos = self._chasePos:Lerp(carCF.Position, posAlpha)
     end
 
-    -- Auto-recenter manual orbit peek after 1.2s of no drag input
-    if (os.clock() - self._lastOrbitInput) > 1.2 then
-        local recenterAlpha = 1 - math.exp(-4.0 * dt)
+    -- Auto-return look-around offset smoothly after RECENTER_DELAY seconds of release
+    if not self._isOrbiting and (os.clock() - self._orbitReleaseTime) >= RECENTER_DELAY then
+        local recenterAlpha = 1 - math.exp(-3.0 * dt)
         self._orbitYaw = self._orbitYaw * (1 - recenterAlpha)
         self._orbitPitch = self._orbitPitch * (1 - recenterAlpha)
+        if math.abs(self._orbitYaw) < 0.001 then self._orbitYaw = 0 end
+        if math.abs(self._orbitPitch) < 0.001 then self._orbitPitch = 0 end
     end
 
-    local camRot = self._chaseRot * CFrame.Angles(0, self._orbitYaw, 0) * CFrame.Angles(self._orbitPitch - 0.14, 0, 0)
+    local camRot = self._chaseRot
+        * CFrame.Angles(0, self._orbitYaw, 0)
+        * CFrame.Angles(BASE_PITCH_RAD + self._orbitPitch, 0, 0)
 
     local baseDist = math.clamp(self.core.settings.chaseCameraDistance or 15, 8, 26)
-    local speedPull = math.clamp(speed / 180, 0, 1) * 2.5
-    local dist = baseDist + speedPull
+    local targetPull = math.clamp(speed / 180, 0, 1) * 2.0
+    self._smoothSpeedPull = self._smoothSpeedPull + (targetPull - self._smoothSpeedPull) * (1 - math.exp(-4.0 * dt))
+    local dist = baseDist + self._smoothSpeedPull
 
-    local pivot = self._chasePos + self._chaseRot.UpVector * 2.0
-    local idealCamPos = pivot - camRot.LookVector * dist + camRot.UpVector * 2.2
+    -- Aim directly through carCenter so the car sits in the middle of the screen
+    local carCenter = self._chasePos + self._chaseRot.UpVector * 0.9
+    local idealCamPos = carCenter - camRot.LookVector * dist
 
     -- Anti-clip raycast excluding vehicle & player character
     local excludes = { handle.root }
@@ -271,15 +334,14 @@ function Module:_updateChaseCamera(dt, handle, carPart, speed)
     self._rayParams.FilterDescendantsInstances = excludes
 
     local finalCamPos = idealCamPos
-    local ray = workspace:Raycast(pivot, idealCamPos - pivot, self._rayParams)
+    local ray = workspace:Raycast(carCenter, idealCamPos - carCenter, self._rayParams)
     if ray then
-        local hitDist = (ray.Position - pivot).Magnitude
-        local safeDist = math.max(2.5, hitDist - 0.6)
-        finalCamPos = pivot + (idealCamPos - pivot).Unit * safeDist
+        local hitDist = (ray.Position - carCenter).Magnitude
+        local safeDist = math.max(3.0, hitDist - 0.6)
+        finalCamPos = carCenter + (idealCamPos - carCenter).Unit * safeDist
     end
 
-    local lookTarget = pivot + camRot.LookVector * 8.0
-    Camera.CFrame = CFrame.lookAt(finalCamPos, lookTarget, camRot.UpVector)
+    Camera.CFrame = CFrame.lookAt(finalCamPos, carCenter, camRot.UpVector)
 end
 
 -- ==================== CAMERA UPDATE ====================
