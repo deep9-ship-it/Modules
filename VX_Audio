@@ -1,19 +1,21 @@
 --[[
-    VX_Audio.lua — Engine Sound (Profile refRpm), Turbo Spool/Blowoff/Flutter, Shift Sounds, Backfires & Compressor
-    Version: 3.0.2
+    VX_Audio.lua — Continuous RPM Engine Pitch (MIN 0.14 for 5k/6k Ref Samples), Throttle Load Swell,
+                   Turbo Spool/Blowoff/Flutter, Shift Sounds, Backfires & Compressor
+    Version: 3.1.0
 ]]
 
 local VX = _G.VX
 if not VX or not VX.Framework then error("VX_Audio requires VX_Kernel") end
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local Debris = game:GetService("Debris")
 local Player = Players.LocalPlayer
 
 local Module = VX.Framework.Module.new({
     Name = "Audio",
     Dependencies = { "Core", "Profiles", "Remote", "Powertrain", "DriveSystem" },
-    Version = "3.0.2",
+    Version = "3.1.0",
 })
 
 local TURBO_SPOOL_ID   = "89818258229795"
@@ -22,20 +24,20 @@ local TURBO_BLOWOFF_ID = "75197887670820"
 local BACKFIRE_DEFAULT = "140562715692021"
 
 local MAX_ENGINE_PITCH = 3.0
-local MIN_ENGINE_PITCH = 0.5
+local MIN_ENGINE_PITCH = 0.14
 
 function Module:Construct()
     self.engineSound = nil
     self.engineSoundId = nil
     self.spoolSound = nil
 
-    self.fastRpm = 900
-    self.slowRpm = 900
-    self.fastRate = 40
-    self.slowRate = 15
+    self.fastRpm = 800
+    self.slowRpm = 800
+    self.fastRate = 28
+    self.slowRate = 16
 
     self.downshiftBoostUntil = 0
-    self.downshiftBoostAmt = 15
+    self.downshiftBoostAmt = 14
 
     self.lastShiftTime = 0
     self.lastBackfireTime = 0
@@ -55,8 +57,9 @@ function Module:Construct()
     self._compressorGain = 1.0
     self._smoothedSpoolVol = 0
     self._smoothedSpoolPitch = 0.5
+    self._smoothedLoad = 0.85
 
-    self._loopThread = nil
+    self._updateConn = nil
     self._running = false
     self._conns = {}
 
@@ -137,7 +140,7 @@ function Module:_registerDiagnostics()
     local D = _G.VX.diagnostics
     pcall(function()
         D.register("audio.enginePitch", {
-            fn = function() return { value = string.format("%.2f", self:getEnginePitch()), unit = "x", status = "normal" } end,
+            fn = function() return { value = string.format("%.3f", self:getEnginePitch()), unit = "x", status = "normal" } end,
             category = "Audio",
         }, "Audio")
         D.register("audio.backfires", {
@@ -188,16 +191,19 @@ function Module:_attach()
     self.slowRpm = prof.idleRPM
     self._smoothedSpoolVol = 0
     self._smoothedSpoolPitch = 0.5
+    self._smoothedLoad = 0.85
 
     self:_createEngineSound(prof)
     self:_createSpoolSound()
 
-    self._loopThread = task.spawn(function()
-        while self._running do
-            local dt = task.wait(1 / 60)
-            if dt > 0.1 then dt = 1 / 60 end
-            pcall(function() self:_update(dt) end)
-        end
+    if self._updateConn then
+        self._updateConn:Disconnect()
+        self._updateConn = nil
+    end
+    self._updateConn = RunService.Heartbeat:Connect(function(dt)
+        if not self._running then return end
+        if dt <= 0 or dt > 0.1 then dt = 1 / 60 end
+        pcall(function() self:_update(dt) end)
     end)
 
     print("[VX] Audio attached — engine: " .. prof.name)
@@ -207,9 +213,9 @@ function Module:_detach()
     if not self._running then return end
     self._running = false
 
-    if self._loopThread then
-        pcall(function() task.cancel(self._loopThread) end)
-        self._loopThread = nil
+    if self._updateConn then
+        self._updateConn:Disconnect()
+        self._updateConn = nil
     end
 
     self:_destroyEngineSound()
@@ -224,12 +230,16 @@ function Module:_createEngineSound(prof)
     local parent = self:_getSoundParent()
     if not parent then return end
 
+    local ref = prof.refRpm or 3500
+    local offset = 1 + (prof.pitchOffset or 0) + (self.core.settings.pitchOffset or 0)
+    local initPitch = math.clamp((prof.idleRPM / ref) * offset, MIN_ENGINE_PITCH, MAX_ENGINE_PITCH)
+
     local s = Instance.new("Sound")
     s.Name = "VX_Engine"
     s.SoundId = "rbxassetid://" .. tostring(prof.soundId)
-    s.Volume = self:_computeBaseVolume(prof)
+    s.Volume = self:_computeBaseVolume(prof) * self._smoothedLoad
     s.Looped = true
-    s.PlaybackSpeed = 1.0
+    s.PlaybackSpeed = initPitch
     s.RollOffMode = Enum.RollOffMode.Linear
     s.RollOffMaxDistance = 400
     s.RollOffMinDistance = 10
@@ -283,31 +293,32 @@ function Module:_update(dt)
     if not prof then return end
 
     local rpm = self.powertrain:getRPM()
+    local posThr = math.max(0, self.powertrain:getSmoothedThrottle() or 0)
 
     local fastRate = self.fastRate
     if os.clock() < self.downshiftBoostUntil then
         fastRate = fastRate + self.downshiftBoostAmt
+    elseif self.powertrain:isRevLimiting() then
+        fastRate = fastRate + 12
     end
 
     self.fastRpm = self.fastRpm + (rpm - self.fastRpm) * math.min(fastRate * dt, 1)
     self.slowRpm = self.slowRpm + (self.fastRpm - self.slowRpm) * math.min(self.slowRate * dt, 1)
 
-    local smoothRpm = self.slowRpm
-    if self.powertrain:isRevLimiting() then
-        smoothRpm = prof.redlineRPM
-    end
+    local targetLoad = 0.85 + posThr * 0.25
+    self._smoothedLoad = self._smoothedLoad + (targetLoad - self._smoothedLoad) * math.min(10 * dt, 1)
 
     if self.engineSound and self.engineSound.Parent then
         local ref = prof.refRpm or 3500
         local offset = 1 + (prof.pitchOffset or 0) + (self.core.settings.pitchOffset or 0)
-        local targetPitch = math.clamp((smoothRpm / ref) * offset, MIN_ENGINE_PITCH, MAX_ENGINE_PITCH)
-        if math.abs(self.engineSound.PlaybackSpeed - targetPitch) > 0.01 then
+        local targetPitch = math.clamp((self.slowRpm / ref) * offset, MIN_ENGINE_PITCH, MAX_ENGINE_PITCH)
+        if math.abs(self.engineSound.PlaybackSpeed - targetPitch) > 0.001 then
             self.engineSound.PlaybackSpeed = targetPitch
         end
 
         local baseVol = self:_computeBaseVolume(prof)
-        local modulated = baseVol * self._compressorGain
-        if math.abs(self.engineSound.Volume - modulated) > 0.01 then
+        local modulated = math.clamp(baseVol * self._smoothedLoad * self._compressorGain, 0, 1)
+        if math.abs(self.engineSound.Volume - modulated) > 0.002 then
             self.engineSound.Volume = modulated
         end
     end
@@ -392,7 +403,7 @@ end
 function Module:_onBackfire(evt)
     if self.core.settings.backfireEnabled == false then return end
     local now = os.clock()
-    local count = (evt and evt.count) or 1
+    local count = math.min((evt and evt.count) or 1, 5)
     if now - self.lastBackfireTime < self._cooldowns.backfire then return end
     self.lastBackfireTime = now
 
@@ -400,7 +411,7 @@ function Module:_onBackfire(evt)
     local soundIds = (prof and prof.backfireSoundIds) or { BACKFIRE_DEFAULT }
     local parent = self:_getSoundParent()
 
-    for i = 1, math.min(count, 5) do
+    local function fireOne()
         local id = soundIds[math.random(1, #soundIds)]
         local vol = (0.6 + math.random() * 0.4) * (self.core.settings.masterVolume or 1.0) * self._compressorGain
         local pitch = 0.85 + math.random() * 0.3
@@ -408,9 +419,17 @@ function Module:_onBackfire(evt)
         pcall(function()
             self.remote:playSound(id, vol, pitch, parent)
         end)
-        if i < count then
-            task.wait(math.random(20, 50) / 1000)
-        end
+    end
+
+    fireOne()
+    if count > 1 then
+        task.spawn(function()
+            for i = 2, count do
+                task.wait(math.random(20, 50) / 1000)
+                if not self._running then break end
+                fireOne()
+            end
+        end)
     end
 end
 
