@@ -1,7 +1,7 @@
 --[[
-    VX_DriveSystem.lua — Mass-Calibrated HP/RPM Tractive Force, Second-Half-Gear Drag Resistance,
+    VX_DriveSystem.lua — Mass-Calibrated HP/RPM Tractive Force, True G-Force Wheel Accel,
                          Auto/Custom HP, Realistic Turbo Lag/Flutter/Blowoff & Ackermann Steering
-    Version: 3.5.1
+    Version: 3.5.2
 ]]
 
 local VX = _G.VX
@@ -12,13 +12,14 @@ end
 local Module = VX.Framework.Module.new({
     Name = "DriveSystem",
     Dependencies = { "Core", "Profiles", "Authority", "Powertrain", "VehicleState" },
-    Version = "3.5.1",
+    Version = "3.5.2",
 })
 
 local TICK_NORMAL = 60
 local TICK_LOW = 30
 local STUDS_TO_MPH = 0.626
 local MPH_TO_STUDS = 1 / 0.626
+local G_STUDS = 35.05
 local DEFAULT_WHEEL_RADIUS = 1.65
 local DEFAULT_VEHICLE_MASS = 150
 local BASE_TORQUE_CALIBRATION = 26000
@@ -362,7 +363,6 @@ function Module:_updateSteering(dt, handle, speed)
         maxAngle = maxAngle * math.max(0.35, decay)
     end
 
-    -- Polarity fix: Left=-1 -> +Y (Left), Right=+1 -> -Y (Right)
     local targetAngle = -math.clamp(rawSteer * maxAngle * sens, -maxAngle, maxAngle)
     self.steerAngle = self.steerAngle + (targetAngle - self.steerAngle) * math.min(turnSpeed * dt, 1)
 
@@ -475,7 +475,9 @@ function Module:_update(dt)
     local drivetrain = settings.drivetrain or "AWD"
 
     local bodySpeed = self:_getBodySpeedMPH(handle)
-    self.wheelSpeed = self:_getDrivenWheelMPH(handle, drivetrain)
+    local rawWheelMPH = self:_getDrivenWheelMPH(handle, drivetrain)
+    local wsRate = (rawWheelMPH > self.wheelSpeed) and 8.0 or 12.0
+    self.wheelSpeed = self.wheelSpeed + (rawWheelMPH - self.wheelSpeed) * math.min(wsRate * dt, 1)
 
     local targetTop = math.max(settings.topSpeed or 100, 10)
     if bodySpeed < 3 then
@@ -504,9 +506,9 @@ function Module:_update(dt)
     local effHP = self:_computeEffectiveHP(effTop, prof, stageCfg)
     self._currentHP = effHP
 
-    local ratios = prof.gearRatios or { 3.85, 2.20, 1.55, 1.20, 0.95, 0.80, 0.65 }
+    local ratios = prof.gearRatios or { 3.65, 2.28, 1.62, 1.25, 1.00, 0.84, 0.70 }
     local maxGear = #ratios
-    local topRatio = ratios[maxGear] or 0.65
+    local topRatio = ratios[maxGear] or 0.70
     local curRatio = ratios[math.clamp(math.abs(gear), 1, maxGear)] or topRatio
 
     local gearAngular = 0
@@ -539,10 +541,10 @@ function Module:_update(dt)
     local launchBonus = (os.clock() < self._launchBurstUntil) and self._launchBurstMult or 1.0
 
     local rpmDenom = math.max(rpm / 4500, 0.55)
-    local rawDriveG = 0.0025 * effHP * torqueCurve * curRatio * rwdEfficiency * launchBonus * slopeLoad / rpmDenom
+    local rawDriveG = 0.0028 * effHP * torqueCurve * curRatio * rwdEfficiency * launchBonus * slopeLoad / rpmDenom
 
     local avgGrip = ((settings.frontGrip or 1.0) + (settings.rearGrip or 0.9)) * 0.5
-    local dtTraction = (drivetrain == "AWD") and 1.10 or ((drivetrain == "RWD") and 0.92 or 0.80)
+    local dtTraction = (drivetrain == "AWD") and 1.05 or ((drivetrain == "RWD") and 0.90 or 0.78)
     local tractionCapG = dtTraction * math.clamp(avgGrip, 0.5, 2.5)
 
     local tcsMult = 1.0
@@ -553,9 +555,10 @@ function Module:_update(dt)
         end
     end
 
-    local dragG = 0.0000075 * (bodySpeed * bodySpeed) + 0.012
+    -- Light internal drag resistance (works alongside VX_Chassis aeroDrag without double-counting or stalling)
+    local dragG = 0.0000035 * (bodySpeed * bodySpeed) + 0.008
     local cappedDriveG = math.min(rawDriveG, tractionCapG) * tcsMult * math.min(posThr, 1)
-    local netG = math.max(0, cappedDriveG - dragG)
+    local netG = math.max(0.02 * posThr, cappedDriveG - dragG)
 
     local drivenCount = 0
     for _, w in ipairs(handle.wheels or {}) do
@@ -566,11 +569,12 @@ function Module:_update(dt)
     end
     drivenCount = math.max(drivenCount, 1)
 
-    -- Calibrate Roblox MotorMaxTorque & MotorMaxAngularAcceleration so wheels overcome ground friction smoothly
     local massFactor = math.max(1.0, self._vehicleMass / 150)
-    local perWheelDriveTorque = (BASE_TORQUE_CALIBRATION * massFactor * (netG + 0.15)) * (4 / drivenCount) * (self._wheelRadius / 1.65)
+    local perWheelDriveTorque = (BASE_TORQUE_CALIBRATION * massFactor * (netG + 0.14)) * (4 / drivenCount) * (self._wheelRadius / 1.65)
     local brakeTorque = math.max(BASE_BRAKE_TORQUE * 0.65, 45000 * massFactor) * (settings.brakingPower or 0.75) * brakeMult
-    local motorAngAccel = math.max(22, netG * 65)
+
+    -- True physics G-force angular acceleration: 1G = G_STUDS / wheelRadius (~21.2 rad/s^2)
+    local motorAngAccel = math.max(4.5, (netG * G_STUDS / self._wheelRadius) * 1.15)
 
     for _, w in ipairs(handle.wheels or {}) do
         local isDriven = (drivetrain == "AWD")
@@ -593,13 +597,13 @@ function Module:_update(dt)
             mode = "drive"
             angular = (effTop * MPH_TO_STUDS) / self._wheelRadius
             torque = brakeTorque * 0.45 * governorBrake
-            angAccel = 45
+            angAccel = 35
         elseif gear == -1 then
             if throttle < -0.05 and isDriven then
                 mode = "drive"
                 angular = gearAngular
-                torque = (BASE_TORQUE_CALIBRATION * massFactor * 0.65) * (4 / drivenCount) * math.min(math.abs(throttle), 1)
-                angAccel = 28
+                torque = (BASE_TORQUE_CALIBRATION * massFactor * 0.55) * (4 / drivenCount) * math.min(math.abs(throttle), 1)
+                angAccel = 14
             elseif throttle > 0.05 then
                 mode = "brake"
                 angular = 0
@@ -608,13 +612,9 @@ function Module:_update(dt)
             end
         else
             if posThr > 0.05 and isDriven then
-                if netG <= 0.002 and bodySpeed > 8 then
-                    mode = "coast"
-                else
-                    mode = "drive"
-                    angular = gearAngular
-                    torque = perWheelDriveTorque
-                end
+                mode = "drive"
+                angular = gearAngular
+                torque = perWheelDriveTorque
             elseif throttle < -0.05 then
                 mode = "brake"
                 angular = 0
