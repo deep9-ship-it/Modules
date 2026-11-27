@@ -1,25 +1,27 @@
 --[[
-    VX_Visuals v3.1.1
-    Camera effects + body tilt + exhaust flame VFX.
-    - Every backfire spits fire locally AND via Remote:fireBoostPulse() (0.03s gate)
-    - Sequence-guarded flame off-timer so rapid redline bounces keep fire spitting continuously
+    VX_Visuals v3.2.0
+    - RacingChaseCamera: 3-axis car-following chase camera (Pitch, Yaw, Roll) blending car nose
+      with forward direction of movement, orbit peek + auto-recenter, speed pullback & anti-clip raycast
+    - Camera FOV dynamics, RPM vibration, shift/launch jolts
+    - Body pitch/roll via tiltWeld + local & remote exhaust flame bursts
 ]]
 
 local VX = _G.VX
 if not VX or not VX.Framework then error("VX_Visuals requires VX_Kernel") end
 
-local RunService = game:GetService("RunService")
-local Camera     = workspace.CurrentCamera
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Camera           = workspace.CurrentCamera
 
 local Module = VX.Framework.Module.new({
     Name = "Visuals",
     Dependencies = { "Core", "Authority", "Powertrain", "DriveSystem" },
-    Version = "3.1.1",
+    Version = "3.2.0",
 })
 
 local STUDS_TO_MPH = 0.626
 local DEFAULT_FOV  = 70
-local DEFAULT_SENSITIVITY = 1.0
 
 function Module:Construct()
     self.lastCameraUpdate = 0
@@ -33,6 +35,17 @@ function Module:Construct()
     self._flameSeq = 0
     self._renderBound = false
     self._conns = {}
+
+    -- Racing Chase Camera state
+    self._chaseActive = false
+    self._chaseRot = nil
+    self._chasePos = nil
+    self._orbitYaw = 0
+    self._orbitPitch = 0
+    self._lastOrbitInput = 0
+    self._rayParams = RaycastParams.new()
+    self._rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    self._rayParams.IgnoreWater = true
 end
 
 function Module:Init(deps)
@@ -78,6 +91,22 @@ function Module:Start()
         self:fireExhaustFlame()
     end))
 
+    self:_trackConn(_G.VX.bus:on("settings.changed", function(evt)
+        if evt and evt.path == "racingChaseCamera" and evt.new == false then
+            self:_restoreDefaultCamera()
+        end
+    end))
+
+    -- Right-click mouse drag orbit peek while driving in Chase Cam
+    self:_trackConn(UserInputService.InputChanged:Connect(function(input, gp)
+        if gp or not self._chaseActive then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+            self._orbitYaw = math.clamp(self._orbitYaw - input.Delta.X * 0.005, -1.35, 1.35)
+            self._orbitPitch = math.clamp(self._orbitPitch - input.Delta.Y * 0.004, -0.45, 0.65)
+            self._lastOrbitInput = os.clock()
+        end
+    end))
+
     local auth = self.authority
     if auth and auth:getHandle() then
         self:_bindCamera()
@@ -108,17 +137,45 @@ function Module:_registerDiagnostics()
             fn = function() return { value = string.format("%.1f", self.currentFOV), unit = "deg", status = "normal" } end,
             category = "Visuals",
         }, "Visuals")
+        D.register("visuals.chaseCam", {
+            fn = function() return { value = self._chaseActive and "ON" or "OFF", unit = "", status = "normal" } end,
+            category = "Visuals",
+        }, "Visuals")
     end)
 end
 
--- ==================== CAMERA BIND ====================
+-- ==================== CAMERA BIND & RESTORE ====================
+function Module:_restoreDefaultCamera()
+    if not self._chaseActive then return end
+    self._chaseActive = false
+    self._chaseRot = nil
+    self._chasePos = nil
+    self._orbitYaw = 0
+    self._orbitPitch = 0
+
+    if not Camera then Camera = workspace.CurrentCamera end
+    if Camera then
+        Camera.CameraType = Enum.CameraType.Custom
+        local player = Players.LocalPlayer
+        local char = player and player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            Camera.CameraSubject = hum
+        end
+    end
+end
+
 function Module:_bindCamera()
     if self._renderBound then return end
     self._renderBound = true
     self.currentFOV = Camera and Camera.FieldOfView or DEFAULT_FOV
     self.lastCameraUpdate = os.clock()
+    self._chaseRot = nil
+    self._chasePos = nil
+    self._orbitYaw = 0
+    self._orbitPitch = 0
 
-    RunService:BindToRenderStep("VX_Camera", 300, function(dt)
+    RunService:BindToRenderStep("VX_Camera", Enum.RenderPriority.Camera.Value + 5, function(dt)
         pcall(function() self:_updateCamera(dt) end)
     end)
     print("[VX] Visuals camera bound")
@@ -128,6 +185,8 @@ function Module:_unbindCamera()
     if not self._renderBound then return end
     self._renderBound = false
     pcall(function() RunService:UnbindFromRenderStep("VX_Camera") end)
+
+    self:_restoreDefaultCamera()
 
     if Camera then Camera.FieldOfView = DEFAULT_FOV end
     self.joltOffset = Vector3.new()
@@ -140,6 +199,89 @@ function Module:_unbindCamera()
     print("[VX] Visuals camera unbound")
 end
 
+-- ==================== 3-AXIS RACING CHASE CAMERA ====================
+function Module:_updateChaseCamera(dt, handle, carPart, speed)
+    if not Camera then return end
+    if Camera.CameraType ~= Enum.CameraType.Scriptable then
+        Camera.CameraType = Enum.CameraType.Scriptable
+    end
+    self._chaseActive = true
+
+    local carCF = carPart.CFrame
+    local carLook = carCF.LookVector
+    local carUp = carCF.UpVector
+
+    -- Blend car nose with forward direction of movement (ignore when crawling or reversing)
+    local vel = carPart.AssemblyLinearVelocity
+    local velMag = vel.Magnitude
+    local desiredLook = carLook
+    if velMag > 8 then
+        local velDir = vel / velMag
+        if carLook:Dot(velDir) > 0.25 then
+            local velBlend = math.clamp((speed - 5) / 35, 0, 0.55)
+            desiredLook = carLook:Lerp(velDir, velBlend).Unit
+        end
+    end
+
+    -- All-axis car pitch, yaw & roll following
+    local rollWeight = math.clamp(self.core.settings.chaseCameraRoll or 0.7, 0, 1)
+    local worldUp = Vector3.new(0, 1, 0)
+    local desiredUp
+    if carUp:Dot(worldUp) < 0.15 then
+        desiredUp = carUp
+    else
+        desiredUp = worldUp:Lerp(carUp, rollWeight).Unit
+    end
+    if math.abs(desiredLook:Dot(desiredUp)) > 0.98 then
+        desiredUp = carUp
+    end
+
+    local targetRot = CFrame.lookAt(Vector3.zero, desiredLook, desiredUp)
+
+    if not self._chaseRot or not self._chasePos then
+        self._chaseRot = targetRot
+        self._chasePos = carCF.Position
+    else
+        local rotAlpha = 1 - math.exp(-8.5 * dt)
+        local posAlpha = 1 - math.exp(-16.0 * dt)
+        self._chaseRot = self._chaseRot:Lerp(targetRot, rotAlpha)
+        self._chasePos = self._chasePos:Lerp(carCF.Position, posAlpha)
+    end
+
+    -- Auto-recenter manual orbit peek after 1.2s of no drag input
+    if (os.clock() - self._lastOrbitInput) > 1.2 then
+        local recenterAlpha = 1 - math.exp(-4.0 * dt)
+        self._orbitYaw = self._orbitYaw * (1 - recenterAlpha)
+        self._orbitPitch = self._orbitPitch * (1 - recenterAlpha)
+    end
+
+    local camRot = self._chaseRot * CFrame.Angles(0, self._orbitYaw, 0) * CFrame.Angles(self._orbitPitch - 0.14, 0, 0)
+
+    local baseDist = math.clamp(self.core.settings.chaseCameraDistance or 15, 8, 26)
+    local speedPull = math.clamp(speed / 180, 0, 1) * 2.5
+    local dist = baseDist + speedPull
+
+    local pivot = self._chasePos + self._chaseRot.UpVector * 2.0
+    local idealCamPos = pivot - camRot.LookVector * dist + camRot.UpVector * 2.2
+
+    -- Anti-clip raycast excluding vehicle & player character
+    local excludes = { handle.root }
+    local char = Players.LocalPlayer and Players.LocalPlayer.Character
+    if char then table.insert(excludes, char) end
+    self._rayParams.FilterDescendantsInstances = excludes
+
+    local finalCamPos = idealCamPos
+    local ray = workspace:Raycast(pivot, idealCamPos - pivot, self._rayParams)
+    if ray then
+        local hitDist = (ray.Position - pivot).Magnitude
+        local safeDist = math.max(2.5, hitDist - 0.6)
+        finalCamPos = pivot + (idealCamPos - pivot).Unit * safeDist
+    end
+
+    local lookTarget = pivot + camRot.LookVector * 8.0
+    Camera.CFrame = CFrame.lookAt(finalCamPos, lookTarget, camRot.UpVector)
+end
+
 -- ==================== CAMERA UPDATE ====================
 function Module:_updateCamera(dt)
     if not Camera then Camera = workspace.CurrentCamera end
@@ -147,7 +289,10 @@ function Module:_updateCamera(dt)
     if dt > 0.1 then dt = 0.016 end
 
     local handle = self.authority:getHandle()
-    if not handle or not handle.root then return end
+    if not handle or not handle.root then
+        self:_restoreDefaultCamera()
+        return
+    end
 
     local settings = self.core.settings
     local cfg = self.core.config.cameraFx
@@ -156,6 +301,12 @@ function Module:_updateCamera(dt)
     if part then
         local v = part.AssemblyLinearVelocity
         speed = Vector3.new(v.X, 0, v.Z).Magnitude * STUDS_TO_MPH
+    end
+
+    if settings.racingChaseCamera and part then
+        self:_updateChaseCamera(dt, handle, part, speed)
+    else
+        self:_restoreDefaultCamera()
     end
 
     if settings.fovDynamicsEnabled then
