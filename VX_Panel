@@ -1,6 +1,6 @@
 --[[
     VX_Panel.lua — GT3 Carbon Left-Side Tuning Panel (6 Tabs: Dynamics, Physics, Audio, Engine, Controls, Lights)
-    Version: 3.4.2
+    Version: 3.4.3
 ]]
 
 local VX = _G.VX
@@ -17,7 +17,7 @@ local UserInputService = game:GetService("UserInputService")
 local Module = VX.Framework.Module.new({
     Name = "Panel",
     Dependencies = { "Core", "Profiles", "Powertrain", "DriveSystem", "Chassis", "UI" },
-    Version = "3.4.2",
+    Version = "3.4.3",
 })
 
 local GT3 = {
@@ -76,7 +76,24 @@ function Module:_trackConn(conn)
     return conn
 end
 
+function Module:_trackTabConn(conn)
+    if conn then table.insert(self._tabConns, conn) end
+    return conn
+end
+
+function Module:_clearTabConns()
+    for _, c in ipairs(self._tabConns) do
+        if typeof(c) == "RBXScriptConnection" then
+            c:Disconnect()
+        elseif type(c) == "table" and c.Disconnect then
+            c:Disconnect()
+        end
+    end
+    self._tabConns = {}
+end
+
 function Module:_clearConns()
+    self:_clearTabConns()
     for _, c in ipairs(self._conns) do
         if typeof(c) == "RBXScriptConnection" then
             c:Disconnect()
@@ -103,11 +120,13 @@ function Module:_formatNumber(path, value, schema)
         return string.format("%d%%", math.floor(v * 100 + 0.5))
     elseif path == "pitchOffset" then
         return string.format("%+d%%", math.floor(v * 100 + 0.5))
+    elseif path == "chaseCameraDistance" then
+        return string.format("%d st", math.floor(v + 0.5))
     elseif path == "topSpeed" or path == "lightSpeed" or (schema and schema.step and schema.step >= 1) then
         return string.format("%d", math.floor(v + 0.5))
     elseif path == "frontGrip" or path == "rearGrip" then
         return string.format("%.2f", v)
-    elseif path == "brakeSpeed" or path == "brakingPower" then
+    elseif path == "brakeSpeed" or path == "brakingPower" or path == "chaseCameraRoll" then
         return string.format("%.1f", v)
     elseif path == "turboCustomMultiplier" then
         return string.format("%.1fx", v)
@@ -124,6 +143,7 @@ end
 
 function Module:Construct()
     self._conns = {}
+    self._tabConns = {}
     self._gui = nil
     self._panel = nil
     self._toggleBtn = nil
@@ -329,7 +349,7 @@ function Module:_createPanel()
     self._panel = panel
 
     local sizeConstraint = Instance.new("UISizeConstraint")
-    sizeConstraint.MinSize = Vector2.new(330, 360)
+    sizeConstraint.MinSize = Vector2.new(300, 280)
     sizeConstraint.MaxSize = Vector2.new(384, 600)
     sizeConstraint.Parent = panel
 
@@ -519,6 +539,7 @@ function Module:toggle()
 end
 
 function Module:_switchTab(tabName)
+    self:_clearTabConns()
     self._activeTab = tabName
     self._rowUpdaters = {}
     self._profileCards = {}
@@ -628,7 +649,7 @@ function Module:_addSettingRow(path, customLabel)
         sync(false)
         self._rowUpdaters[path] = function() sync(true) end
 
-        self:_trackConn(switch.MouseButton1Click:Connect(function()
+        self:_trackTabConn(switch.MouseButton1Click:Connect(function()
             _G.VX.setSetting(path, not (_G.VX.getSetting(path) == true))
             sync(true)
         end))
@@ -685,8 +706,8 @@ function Module:_addSettingRow(path, customLabel)
             _G.VX.setSetting(path, opts[idx])
             sync()
         end
-        self:_trackConn(prevBtn.MouseButton1Click:Connect(function() stepOpt(-1) end))
-        self:_trackConn(nextBtn.MouseButton1Click:Connect(function() stepOpt(1) end))
+        self:_trackTabConn(prevBtn.MouseButton1Click:Connect(function() stepOpt(-1) end))
+        self:_trackTabConn(nextBtn.MouseButton1Click:Connect(function() stepOpt(1) end))
 
     elseif isSegmented then
         local holder = Instance.new("Frame")
@@ -729,7 +750,7 @@ function Module:_addSettingRow(path, customLabel)
             b.Parent = holder
             _corner(b, 5)
             btns[item.val] = b
-            self:_trackConn(b.MouseButton1Click:Connect(function()
+            self:_trackTabConn(b.MouseButton1Click:Connect(function()
                 _G.VX.setSetting(path, item.val)
             end))
         end
@@ -829,8 +850,8 @@ function Module:_addSettingRow(path, customLabel)
             sync()
         end
 
-        self:_trackConn(minusBtn.MouseButton1Click:Connect(function() nudge(-step) end))
-        self:_trackConn(plusBtn.MouseButton1Click:Connect(function() nudge(step) end))
+        self:_trackTabConn(minusBtn.MouseButton1Click:Connect(function() nudge(-step) end))
+        self:_trackTabConn(plusBtn.MouseButton1Click:Connect(function() nudge(step) end))
 
         local dragging = false
         local function applyX(x)
@@ -839,18 +860,18 @@ function Module:_addSettingRow(path, customLabel)
             sync()
         end
 
-        self:_trackConn(track.InputBegan:Connect(function(inp)
+        self:_trackTabConn(track.InputBegan:Connect(function(inp)
             if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
                 dragging = true
                 applyX(inp.Position.X)
             end
         end))
-        self:_trackConn(UserInputService.InputChanged:Connect(function(inp)
+        self:_trackTabConn(UserInputService.InputChanged:Connect(function(inp)
             if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
                 applyX(inp.Position.X)
             end
         end))
-        self:_trackConn(UserInputService.InputEnded:Connect(function(inp)
+        self:_trackTabConn(UserInputService.InputEnded:Connect(function(inp)
             if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
                 dragging = false
             end
@@ -941,7 +962,7 @@ function Module:_buildEngine()
         subLbl.Parent = b
 
         self._profileCards[i] = { btn = b, nameLbl = nameLbl, subLbl = subLbl }
-        self:_trackConn(b.MouseButton1Click:Connect(function()
+        self:_trackTabConn(b.MouseButton1Click:Connect(function()
             if self:_getSpeed() > 5 then
                 self.ui:notify("ENGINE", "Can't change while moving", GT3.amber, 1.5)
                 return
@@ -963,6 +984,12 @@ function Module:_buildEngine()
 end
 
 function Module:_buildControls()
+    self:_addSection("Camera")
+    self:_addSettingRow("racingChaseCamera", "Racing Chase Camera")
+    self:_addSettingRow("chaseCameraDistance", "Chase Cam Distance")
+    self:_addSettingRow("chaseCameraRoll", "Chase Cam 3-Axis Roll")
+    self:_addSettingRow("fovDynamicsEnabled", "FOV Dynamics")
+
     self:_addSection("Controls & Shifting")
     self:_addSettingRow("topSpeed", "Top Speed")
     self:_addSettingRow("launchControlEnabled", "Launch Control")
@@ -971,7 +998,6 @@ function Module:_buildControls()
     self:_addSettingRow("shiftingJolt", "Shifting Jolt")
     self:_addSettingRow("vehicleShaking", "Vehicle Shaking")
     self:_addSettingRow("ghostModeEnabled", "Ghost Mode")
-    self:_addSettingRow("fovDynamicsEnabled", "FOV Dynamics")
     self:_addSettingRow("highSpeedSteerReduction", "High Speed Steer Reduction")
     self:_addSettingRow("reductionFactor", "Reduction Factor")
     self:_addSettingRow("realisticTurboEnabled", "Realistic Turbo")
