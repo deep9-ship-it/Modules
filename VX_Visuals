@@ -1,11 +1,12 @@
 --[[
-    VX_Visuals v3.2.1
+    VX_Visuals v3.2.2
     - RacingChaseCamera: Ultra-smooth 3-axis car-following chase camera (Pitch, Yaw, Roll),
       low centered perspective (~15 deg lower angle, car in middle of screen),
       PC right-click + Mobile touch look-around with 2s post-release smooth auto-return,
       speed pullback & anti-clip raycast
-    - Camera FOV dynamics, RPM vibration, shift/launch jolts
-    - Body pitch/roll via tiltWeld + local & remote exhaust flame bursts
+    - 15s Idle Showcase Camera (active whenever RacingChaseCamera is ON):
+      4-shot cinematic orbit cycle with smooth dolly transitions, telephoto FOV & seamless drive exit
+    - Camera FOV dynamics, RPM vibration, shift/launch jolts, body tilt & exhaust flames
 ]]
 
 local VX = _G.VX
@@ -19,13 +20,31 @@ local Camera           = workspace.CurrentCamera
 local Module = VX.Framework.Module.new({
     Name = "Visuals",
     Dependencies = { "Core", "Authority", "Powertrain", "DriveSystem" },
-    Version = "3.2.1",
+    Version = "3.2.2",
 })
 
 local STUDS_TO_MPH = 0.626
 local DEFAULT_FOV  = 70
-local BASE_PITCH_RAD = -math.rad(6) -- Low chase perspective (~15 deg lower than high top-down cam)
-local RECENTER_DELAY = 2.0          -- Seconds after releasing look-around before smoothly returning
+local BASE_PITCH_RAD = -math.rad(6)
+local RECENTER_DELAY = 2.0
+local IDLE_SHOWCASE_DELAY = 15.0
+local SHOWCASE_SHOT_DURATION = 6.5
+
+local SHOWCASE_SHOTS = {
+    { yawStart = 0.65,  yawRate = 0.20, pitch = -math.rad(6),  distMult = 0.88, roll = math.rad(3.0),  fov = 62, focusSide = 0.0, focusFwd = 0.5 },
+    { yawStart = 1.35,  yawRate = 0.14, pitch = -math.rad(3),  distMult = 0.74, roll = math.rad(-2.0), fov = 58, focusSide = 0.4, focusFwd = 1.0 },
+    { yawStart = 2.65,  yawRate = 0.18, pitch = -math.rad(13), distMult = 1.02, roll = math.rad(2.5),  fov = 65, focusSide = 0.0, focusFwd = -0.6 },
+    { yawStart = -1.20, yawRate = 0.16, pitch = -math.rad(20), distMult = 1.18, roll = 0.0,            fov = 68, focusSide = 0.0, focusFwd = 0.0 },
+}
+
+local function _wrapAngle(a)
+    return ((a + math.pi) % (2 * math.pi)) - math.pi
+end
+
+local function _lerpAngle(a, b, t)
+    local diff = _wrapAngle(b - a)
+    return a + diff * t
+end
 
 function Module:Construct()
     self.lastCameraUpdate = 0
@@ -52,6 +71,21 @@ function Module:Construct()
     self._isOrbiting = false
     self._orbitTouch = nil
     self._orbitReleaseTime = 0
+
+    -- Idle Showcase state
+    self._idleTimer = 0
+    self._showcaseActive = false
+    self._scShotIndex = 1
+    self._scShotTimer = 0
+    self._scOrbitOffset = 0
+    self._scYaw = 0
+    self._scPitch = BASE_PITCH_RAD
+    self._scDistMult = 1.0
+    self._scRoll = 0
+    self._scFov = DEFAULT_FOV
+    self._scFocusSide = 0
+    self._scFocusFwd = 0
+
     self._rayParams = RaycastParams.new()
     self._rayParams.FilterType = Enum.RaycastFilterType.Exclude
     self._rayParams.IgnoreWater = true
@@ -106,14 +140,17 @@ function Module:Start()
         end
     end))
 
-    -- Look-around input: Touch (open screen, multi-touch safe) + PC Right-Click drag
     self:_trackConn(UserInputService.InputBegan:Connect(function(input, gp)
         if gp or not self._chaseActive then return end
         if input.UserInputType == Enum.UserInputType.Touch and not self._orbitTouch then
             self._orbitTouch = input
             self._isOrbiting = true
+            self._idleTimer = 0
+            if self._showcaseActive then self:_exitShowcase() end
         elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
             self._isOrbiting = true
+            self._idleTimer = 0
+            if self._showcaseActive then self:_exitShowcase() end
         end
     end))
 
@@ -123,10 +160,12 @@ function Module:Start()
             self._orbitYaw = math.clamp(self._orbitYaw - input.Delta.X * 0.007, -math.pi, math.pi)
             self._orbitPitch = math.clamp(self._orbitPitch - input.Delta.Y * 0.005, -0.55, 0.35)
             self._isOrbiting = true
+            self._idleTimer = 0
         elseif input.UserInputType == Enum.UserInputType.MouseMovement and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
             self._orbitYaw = math.clamp(self._orbitYaw - input.Delta.X * 0.006, -math.pi, math.pi)
             self._orbitPitch = math.clamp(self._orbitPitch - input.Delta.Y * 0.0045, -0.55, 0.35)
             self._isOrbiting = true
+            self._idleTimer = 0
         end
     end))
 
@@ -174,7 +213,10 @@ function Module:_registerDiagnostics()
             category = "Visuals",
         }, "Visuals")
         D.register("visuals.chaseCam", {
-            fn = function() return { value = self._chaseActive and "ON" or "OFF", unit = "", status = "normal" } end,
+            fn = function()
+                local status = self._showcaseActive and "SHOWCASE" or (self._chaseActive and "ON" or "OFF")
+                return { value = status, unit = "", status = "normal" }
+            end,
             category = "Visuals",
         }, "Visuals")
     end)
@@ -184,6 +226,8 @@ end
 function Module:_restoreDefaultCamera()
     if not self._chaseActive then return end
     self._chaseActive = false
+    self._showcaseActive = false
+    self._idleTimer = 0
     self._chaseRot = nil
     self._chasePos = nil
     self._smoothLook = nil
@@ -220,6 +264,8 @@ function Module:_bindCamera()
     self._orbitPitch = 0
     self._isOrbiting = false
     self._orbitTouch = nil
+    self._idleTimer = 0
+    self._showcaseActive = false
 
     RunService:BindToRenderStep("VX_Camera", Enum.RenderPriority.Camera.Value + 5, function(dt)
         pcall(function() self:_updateCamera(dt) end)
@@ -245,7 +291,32 @@ function Module:_unbindCamera()
     print("[VX] Visuals camera unbound")
 end
 
--- ==================== 3-AXIS RACING CHASE CAMERA ====================
+-- ==================== IDLE SHOWCASE TRANSITIONS ====================
+function Module:_enterShowcase()
+    self._showcaseActive = true
+    self._scShotIndex = 1
+    self._scShotTimer = 0
+    self._scOrbitOffset = 0
+    self._scYaw = self._orbitYaw
+    self._scPitch = BASE_PITCH_RAD + self._orbitPitch
+    self._scDistMult = 1.0
+    self._scRoll = 0
+    self._scFov = self.currentFOV or DEFAULT_FOV
+    self._scFocusSide = 0
+    self._scFocusFwd = 0
+end
+
+function Module:_exitShowcase()
+    if not self._showcaseActive then return end
+    self._showcaseActive = false
+    self._idleTimer = 0
+    self._orbitYaw = _wrapAngle(self._scYaw)
+    self._orbitPitch = math.clamp(self._scPitch - BASE_PITCH_RAD, -0.55, 0.35)
+    self._orbitReleaseTime = os.clock() - RECENTER_DELAY
+    self.currentFOV = self._scFov
+end
+
+-- ==================== 3-AXIS RACING CHASE + SHOWCASE CAMERA ====================
 function Module:_updateChaseCamera(dt, handle, carPart, speed)
     if not Camera then return end
     if Camera.CameraType ~= Enum.CameraType.Scriptable then
@@ -282,7 +353,6 @@ function Module:_updateChaseCamera(dt, handle, carPart, speed)
         desiredUp = carUp
     end
 
-    -- Pre-smooth look & up vectors + chase rotation & position for butter-smooth motion
     if not self._chaseRot or not self._chasePos then
         self._smoothLook = desiredLook
         self._smoothUp = desiredUp
@@ -305,27 +375,84 @@ function Module:_updateChaseCamera(dt, handle, carPart, speed)
         self._chasePos = self._chasePos:Lerp(carCF.Position, posAlpha)
     end
 
-    -- Auto-return look-around offset smoothly after RECENTER_DELAY seconds of release
-    if not self._isOrbiting and (os.clock() - self._orbitReleaseTime) >= RECENTER_DELAY then
-        local recenterAlpha = 1 - math.exp(-3.0 * dt)
-        self._orbitYaw = self._orbitYaw * (1 - recenterAlpha)
-        self._orbitPitch = self._orbitPitch * (1 - recenterAlpha)
-        if math.abs(self._orbitYaw) < 0.001 then self._orbitYaw = 0 end
-        if math.abs(self._orbitPitch) < 0.001 then self._orbitPitch = 0 end
+    -- Check idle/stationary state for 15s Auto-Showcase
+    local input = _G.VX.Modules and _G.VX.Modules.Input
+    local rawThr = input and input:getRawThrottle() or 0
+    local rawStr = input and input:getRawSteer() or 0
+    local launchState = self.powertrain and self.powertrain:getLaunchState() or "idle"
+    local twostep = self.powertrain and self.powertrain:isTwostepActive() or false
+    local isStationary = (speed < 2.0) and (math.abs(rawThr) < 0.05) and (math.abs(rawStr) < 0.05)
+        and (launchState == "idle") and (not twostep) and (not self._isOrbiting)
+
+    if isStationary then
+        self._idleTimer = self._idleTimer + dt
+        if self._idleTimer >= IDLE_SHOWCASE_DELAY and not self._showcaseActive then
+            self:_enterShowcase()
+        end
+    else
+        self._idleTimer = 0
+        if self._showcaseActive then
+            self:_exitShowcase()
+        end
     end
 
-    local camRot = self._chaseRot
-        * CFrame.Angles(0, self._orbitYaw, 0)
-        * CFrame.Angles(BASE_PITCH_RAD + self._orbitPitch, 0, 0)
-
     local baseDist = math.clamp(self.core.settings.chaseCameraDistance or 15, 8, 26)
-    local targetPull = math.clamp(speed / 180, 0, 1) * 2.0
-    self._smoothSpeedPull = self._smoothSpeedPull + (targetPull - self._smoothSpeedPull) * (1 - math.exp(-4.0 * dt))
-    local dist = baseDist + self._smoothSpeedPull
+    local camRot, dist, focusPoint
 
-    -- Aim directly through carCenter so the car sits in the middle of the screen
-    local carCenter = self._chasePos + self._chaseRot.UpVector * 0.9
-    local idealCamPos = carCenter - camRot.LookVector * dist
+    if self._showcaseActive then
+        -- 4-Shot Cinematic Showcase Cycle
+        self._scShotTimer = self._scShotTimer + dt
+        if self._scShotTimer >= SHOWCASE_SHOT_DURATION then
+            self._scShotTimer = 0
+            self._scOrbitOffset = 0
+            self._scShotIndex = (self._scShotIndex % #SHOWCASE_SHOTS) + 1
+        end
+
+        local shot = SHOWCASE_SHOTS[self._scShotIndex]
+        self._scOrbitOffset = self._scOrbitOffset + shot.yawRate * dt
+        local targetYaw = shot.yawStart + self._scOrbitOffset
+
+        local dollyAlpha = 1 - math.exp(-1.8 * dt)
+        local orbitAlpha = 1 - math.exp(-3.5 * dt)
+
+        self._scYaw = _lerpAngle(self._scYaw, targetYaw, orbitAlpha)
+        self._scPitch = self._scPitch + (shot.pitch - self._scPitch) * dollyAlpha
+        self._scDistMult = self._scDistMult + (shot.distMult - self._scDistMult) * dollyAlpha
+        self._scRoll = self._scRoll + (shot.roll - self._scRoll) * dollyAlpha
+        self._scFov = self._scFov + (shot.fov - self._scFov) * dollyAlpha
+        self._scFocusSide = self._scFocusSide + (shot.focusSide - self._scFocusSide) * dollyAlpha
+        self._scFocusFwd = self._scFocusFwd + (shot.focusFwd - self._scFocusFwd) * dollyAlpha
+
+        camRot = self._chaseRot
+            * CFrame.Angles(0, self._scYaw, 0)
+            * CFrame.Angles(self._scPitch, 0, self._scRoll)
+
+        dist = baseDist * self._scDistMult
+        focusPoint = self._chasePos
+            + self._chaseRot.UpVector * 0.9
+            + self._chaseRot.RightVector * self._scFocusSide
+            + self._chaseRot.LookVector * self._scFocusFwd
+    else
+        -- Standard Chase Cam + Smooth Auto-Return after RECENTER_DELAY
+        if not self._isOrbiting and (os.clock() - self._orbitReleaseTime) >= RECENTER_DELAY then
+            local recenterAlpha = 1 - math.exp(-3.0 * dt)
+            self._orbitYaw = self._orbitYaw * (1 - recenterAlpha)
+            self._orbitPitch = self._orbitPitch * (1 - recenterAlpha)
+            if math.abs(self._orbitYaw) < 0.001 then self._orbitYaw = 0 end
+            if math.abs(self._orbitPitch) < 0.001 then self._orbitPitch = 0 end
+        end
+
+        camRot = self._chaseRot
+            * CFrame.Angles(0, self._orbitYaw, 0)
+            * CFrame.Angles(BASE_PITCH_RAD + self._orbitPitch, 0, 0)
+
+        local targetPull = math.clamp(speed / 180, 0, 1) * 2.0
+        self._smoothSpeedPull = self._smoothSpeedPull + (targetPull - self._smoothSpeedPull) * (1 - math.exp(-4.0 * dt))
+        dist = baseDist + self._smoothSpeedPull
+        focusPoint = self._chasePos + self._chaseRot.UpVector * 0.9
+    end
+
+    local idealCamPos = focusPoint - camRot.LookVector * dist
 
     -- Anti-clip raycast excluding vehicle & player character
     local excludes = { handle.root }
@@ -334,14 +461,14 @@ function Module:_updateChaseCamera(dt, handle, carPart, speed)
     self._rayParams.FilterDescendantsInstances = excludes
 
     local finalCamPos = idealCamPos
-    local ray = workspace:Raycast(carCenter, idealCamPos - carCenter, self._rayParams)
+    local ray = workspace:Raycast(focusPoint, idealCamPos - focusPoint, self._rayParams)
     if ray then
-        local hitDist = (ray.Position - carCenter).Magnitude
+        local hitDist = (ray.Position - focusPoint).Magnitude
         local safeDist = math.max(3.0, hitDist - 0.6)
-        finalCamPos = carCenter + (idealCamPos - carCenter).Unit * safeDist
+        finalCamPos = focusPoint + (idealCamPos - focusPoint).Unit * safeDist
     end
 
-    Camera.CFrame = CFrame.lookAt(finalCamPos, carCenter, camRot.UpVector)
+    Camera.CFrame = CFrame.lookAt(finalCamPos, focusPoint, camRot.UpVector)
 end
 
 -- ==================== CAMERA UPDATE ====================
@@ -371,14 +498,17 @@ function Module:_updateCamera(dt)
         self:_restoreDefaultCamera()
     end
 
-    if settings.fovDynamicsEnabled then
+    if self._showcaseActive then
+        self.currentFOV = self._scFov
+        Camera.FieldOfView = self.currentFOV
+    elseif settings.fovDynamicsEnabled then
         local t = math.clamp(speed / cfg.fovSpeedThreshold, 0, 1)
         local targetFOV = cfg.fovIdle + t * (cfg.fovMax - cfg.fovIdle)
         self.currentFOV = self.currentFOV + (targetFOV - self.currentFOV) * math.min(cfg.fovSmoothness * dt, 1)
         Camera.FieldOfView = self.currentFOV
     end
 
-    if settings.vehicleShaking then
+    if settings.vehicleShaking and not self._showcaseActive then
         local rpm = self.powertrain:getRPM()
         if rpm > cfg.vibRpmMin then
             local factor = math.clamp((rpm - cfg.vibRpmMin) / (cfg.vibRpmMax - cfg.vibRpmMin), 0, 1)
